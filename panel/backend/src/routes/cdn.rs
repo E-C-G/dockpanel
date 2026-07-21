@@ -6,7 +6,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
-use crate::error::{internal_error, err, ApiError};
+use crate::error::{internal_error, err, require_admin, ApiError};
 use crate::services::activity;
 use crate::AppState;
 
@@ -85,12 +85,13 @@ pub struct PurgeCacheRequest {
 }
 
 /// Helper: get CDN zone and verify ownership.
-async fn get_zone(state: &AppState, zone_id: Uuid, user_id: Uuid) -> Result<CdnZone, ApiError> {
+async fn get_zone(state: &AppState, zone_id: Uuid) -> Result<CdnZone, ApiError> {
+    // De-scoped for admin oversight (s239 DNS treatment): any admin manages any zone.
+    // Every caller is admin-gated via require_admin at the handler entry.
     sqlx::query_as::<_, CdnZone>(
-        "SELECT * FROM cdn_zones WHERE id = $1 AND user_id = $2",
+        "SELECT * FROM cdn_zones WHERE id = $1",
     )
     .bind(zone_id)
-    .bind(user_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("cdn zone", e))?
@@ -115,10 +116,10 @@ pub async fn list_zones(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Vec<CdnZoneView>>, ApiError> {
+    require_admin(&claims.role)?;
     let zones: Vec<CdnZone> = sqlx::query_as(
-        "SELECT * FROM cdn_zones WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100",
+        "SELECT * FROM cdn_zones ORDER BY created_at DESC LIMIT 100",
     )
-    .bind(claims.sub)
     .fetch_all(&state.db)
     .await
     .map_err(|e| internal_error("list cdn zones", e))?;
@@ -132,6 +133,7 @@ pub async fn create_zone(
     AuthUser(claims): AuthUser,
     Json(body): Json<CreateCdnZoneRequest>,
 ) -> Result<(StatusCode, Json<CdnZoneView>), ApiError> {
+    require_admin(&claims.role)?;
     if body.domain.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Domain is required"));
     }
@@ -193,7 +195,8 @@ pub async fn update_zone(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateCdnZoneRequest>,
 ) -> Result<Json<CdnZoneView>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     let enabled = body.enabled.unwrap_or(zone.enabled);
     let cache_ttl = body.cache_ttl.unwrap_or(zone.cache_ttl).clamp(0, 31536000);
@@ -227,7 +230,8 @@ pub async fn delete_zone(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     sqlx::query("DELETE FROM cdn_zones WHERE id = $1")
         .bind(id)
@@ -250,7 +254,8 @@ pub async fn purge_cache(
     Path(id): Path<Uuid>,
     Json(body): Json<PurgeCacheRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     // Validate purge URLs belong to this zone's domain (prevent SSRF)
     if let Some(ref urls) = body.urls {
@@ -346,7 +351,8 @@ pub async fn zone_stats(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     match zone.provider.as_str() {
         "bunnycdn" => {
@@ -444,7 +450,8 @@ pub async fn test_credentials(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     match zone.provider.as_str() {
         "bunnycdn" => {
@@ -498,7 +505,8 @@ pub async fn list_pull_zones(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     match zone.provider.as_str() {
         "bunnycdn" => {

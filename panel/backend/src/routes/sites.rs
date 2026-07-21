@@ -2060,10 +2060,15 @@ pub async fn php_extensions(
 /// POST /api/php/extensions/install — Install a PHP extension.
 pub async fn install_php_extension(
     State(_state): State<AppState>,
-    AuthUser(_claims): AuthUser,
+    AuthUser(claims): AuthUser,
     ServerScope(_server_id, agent): ServerScope,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Installing a PHP extension is a system/package-level op on the shared server,
+    // admin-only exactly like its version-management siblings php_install/php_uninstall.
+    if claims.role != "admin" {
+        return Err(err(StatusCode::FORBIDDEN, "Admin only"));
+    }
     agent.post("/php/extensions/install", Some(body)).await
         .map_err(|e| agent_error("PHP extension", e))?;
     Ok(Json(serde_json::json!({ "ok": true })))

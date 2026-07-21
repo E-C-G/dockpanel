@@ -11,7 +11,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
-use crate::error::{internal_error, err, agent_error, ApiError};
+use crate::error::{internal_error, err, agent_error, require_admin, ApiError};
 use crate::routes::sites::ProvisionStep;
 use crate::services::activity;
 use crate::AppState;
@@ -98,6 +98,7 @@ pub async fn analyze(
     ServerScope(server_id, agent): ServerScope,
     Json(body): Json<AnalyzeRequest>,
 ) -> Result<(StatusCode, Json<Migration>), ApiError> {
+    require_admin(&claims.role)?;
     let path = body.path.trim();
     if path.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Backup path is required"));
@@ -185,6 +186,7 @@ pub async fn get_one(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Migration>, ApiError> {
+    require_admin(&claims.role)?;
     let migration: Migration = sqlx::query_as(
         "SELECT * FROM migrations WHERE id = $1 AND user_id = $2",
     )
@@ -207,6 +209,7 @@ pub async fn list(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Vec<Migration>>, ApiError> {
+    require_admin(&claims.role)?;
     let migrations: Vec<Migration> = sqlx::query_as(
         "SELECT * FROM migrations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
     )
@@ -230,6 +233,7 @@ pub async fn import(
     Path(id): Path<Uuid>,
     Json(body): Json<ImportRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    require_admin(&claims.role)?;
     // Verify migration exists, belongs to user, and is analyzed
     let migration: Migration = sqlx::query_as(
         "SELECT * FROM migrations WHERE id = $1 AND user_id = $2",
@@ -625,6 +629,7 @@ pub async fn progress(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, axum::BoxError>>>, ApiError> {
+    require_admin(&claims.role)?;
     // Verify ownership
     let exists: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM migrations WHERE id = $1 AND user_id = $2",
@@ -686,6 +691,7 @@ pub async fn remove(
     ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
     let migration: Migration = sqlx::query_as(
         "SELECT * FROM migrations WHERE id = $1 AND user_id = $2",
     )

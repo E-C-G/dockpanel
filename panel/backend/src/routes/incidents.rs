@@ -110,7 +110,7 @@ pub async fn list(
 /// POST /api/incidents — Create an incident.
 pub async fn create(
     State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
+    AdminUser(claims): AdminUser,
     Json(req): Json<CreateIncidentRequest>,
 ) -> Result<(StatusCode, Json<ManagedIncident>), ApiError> {
     if req.title.is_empty() || req.title.len() > 200 {
@@ -219,7 +219,7 @@ pub async fn get_one(
 /// PUT /api/incidents/{id} — Update an incident (status change, add update).
 pub async fn update(
     State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
+    AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateIncidentRequest>,
 ) -> Result<Json<ManagedIncident>, ApiError> {
@@ -345,7 +345,7 @@ pub async fn update(
 /// DELETE /api/incidents/{id} — Delete an incident.
 pub async fn remove(
     State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
+    AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = sqlx::query("DELETE FROM managed_incidents WHERE id = $1 AND user_id = $2")
@@ -363,7 +363,7 @@ pub async fn remove(
 /// POST /api/incidents/{id}/updates — Post an incident update.
 pub async fn post_update(
     State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
+    AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
     Json(req): Json<PostUpdateRequest>,
 ) -> Result<(StatusCode, Json<IncidentUpdate>), ApiError> {

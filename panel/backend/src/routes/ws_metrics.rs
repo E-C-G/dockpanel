@@ -98,6 +98,18 @@ pub async fn handler(
         }
     }
 
+    // Live host telemetry (system info, full process list, network connections, GPU)
+    // is admin-only — the equivalent REST endpoints (system::info, logs::processes,
+    // logs::network) all require AdminUser. ServerScope's no-X-Server-Id fallback
+    // resolves the local/admin-owned server WITHOUT a role check, so gate here.
+    if claims.role != "admin" {
+        return axum::http::Response::builder()
+            .status(403)
+            .body(axum::body::Body::from("Admin access required"))
+            .unwrap()
+            .into_response();
+    }
+
     // Enforce connection limit
     let current = WS_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
     if current >= MAX_WS_CONNECTIONS {

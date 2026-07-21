@@ -449,11 +449,16 @@ pub async fn list_versions(
 ) -> Result<Json<Vec<SecretVersion>>, ApiError> {
     verify_vault(&state, vault_id, claims.sub).await?;
 
+    // Scope the version lookup to the ownership-verified vault: without the JOIN a
+    // caller who owns ANY vault could pass their vault_id + another tenant's secret_id
+    // and read that secret's version-history metadata (cross-vault IDOR).
     let versions: Vec<SecretVersion> = sqlx::query_as(
-        "SELECT id, secret_id, version, changed_by, change_type, created_at \
-         FROM secret_versions WHERE secret_id = $1 ORDER BY version DESC"
+        "SELECT sv.id, sv.secret_id, sv.version, sv.changed_by, sv.change_type, sv.created_at \
+         FROM secret_versions sv JOIN secrets s ON s.id = sv.secret_id AND s.vault_id = $2 \
+         WHERE sv.secret_id = $1 ORDER BY sv.version DESC"
     )
     .bind(secret_id)
+    .bind(vault_id)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("list versions", e))?;
 

@@ -228,8 +228,23 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
         }
     }
 
-    // Backup volumes (Docker app volumes)
-    if policy.backup_volumes {
+    // Backup volumes (Docker app volumes). This is an admin-only capability — the
+    // direct create_volume_backup endpoint is AdminUser, and the enumeration below is
+    // fleet-wide with NO per-user scoping. Policy CRUD is now admin-gated, but guard
+    // the executor too so any legacy non-admin-owned policy cannot drive volume backups.
+    let owner_is_admin: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT role = 'admin' FROM users WHERE id = $1"
+    )
+    .bind(policy.user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if policy.backup_volumes && !owner_is_admin {
+        tracing::warn!("Policy '{}': skipping volume backup — owner is not an admin", policy.name);
+    }
+    if policy.backup_volumes && owner_is_admin {
         // Get Docker containers with volumes
         match agent.get("/apps").await {
             Ok(apps) => {

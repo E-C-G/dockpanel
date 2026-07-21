@@ -6,7 +6,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::auth::{AdminUser, AuthUser, ServerScope};
-use crate::error::{internal_error, err, agent_error, paginate, ApiError};
+use crate::error::{internal_error, err, agent_error, paginate, require_admin, ApiError};
 use crate::services::activity;
 use crate::services::extensions::fire_event;
 use crate::AppState;
@@ -525,6 +525,7 @@ pub async fn list_policies(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Vec<BackupPolicy>>, ApiError> {
+    require_admin(&claims.role)?;
     let policies: Vec<BackupPolicy> = sqlx::query_as(
         "SELECT * FROM backup_policies WHERE user_id = $1 ORDER BY created_at DESC LIMIT 500"
     )
@@ -542,6 +543,7 @@ pub async fn create_policy(
     AuthUser(claims): AuthUser,
     Json(req): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<BackupPolicy>), ApiError> {
+    require_admin(&claims.role)?;
     if req.name.is_empty() || req.name.len() > 100 {
         return Err(err(StatusCode::BAD_REQUEST, "Name must be 1-100 characters"));
     }
@@ -600,6 +602,7 @@ pub async fn update_policy(
     Path(id): Path<Uuid>,
     Json(req): Json<CreatePolicyRequest>,
 ) -> Result<Json<BackupPolicy>, ApiError> {
+    require_admin(&claims.role)?;
     // Verify ownership
     let existing: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM backup_policies WHERE id = $1 AND user_id = $2"
@@ -670,6 +673,7 @@ pub async fn delete_policy(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
     let result = sqlx::query("DELETE FROM backup_policies WHERE id = $1 AND user_id = $2")
         .bind(id).bind(claims.sub)
         .execute(&state.db).await
@@ -687,6 +691,7 @@ pub async fn protect_all(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    require_admin(&claims.role)?;
     let db = &state.db;
     let policy_name = "Protect Everything";
 
