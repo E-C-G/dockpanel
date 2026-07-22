@@ -49,6 +49,22 @@ fn is_valid_branch(branch: &str) -> bool {
     !branch.starts_with('-') && !branch.contains("..")
 }
 
+/// Security floor for a domain that becomes an nginx file path
+/// (`/etc/nginx/sites-enabled/{domain}.conf`) and an unescaped `server_name`
+/// written as root. Allows only `[A-Za-z0-9._-]` and rejects `..`, which blocks
+/// path traversal (`/`, `..`) and nginx directive injection (`;`, `{`, `}`,
+/// quotes, `$`, `#`, whitespace, control chars) while still permitting benign
+/// characters like `_`. Deliberately looser than full RFC validity — the backend
+/// enforces is_valid_domain on new values; this only stops the dangerous set.
+fn is_safe_nginx_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && !domain.contains("..")
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
 /// Validate that a dockerfile path does not escape the build context.
 fn is_valid_dockerfile(dockerfile: &str) -> bool {
     !dockerfile.contains("..") && !dockerfile.starts_with('/')
@@ -206,6 +222,19 @@ async fn deploy_container(
     }
     if body.container_port == 0 || body.host_port == 0 {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid port"));
+    }
+    // Defense-in-depth: the domain becomes an nginx file path
+    // (/etc/nginx/sites-enabled/{domain}.conf) and an unescaped `server_name`
+    // written as root, so reject the injection/traversal characters here even if
+    // the backend validation were bypassed (the s241 #69 threat). This is a
+    // SECURITY floor (block '/', ';', braces, quotes, '$', whitespace, control),
+    // NOT full RFC validity — the backend already enforces is_valid_domain on new
+    // values; being stricter here would break grandfathered/preview domains that
+    // merely contain a benign '_'.
+    if let Some(ref domain) = body.domain {
+        if !domain.is_empty() && !is_safe_nginx_domain(domain) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+        }
     }
 
     tracing::info!(
@@ -552,4 +581,31 @@ pub fn router() -> Router<AppState> {
         .route("/git/auto-detect", post(auto_detect))
         .route("/git/compose-check", post(compose_check))
         .route("/git/nixpacks-build", post(nixpacks_build_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_nginx_domain;
+
+    #[test]
+    fn safe_nginx_domain_blocks_injection_and_traversal() {
+        // The s241 #69 sink threats must be rejected.
+        for d in [
+            "../../../etc/nginx/conf.d/pwn",              // path traversal
+            "x; } server { listen 80 default_server; }", // directive injection (space, ';', braces)
+            "a\"b.com",                                    // quote break-out
+            "a$b.com", "a#b.com", "a b.com", "a/b",       // '$','#',space,'/'
+            "",
+        ] {
+            assert!(!is_safe_nginx_domain(d), "{d:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn safe_nginx_domain_allows_real_and_grandfathered_hosts() {
+        // Valid hosts AND benign grandfathered/preview values (underscore) pass.
+        for d in ["app.example.com", "feature-login.app.example.com", "my_app.example.com", "a-b_c.example.com"] {
+            assert!(is_safe_nginx_domain(d), "{d:?} must be allowed");
+        }
+    }
 }

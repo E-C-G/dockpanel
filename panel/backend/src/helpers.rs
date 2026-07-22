@@ -76,10 +76,52 @@ mod tests {
     }
 }
 
+/// True if an IPv4 address is loopback / private / link-local / CGNAT / unspecified
+/// / broadcast — i.e. one an SSRF guard must reject.
+fn v4_is_internal(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || o[0] == 169 // link-local/metadata block (broad; matches the original guard)
+        || (o[0] == 100 && (o[1] & 0xC0) == 0x40) // CGNAT 100.64.0.0/10
+}
+
+/// True if an IPv6 address is loopback / unspecified / ULA (fc00::/7) /
+/// link-local (fe80::/10), OR is an IPv4-mapped address whose embedded v4 is
+/// internal (`::ffff:127.0.0.1`, `::ffff:169.254.169.254`, …). Rust's
+/// `Ipv6Addr::is_loopback()` is false for the mapped forms, so those must be
+/// normalized explicitly — that was the SSRF-validator gap.
+fn v6_is_internal(v6: std::net::Ipv6Addr) -> bool {
+    if v6.is_loopback() || v6.is_unspecified() {
+        return true;
+    }
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        if v4_is_internal(v4) {
+            return true;
+        }
+    }
+    let seg = v6.segments();
+    (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+        || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+}
+
+/// True if an IP is one an SSRF guard must reject (loopback / private / link-local /
+/// ULA / CGNAT / IPv4-mapped-internal / unspecified).
+fn ip_is_internal(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_is_internal(v4),
+        std::net::IpAddr::V6(v6) => v6_is_internal(v6),
+    }
+}
+
 /// SSRF protection: validate that a URL does not resolve to an internal/private address.
 ///
-/// Checks loopback, private (RFC 1918), link-local, and unspecified addresses.
-/// Resolves DNS to catch bypass via hostnames that map to internal IPs.
+/// Checks loopback, private (RFC 1918), link-local, ULA, CGNAT, IPv4-mapped-IPv6,
+/// and unspecified addresses. Resolves DNS to catch bypass via hostnames that map
+/// to internal IPs.
 pub async fn validate_url_not_internal(url: &str) -> Result<(), String> {
     let url = url.trim();
     if url.is_empty() {
@@ -113,25 +155,8 @@ pub async fn validate_url_not_internal(url: &str) -> Result<(), String> {
     match tokio::net::lookup_host(&lookup_host).await {
         Ok(addrs) => {
             for addr in addrs {
-                let ip = addr.ip();
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return Err("URL resolves to loopback address".to_string());
-                }
-                match ip {
-                    std::net::IpAddr::V4(v4) => {
-                        if v4.is_private() || v4.is_link_local() || v4.octets()[0] == 169 {
-                            return Err(
-                                "URL resolves to private/link-local address".to_string(),
-                            );
-                        }
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        if v6.is_loopback() {
-                            return Err(
-                                "URL resolves to loopback address".to_string(),
-                            );
-                        }
-                    }
+                if ip_is_internal(addr.ip()) {
+                    return Err("URL resolves to a private/internal address".to_string());
                 }
             }
         }
@@ -164,5 +189,48 @@ pub async fn detect_public_ip() -> String {
                 .map(|a| a.ip().to_string())
                 .unwrap_or_default()
         }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::{ip_is_internal, v4_is_internal, v6_is_internal};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn v4_internal_ranges_blocked() {
+        for s in ["127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.169.254", "0.0.0.0", "100.64.0.1"] {
+            assert!(v4_is_internal(s.parse::<Ipv4Addr>().unwrap()), "{s} should be internal");
+        }
+    }
+
+    #[test]
+    fn v4_public_allowed() {
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "100.63.255.255", "100.128.0.1"] {
+            assert!(!v4_is_internal(s.parse::<Ipv4Addr>().unwrap()), "{s} should be public");
+        }
+    }
+
+    #[test]
+    fn v6_mapped_loopback_and_metadata_blocked() {
+        // The exact gap: IPv4-mapped IPv6 whose is_loopback() is false.
+        assert!(v6_is_internal("::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap()));
+        assert!(v6_is_internal("::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap()));
+        assert!(v6_is_internal("::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()));
+    }
+
+    #[test]
+    fn v6_ula_and_link_local_blocked() {
+        assert!(v6_is_internal("fc00::1".parse::<Ipv6Addr>().unwrap()));
+        assert!(v6_is_internal("fd00:ec2::254".parse::<Ipv6Addr>().unwrap()));
+        assert!(v6_is_internal("fe80::1".parse::<Ipv6Addr>().unwrap()));
+        assert!(v6_is_internal("::1".parse::<Ipv6Addr>().unwrap()));
+        assert!(v6_is_internal("::".parse::<Ipv6Addr>().unwrap()));
+    }
+
+    #[test]
+    fn v6_public_allowed() {
+        assert!(!v6_is_internal("2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()));
+        assert!(!ip_is_internal("2001:4860:4860::8888".parse::<std::net::IpAddr>().unwrap()));
     }
 }

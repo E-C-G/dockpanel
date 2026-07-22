@@ -493,6 +493,11 @@ fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // Do NOT follow redirects: validate_url_not_internal only vets the
+            // original destination_url, so a public destination returning a
+            // 3xx to http://127.0.0.1 / 169.254.169.254 would otherwise bypass
+            // the SSRF allow-check and exfiltrate the internal response.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default()
     })

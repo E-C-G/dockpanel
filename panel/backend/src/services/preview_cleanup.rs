@@ -42,9 +42,11 @@ async fn cleanup_expired_previews(db: &PgPool, agent: &AgentClient) -> Result<()
     for (id, container_name, branch) in &expired {
         tracing::info!("Cleaning up expired preview: {container_name} (branch: {branch})");
 
-        // Try to stop and remove the container
+        // Try to stop and remove the container (strip the stored "dockpanel-git-"
+        // prefix — the agent re-adds it; passing it verbatim double-prefixes into a
+        // no-op that leaks the container/image/nginx/SSL/repo + a still-bound port).
         if let Err(e) = agent.post("/git/cleanup", Some(serde_json::json!({
-            "name": container_name,
+            "name": crate::routes::git_deploys::strip_container_prefix(container_name),
         }))).await {
             tracing::warn!("Failed to cleanup preview container {container_name}: {e}");
         }
@@ -74,8 +76,9 @@ async fn cleanup_expired_previews(db: &PgPool, agent: &AgentClient) -> Result<()
     .map_err(|e| e.to_string())?;
 
     for (id, container_name) in &stuck {
+        // strip the stored "dockpanel-git-" prefix (see the TTL loop above)
         if let Err(e) = agent.post("/git/cleanup", Some(serde_json::json!({
-            "name": container_name,
+            "name": crate::routes::git_deploys::strip_container_prefix(container_name),
         }))).await {
             tracing::warn!("Failed to cleanup stuck preview container {container_name}: {e}");
         }

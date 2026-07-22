@@ -14,12 +14,78 @@ use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
 use crate::error::{internal_error, err, agent_error, require_admin, ApiError};
-use crate::routes::is_valid_name;
+use crate::routes::{is_valid_name, is_valid_domain, is_reserved_domain};
 use crate::routes::sites::ProvisionStep;
 use crate::services::activity;
 use crate::services::agent::AgentHandle;
 use crate::services::notifications;
 use crate::AppState;
+
+/// git_previews.container_name is stored WITH the `dockpanel-git-` prefix that
+/// the agent's `/git/cleanup` handler re-adds (agent `cleanup_container` does
+/// `format!("dockpanel-git-{name}")`). Passing the stored value verbatim yields
+/// a double-prefixed name that matches no container, so the teardown silently
+/// no-ops and leaks the container/image/nginx/SSL/repo dir while the DB frees
+/// its port. Every preview-cleanup caller MUST route the stored name through
+/// this so the agent resolves the real container (mirrors the manual
+/// `delete_preview` path). See lesson #70 (resolve by the identity the resource
+/// was created with, and fix the whole class at one choke point).
+pub(crate) fn strip_container_prefix(stored: &str) -> &str {
+    stored.strip_prefix("dockpanel-git-").unwrap_or(stored)
+}
+
+/// Convert an arbitrary branch name into a DNS-label-safe slug for the preview
+/// subdomain / container name: lowercase, every run of chars outside `[a-z0-9]`
+/// collapses to a single '-', with leading/trailing '-' trimmed. Keeps the
+/// synthesized preview domain (`{slug}.{base}`) a valid hostname so the agent's
+/// `is_valid_domain` check accepts it — an underscore branch like
+/// `feature_login` would otherwise fail domain validation and the preview would
+/// silently fail. Falls back to "preview" if nothing alphanumeric remains.
+pub(crate) fn dns_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for c in s.chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = out.trim_matches('-').to_string();
+    if slug.is_empty() { "preview".to_string() } else { slug }
+}
+
+/// Validate a single crontab field against the exact surface the executor
+/// (`deploy_scheduler::matches_field`) accepts: a comma list whose parts are each
+/// `*`, `*/N` (N>0), an `a-b` range, or a plain number. Format-only — the goal is
+/// to reject unparseable garbage WITHOUT being stricter than the scheduler that
+/// runs it (a validator stricter than the executor rejects working crons on edit).
+fn is_valid_cron_field(field: &str) -> bool {
+    !field.is_empty()
+        && field.split(',').all(|part| {
+            part.is_empty() // scheduler skips empty comma segments (e.g. "1,,5"); don't be stricter
+                || part == "*"
+                || part
+                    .strip_prefix("*/")
+                    .map(|n| n.parse::<u32>().map(|v| v > 0).unwrap_or(false))
+                    .unwrap_or(false)
+                || part
+                    .split_once('-')
+                    .map(|(a, b)| a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok())
+                    .unwrap_or(false)
+                || part.parse::<u32>().is_ok()
+        })
+}
+
+/// A `deploy_cron` value is valid iff it has AT LEAST 5 whitespace-separated
+/// fields (the scheduler reads the first 5 and ignores extras — a 6-field
+/// "seconds" cron still fires) and each of those first 5 is individually valid.
+pub(crate) fn is_valid_cron(expr: &str) -> bool {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    parts.len() >= 5 && parts[..5].iter().all(|f| is_valid_cron_field(f))
+}
 
 #[derive(serde::Serialize, sqlx::FromRow)]
 pub struct GitDeploy {
@@ -235,9 +301,27 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "build_context must not contain '..' or start with '/'"));
     }
 
+    // Validate deploy_cron format (reject unparseable crons that would be stored and mis-scheduled)
+    if let Some(ref cron) = body.deploy_cron {
+        if !cron.trim().is_empty() && !is_valid_cron(cron) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid deploy_cron: expected at least 5 crontab fields"));
+        }
+    }
+
     // Cross-table domain uniqueness: check sites table
     if let Some(ref domain) = body.domain {
         if !domain.is_empty() {
+            // Parity with the Sites surface (s241 #69): the domain reaches the
+            // root agent's nginx path write + unescaped `server_name`. Reject
+            // malformed values (path traversal / directive break-out) and
+            // reserved control-plane zones before it is stored.
+            if !is_valid_domain(domain) {
+                return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+            }
+            if is_reserved_domain(domain) {
+                return Err(err(StatusCode::BAD_REQUEST, "Domain is reserved"));
+            }
+
             let site_conflict: Option<(Uuid,)> = sqlx::query_as(
                 "SELECT id FROM sites WHERE domain = $1 AND server_id = $2"
             )
@@ -357,9 +441,12 @@ pub async fn update(
 ) -> Result<Json<GitDeploy>, ApiError> {
     require_admin(&claims.role)?;
 
-    // Verify ownership
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM git_deploys WHERE id = $1 AND user_id = $2",
+    // Verify ownership + fetch current domain/cron so we only validate values
+    // that actually CHANGE (grandfather rows that predate these guards — e.g. a
+    // deploy already on a reserved zone, or a stored 6-field cron — so an
+    // unrelated field edit that re-sends the unchanged value isn't rejected).
+    let existing: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT domain, deploy_cron FROM git_deploys WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(claims.sub)
@@ -367,8 +454,29 @@ pub async fn update(
     .await
     .map_err(|e| internal_error("update git_deploys", e))?;
 
-    if existing.is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "Git deploy not found"));
+    let (cur_domain, cur_cron) = match existing {
+        Some(row) => row,
+        None => return Err(err(StatusCode::NOT_FOUND, "Git deploy not found")),
+    };
+
+    // Validate domain ONLY when it changes (parity with create / Sites s241 #69) —
+    // it reaches the root agent's nginx path write + unescaped `server_name`.
+    if let Some(ref domain) = body.domain {
+        if !domain.is_empty() && Some(domain) != cur_domain.as_ref() {
+            if !is_valid_domain(domain) {
+                return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+            }
+            if is_reserved_domain(domain) {
+                return Err(err(StatusCode::BAD_REQUEST, "Domain is reserved"));
+            }
+        }
+    }
+
+    // Validate deploy_cron format ONLY when it changes
+    if let Some(ref cron) = body.deploy_cron {
+        if !cron.trim().is_empty() && Some(cron) != cur_cron.as_ref() && !is_valid_cron(cron) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid deploy_cron: expected at least 5 crontab fields"));
+        }
     }
 
     // Validate commands for injection (same as create)
@@ -534,21 +642,21 @@ pub async fn deploy(
         }))));
     }
 
-    // Deploy lock: prevent concurrent deploys for the same project
-    let active: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM git_deploy_history WHERE git_deploy_id = $1 AND status IN ('building', 'deploying') AND created_at > NOW() - INTERVAL '1 hour'"
-    ).bind(id).fetch_one(&state.db).await.unwrap_or((0,));
-    if active.0 > 0 {
-        return Err(err(StatusCode::CONFLICT, "Deploy already in progress"));
-    }
-
-    // Update status to building
-    if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'building', updated_at = NOW() WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-    {
-        tracing::warn!("Failed to update git deploy status: {e}");
+    // Deploy lock (atomic): flip status to 'building' iff not already building.
+    // The old guard queried git_deploy_history for a 'building'/'deploying'
+    // status that is NEVER written there (all history rows are 'success'/'failed'),
+    // so it always counted 0 and never fired. This conditional UPDATE is the real
+    // lock — a losing concurrent caller gets 0 rows affected — and self-heals a
+    // crashed deploy after 30 min (stale 'building'; longer than the worst-case
+    // clone+build+deploy so a still-running build never releases its own lock).
+    // A DB error is surfaced as 500, NOT mistaken for "already in progress".
+    match sqlx::query(
+        "UPDATE git_deploys SET status = 'building', updated_at = NOW() \
+         WHERE id = $1 AND (status IS DISTINCT FROM 'building' OR updated_at < NOW() - INTERVAL '30 minutes')"
+    ).bind(id).execute(&state.db).await {
+        Ok(r) if r.rows_affected() == 0 => return Err(err(StatusCode::CONFLICT, "Deploy already in progress")),
+        Ok(_) => {}
+        Err(e) => return Err(internal_error("deploy lock", e)),
     }
 
     let deploy_id = Uuid::new_v4();
@@ -1087,7 +1195,7 @@ pub async fn webhook(
         };
 
         if let Some((preview_id, container_name)) = deleted {
-            let _ = agent.post("/git/cleanup", Some(serde_json::json!({ "name": container_name }))).await;
+            let _ = agent.post("/git/cleanup", Some(serde_json::json!({ "name": strip_container_prefix(&container_name) }))).await;
             let _ = sqlx::query("DELETE FROM git_previews WHERE id = $1").bind(preview_id).execute(&state.db).await;
             tracing::info!("Cleaned up preview for deleted branch: {push_branch}");
         }
@@ -1104,21 +1212,16 @@ pub async fn webhook(
         })));
     }
 
-    // Deploy lock: prevent concurrent deploys for the same project
-    let active: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM git_deploy_history WHERE git_deploy_id = $1 AND status IN ('building', 'deploying') AND created_at > NOW() - INTERVAL '1 hour'"
-    ).bind(id).fetch_one(&state.db).await.unwrap_or((0,));
-    if active.0 > 0 {
-        return Ok(Json(serde_json::json!({ "ok": false, "message": "Deploy already in progress, skipping" })));
-    }
-
-    // Update status to building
-    if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'building', updated_at = NOW() WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-    {
-        tracing::warn!("Failed to update git deploy status: {e}");
+    // Deploy lock (atomic — see deploy(); the old git_deploy_history guard was inert)
+    match sqlx::query(
+        "UPDATE git_deploys SET status = 'building', updated_at = NOW() \
+         WHERE id = $1 AND (status IS DISTINCT FROM 'building' OR updated_at < NOW() - INTERVAL '30 minutes')"
+    ).bind(id).execute(&state.db).await {
+        Ok(r) if r.rows_affected() == 0 => {
+            return Ok(Json(serde_json::json!({ "ok": false, "message": "Deploy already in progress, skipping" })));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(internal_error("webhook deploy lock", e)),
     }
 
     let deploy_id = Uuid::new_v4();
@@ -1919,19 +2022,12 @@ pub async fn trigger_deploy_task(
         return;
     }
 
-    // Deploy lock: prevent concurrent deploys for the same project
-    let active: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM git_deploy_history WHERE git_deploy_id = $1 AND status IN ('building', 'deploying') AND created_at > NOW() - INTERVAL '1 hour'"
-    ).bind(git_deploy_id).fetch_one(&db).await.unwrap_or((0,));
-    if active.0 > 0 {
-        tracing::warn!("Scheduled deploy skipped for {git_deploy_id}: deploy already in progress");
-        return;
-    }
-
     // Wrap the AgentClient in an AgentHandle for uniform API
     let agent = AgentHandle::Local(agent);
 
-    // Fetch config
+    // Fetch config FIRST — before acquiring the lock — so a config-fetch error
+    // (or a row deleted between the scheduler's list and now) returns WITHOUT
+    // having flipped status to 'building' and stranding it for the self-heal window.
     let config: GitDeploy = match sqlx::query_as("SELECT * FROM git_deploys WHERE id = $1")
         .bind(git_deploy_id).fetch_optional(&db).await {
         Ok(Some(c)) => c,
@@ -1948,11 +2044,21 @@ pub async fn trigger_deploy_task(
         }
     };
 
-    // Update status
-    if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'building', updated_at = NOW() WHERE id = $1")
-        .bind(git_deploy_id).execute(&db).await
-    {
-        tracing::warn!("Failed to update git deploy status: {e}");
+    // Deploy lock (atomic — see deploy(); the old git_deploy_history guard was inert).
+    // Acquired AFTER the config fetch above so a fetch error can't leave 'building' stuck.
+    match sqlx::query(
+        "UPDATE git_deploys SET status = 'building', updated_at = NOW() \
+         WHERE id = $1 AND (status IS DISTINCT FROM 'building' OR updated_at < NOW() - INTERVAL '30 minutes')"
+    ).bind(git_deploy_id).execute(&db).await {
+        Ok(r) if r.rows_affected() == 0 => {
+            tracing::warn!("Scheduled deploy skipped for {git_deploy_id}: deploy already in progress");
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("Scheduled deploy lock failed for {git_deploy_id}: {e}");
+            return;
+        }
     }
 
     let started = std::time::Instant::now();
@@ -2068,6 +2174,15 @@ pub async fn trigger_deploy_task(
                 tracing::warn!("Failed to update git deploy status: {db_err}");
             }
             return;
+        }
+        // Refresh the lock's self-heal clock before the (up to ~16 min) pre-build+build:
+        // this fallthrough path has no updated_at bump since lock acquisition, so a
+        // legitimately long Dockerfile build could otherwise cross the 30-min window and
+        // let a concurrent trigger self-release the lock (mirrors spawn_deploy_task 1466/1473).
+        if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'dockerfile', updated_at = NOW() WHERE id = $1")
+            .bind(git_deploy_id).execute(&db).await
+        {
+            tracing::warn!("Failed to update git deploy build method: {db_err}");
         }
     }
 
@@ -2222,7 +2337,7 @@ async fn record_failed_history(db: &sqlx::PgPool, git_deploy_id: Uuid, commit_ha
 
 /// Handle preview deployment for non-configured branches.
 async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &GitDeploy, branch: &str, _payload: &serde_json::Value) {
-    let branch_slug = branch.replace('/', "-").replace('.', "-").to_lowercase();
+    let branch_slug = dns_label(branch);
     if branch_slug.len() > 50 { return; } // Safety limit
 
     // Allocate preview port (scoped to this server via git_deploys)
@@ -2270,7 +2385,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
     let branch = branch.to_string();
 
     tokio::spawn(async move {
-        let branch_slug = branch.replace('/', "-").replace('.', "-").to_lowercase();
+        let branch_slug = dns_label(&branch);
 
         // Clone at preview branch
         let mut clone_body = serde_json::json!({
@@ -2383,8 +2498,8 @@ pub async fn delete_preview(
         .map_err(|e| internal_error("delete preview", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Preview not found"))?;
 
-    // Clean up container — strip "dockpanel-git-" prefix since the agent adds it
-    let cleanup_name = preview.container_name.strip_prefix("dockpanel-git-").unwrap_or(&preview.container_name);
+    // Clean up container — strip the "dockpanel-git-" prefix since the agent re-adds it
+    let cleanup_name = strip_container_prefix(&preview.container_name);
     agent.post("/git/cleanup", Some(serde_json::json!({ "name": cleanup_name }))).await.ok();
 
     if let Err(e) = sqlx::query("DELETE FROM git_previews WHERE id = $1").bind(preview_id).execute(&state.db).await {
@@ -2625,4 +2740,55 @@ pub async fn reject_deploy(
         "status": "rejected",
         "message": "Deploy request rejected",
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_container_prefix, is_valid_cron};
+
+    #[test]
+    fn strip_prefix_from_stored_preview_name() {
+        // git_previews.container_name is stored WITH the prefix; cleanup must strip it
+        // so the agent (which re-adds "dockpanel-git-") resolves the real container.
+        assert_eq!(strip_container_prefix("dockpanel-git-myapp-pr-feat-x"), "myapp-pr-feat-x");
+    }
+
+    #[test]
+    fn strip_prefix_is_idempotent_and_safe_on_bare() {
+        // A bare name (the manual path already passes this) is returned unchanged.
+        assert_eq!(strip_container_prefix("myapp-pr-feat-x"), "myapp-pr-feat-x");
+        // Only ONE prefix is stripped — a double-prefixed input still loses just one,
+        // but the stored value only ever carries a single prefix.
+        assert_eq!(strip_container_prefix("dockpanel-git-dockpanel-git-x"), "dockpanel-git-x");
+    }
+
+    #[test]
+    fn valid_cron_accepts_what_the_scheduler_runs() {
+        // Must NOT be stricter than deploy_scheduler::matches_field, else editing a
+        // deploy whose stored cron the scheduler already fires gets rejected.
+        for c in [
+            "* * * * *", "*/5 * * * *", "0 3 * * *", "0 0 1,15 * *", "0 9-17 * * 1-5",
+            "* * * * * *",   // 6-field: scheduler reads first 5 + ignores extras
+            "*/5,30 * * * *", // comma list mixing a step and a number
+            "1,,5 * * * *",   // empty comma segment: scheduler skips it, so don't reject
+        ] {
+            assert!(is_valid_cron(c), "{c} should be valid");
+        }
+    }
+
+    #[test]
+    fn valid_cron_rejects_malformed() {
+        for c in ["", "* * * *", "abc * * * *", "*/0 * * * *", "@daily"] {
+            assert!(!is_valid_cron(c), "{c} should be rejected");
+        }
+    }
+
+    #[test]
+    fn dns_label_makes_valid_preview_slugs() {
+        assert_eq!(super::dns_label("feature_login"), "feature-login"); // '_' would fail domain validation
+        assert_eq!(super::dns_label("feature/JIRA-42"), "feature-jira-42");
+        assert_eq!(super::dns_label("--weird__"), "weird");
+        assert_eq!(super::dns_label("###"), "preview"); // fallback when nothing alphanumeric remains
+        assert_eq!(super::dns_label("Main"), "main");
+    }
 }
