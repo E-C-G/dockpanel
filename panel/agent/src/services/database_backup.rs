@@ -24,6 +24,8 @@ fn backup_dir(db_name: &str) -> PathBuf {
 fn is_safe_db_identifier(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
+        && !name.contains("..")
+        && !name.contains('/')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
@@ -175,7 +177,11 @@ pub async fn dump_postgres(
             "pg_dump",
             "-U", user,
             "-d", db_name,
-            "--no-owner", "--no-acl",
+            // --clean --if-exists so a restore OVERWRITES the target rather than merging
+            // into it (without --clean, restoring into a non-empty DB appends/errors per
+            // object and silently yields a merge). Pairs with the ON_ERROR_STOP +
+            // --single-transaction restore below.
+            "--no-owner", "--no-acl", "--clean", "--if-exists",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -366,10 +372,16 @@ pub async fn restore_mysql(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         async {
-            let _gunzip_status = gunzip_child.wait().await
+            // Fail the restore if decompression did not complete cleanly — a truncated
+            // .gz that ends on a statement boundary otherwise imports partially and the
+            // mysql client exits 0 (EOF-as-success).
+            let gunzip_status = gunzip_child.wait().await
                 .map_err(|e| format!("gunzip wait error: {e}"))?;
             let docker_output = docker_child.wait_with_output().await
                 .map_err(|e| format!("docker exec wait error: {e}"))?;
+            if !gunzip_status.success() {
+                return Err("MySQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
+            }
             if !docker_output.status.success() {
                 let stderr = String::from_utf8_lossy(&docker_output.stderr);
                 return Err(format!("MySQL restore failed: {stderr}"));
@@ -417,7 +429,10 @@ pub async fn restore_postgres(
             "exec", "-i",
             "-e", &format!("PGPASSWORD={password}"),
             container_name,
-            "psql", "-U", user, "-d", db_name,
+            // ON_ERROR_STOP=1 + --single-transaction make the restore fail-and-rollback on
+            // ANY statement error instead of psql's default (continue-on-error, exit 0),
+            // which reported partial/failed restores as success.
+            "psql", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-U", user, "-d", db_name,
         ])
         .stdin(gunzip_stdout.into_owned_fd().map_err(|_| "Failed to get fd")?)
         .stdout(std::process::Stdio::piped())
@@ -428,10 +443,16 @@ pub async fn restore_postgres(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         async {
-            let _gunzip_status = gunzip_child.wait().await
+            // A truncated/corrupt .gz makes gunzip exit non-zero while psql sees a clean
+            // EOF at a statement boundary and exits 0 — the classic EOF-as-success trap.
+            // Fail the restore if decompression did not complete cleanly.
+            let gunzip_status = gunzip_child.wait().await
                 .map_err(|e| format!("gunzip wait error: {e}"))?;
             let docker_output = docker_child.wait_with_output().await
                 .map_err(|e| format!("docker exec wait error: {e}"))?;
+            if !gunzip_status.success() {
+                return Err("PostgreSQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
+            }
             if !docker_output.status.success() {
                 let stderr = String::from_utf8_lossy(&docker_output.stderr);
                 return Err(format!("PostgreSQL restore failed: {stderr}"));
@@ -576,4 +597,33 @@ pub fn get_backup_path(db_name: &str, filename: &str) -> Result<String, String> 
         .to_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "Invalid path encoding".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_db_identifier_rejects_traversal() {
+        // Traversal sequences must be rejected even though '.' is allowed in the charset.
+        assert!(!is_safe_db_identifier(".."));
+        assert!(!is_safe_db_identifier("../etc"));
+        assert!(!is_safe_db_identifier("a/../b"));
+        assert!(!is_safe_db_identifier("foo/bar"));
+        assert!(!is_safe_db_identifier("-leadingdash"));
+        assert!(!is_safe_db_identifier(""));
+        // Legitimate identifiers still pass.
+        assert!(is_safe_db_identifier("wordpress"));
+        assert!(is_safe_db_identifier("my_db-01"));
+        assert!(is_safe_db_identifier("dockpanel-db-wordpress"));
+    }
+
+    #[test]
+    fn safe_filename_rejects_traversal_and_bad_ext() {
+        assert!(!is_safe_filename("../evil.sql.gz"));
+        assert!(!is_safe_filename("a/b.sql.gz"));
+        assert!(!is_safe_filename("dump.txt"));
+        assert!(is_safe_filename("wordpress-20260722-120000.sql.gz"));
+        assert!(is_safe_filename("db-20260722-120000.archive.gz.enc"));
+    }
 }

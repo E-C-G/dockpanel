@@ -88,6 +88,11 @@ pub async fn create_database(
             ..Default::default()
         }),
         memory: Some(256 * 1024 * 1024), // 256MB
+        // Cap CPU at 2 cores (like app containers, which set cpu_period/cpu_quota) so a
+        // heavy query/dump/restore on one tenant's DB container cannot starve co-tenant
+        // containers on the shared host.
+        cpu_period: Some(100_000),
+        cpu_quota: Some(200_000),
         ..Default::default()
     };
 
@@ -250,60 +255,96 @@ pub async fn execute_query(
 ) -> Result<QueryResult, String> {
     let start = std::time::Instant::now();
 
-    let output = match engine {
+    // Build the docker-exec command. kill_on_drop ensures a timed-out (dropped) future
+    // actually terminates the docker exec child rather than leaking an orphaned process.
+    let mut cmd = safe_command("docker");
+    match engine {
         "mysql" | "mariadb" => {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
-                safe_command("docker")
-                    .arg("exec")
-                    .arg("-e")
-                    .arg(format!("MYSQL_PWD={password}"))
-                    .arg(container)
-                    .arg("mariadb")
-                    .arg("-u")
-                    .arg(user)
-                    .arg(database)
-                    .arg("-e")
-                    .arg(sql)
-                    .arg("--batch")
-                    .arg("--column-names")
-                    .output(),
-            )
-            .await
+            cmd.arg("exec")
+                .arg("-e").arg(format!("MYSQL_PWD={password}"))
+                .arg(container)
+                .arg("mariadb").arg("-u").arg(user).arg(database)
+                .arg("-e").arg(sql).arg("--batch").arg("--column-names");
         }
         _ => {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
-                safe_command("docker")
-                    .arg("exec")
-                    .arg("-e")
-                    .arg(format!("PGPASSWORD={password}"))
-                    .arg(container)
-                    .arg("psql")
-                    .arg("-U")
-                    .arg(user)
-                    .arg("-d")
-                    .arg(database)
-                    .arg("-c")
-                    .arg(sql)
-                    .arg("--csv")
-                    .output(),
-            )
-            .await
+            cmd.arg("exec")
+                .arg("-e").arg(format!("PGPASSWORD={password}"))
+                .arg(container)
+                .arg("psql").arg("-U").arg(user).arg("-d").arg(database)
+                .arg("-c").arg(sql).arg("--csv");
         }
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    // Stream stdout with a HARD cap (MAX_OUTPUT_BYTES) instead of buffering the whole
+    // result set with .output(). A tenant could otherwise stream hundreds of MB into the
+    // agent's memory and OOM the shared agent (MemoryMax). stderr is drained concurrently
+    // (bounded) to avoid a pipe-full deadlock.
+    let run = async {
+        use tokio::io::AsyncReadExt;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to execute docker exec: {e}"))?;
+        let mut child_stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+        let mut child_stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+        let stdout_fut = async {
+            let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut overflow = false;
+            loop {
+                let n = match child_stdout.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => return Err(format!("read error: {e}")),
+                };
+                if buf.len() + n > MAX_OUTPUT_BYTES {
+                    overflow = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok::<(Vec<u8>, bool), String>((buf, overflow))
+        };
+        let stderr_fut = async {
+            let mut buf = Vec::new();
+            let _ = (&mut child_stderr).take(64 * 1024).read_to_end(&mut buf).await;
+            buf
+        };
+        let (out_res, err_buf) = tokio::join!(stdout_fut, stderr_fut);
+        let (out_buf, overflow) = out_res?;
+        if overflow {
+            let _ = child.start_kill();
+            return Err(format!(
+                "Query output too large (max {} MB)",
+                MAX_OUTPUT_BYTES / (1024 * 1024)
+            ));
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("docker exec wait error: {e}"))?;
+        Ok::<_, String>((status, out_buf, err_buf))
+    };
+
+    let (status, out_bytes, err_bytes) = match tokio::time::timeout(
+        std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
+        run,
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(format!("Query timed out ({QUERY_TIMEOUT_SECS}s limit)")),
     };
 
     let elapsed = start.elapsed().as_millis() as u64;
 
-    let output = match output {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("Failed to execute docker exec: {e}")),
-        Err(_) => return Err(format!("Query timed out ({QUERY_TIMEOUT_SECS}s limit)")),
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err_bytes);
+        let stdout = String::from_utf8_lossy(&out_bytes);
         let msg = if stderr.trim().is_empty() {
             stdout.trim().to_string()
         } else {
@@ -312,15 +353,7 @@ pub async fn execute_query(
         return Err(msg);
     }
 
-    if output.stdout.len() > MAX_OUTPUT_BYTES {
-        return Err(format!(
-            "Query output too large ({} MB, max {} MB)",
-            output.stdout.len() / (1024 * 1024),
-            MAX_OUTPUT_BYTES / (1024 * 1024)
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&out_bytes);
 
     let (columns, mut rows) = match engine {
         "mysql" | "mariadb" => parse_tsv(&stdout),
@@ -517,6 +550,15 @@ async fn ensure_network(docker: &Docker) -> Result<(), String> {
                 .create_network(CreateNetworkOptions {
                     name: DB_NETWORK,
                     driver: "bridge",
+                    // Disable inter-container communication on the shared DB bridge so a
+                    // compromised/abusive tenant DB container cannot address sibling
+                    // tenants' DB containers (lateral movement). DB containers only need
+                    // their 127.0.0.1-published host port, never container-to-container
+                    // traffic. NOTE: only applies when the network is first created;
+                    // existing installs keep ICC until the network is recreated.
+                    options: HashMap::from([
+                        ("com.docker.network.bridge.enable_icc", "false"),
+                    ]),
                     ..Default::default()
                 })
                 .await

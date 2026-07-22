@@ -6,6 +6,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.19.0] - 2026-07-22
+
+Databases-surface security hardening — the audit-coverage rotation's fresh-eyes pass over the
+per-tenant Databases surface (`routes/databases.rs`, the agent DB container + backup services,
+and the `db-backup` orchestrator handlers). The Databases nav is not admin-only, so every authed
+user reaches these; a 10-lens REFUTE-verified audit found 19 confirmed issues.
+
+### Security
+- **Cross-tenant database password reset (BOLA/TOCTOU) closed.** Every exec/reset path resolved
+  the target Docker container by the per-site (non-unique) name `dockpanel-db-{name}`. During
+  `create()`'s agent round-trip a tenant's transient colliding-name row (empty `container_id`) was
+  list-visible, letting a `reset-password` call reach another tenant's like-named container (the
+  agent's MariaDB reset authenticates as root over the unix socket, needing no victim password).
+  `get_db_info` now refuses to operate on a row with an empty `container_id`; Docker's global name
+  uniqueness guarantees a non-empty `container_id` owns its uniquely-named container.
+- **Per-account database cap + wider port pool.** A single tenant could create databases until the
+  shared, host-wide DB port pool was exhausted, denying database creation to everyone. Added a hard
+  per-account cap (25) and widened the postgres/mysql port ranges.
+- **Reseller database quota is now race-free.** The check-then-increment was TOCTOU-racy (concurrent
+  creates bypassed `max_databases`); replaced with an atomic conditional `UPDATE ... RETURNING`
+  reservation, released on failure.
+- **Query output is streamed with a hard cap + `kill_on_drop`.** `execute_query` buffered the entire
+  result set in the agent's memory (the 5 MB cap was checked only after buffering), so a large-output
+  query could OOM the shared agent; it now streams with an enforced cap and kills timed-out children.
+- **Inter-container communication disabled on the shared DB bridge** (`enable_icc=false`, new
+  networks) to cut lateral movement between tenant DB containers; DB containers also get a CPU quota
+  (like app containers) so a heavy dump/restore cannot starve co-tenants.
+- **Restore no longer reports success on a failed/partial restore.** The postgres/mysql restore
+  pipeline discarded `gunzip`'s exit status and ran `psql` without `ON_ERROR_STOP=1
+  --single-transaction`, so a truncated/corrupt archive imported partially yet returned success. The
+  decompression status is now checked and postgres restores fail-and-roll-back on any error; new
+  postgres dumps use `--clean --if-exists` so a restore overwrites rather than merges.
+- **Point-in-time recovery made honest.** `pitr_restore` returned a false `ok:true` (the postgres
+  path only wrote a WAL marker; the mysql path posted to a non-existent agent route) — it now returns
+  `501 Not Implemented`. PITR enable no longer runs the un-revertable, disk-filling `archive_mode=on`
+  mutation; only the intent flag is persisted until real WAL archiving lands.
+- Defense-in-depth: `restore_db_backup` gained the traversal guard its `delete` sibling already had;
+  `is_safe_db_identifier` rejects `..`/`/`; SQL error responses strip the Docker-daemon prefix.
+
+Backend + agent only; runtime-only (no migration). Verified live on the published 2.19.0 demo.
+
+## [2.18.0] - 2026-07-22
+
+Sites & SSL security hardening (audit-coverage rotation). A 10-lens REFUTE sweep over `sites.rs`,
+`ssl.rs`, and the agent nginx/ssl services (a per-user-ownership BOLA surface) → 15 confirmed fixes:
+2 critical nginx-injection paths (raw `csp_policy`/`permissions_policy` into `add_header` on a
+non-autoescaped `.conf`; `custom_nginx` `;`-chaining past a per-line-token validator), 4 high
+(domain-hijack via `add_alias`; reserved-domain squat via rename/clone; clone admission-control
+bypass; unvalidated `proxy_port` → loopback SSRF + ufw-deny outage), 2 medium (SSL renew + toggle
+handlers rebuilt the vhost from a subset config, dropping WAF/CSP/rate-limit — now via
+`build_nginx_body`), 1 low (TLS keys written 0600-atomic). Shared `is_reserved_domain` +
+`ensure_domain_available`; `is_safe_header_value`; per-statement `validate_custom_nginx`;
+`is_safe_proxy_port`. Backend + agent, runtime-only.
+
+## [2.17.0] - 2026-07-22
+
+Cross-surface authorization-guard sweep. After the authz-inversion class (a state-changing handler
+weaker than its admin-gated read siblings) recurred twice, a 21-lens REFUTE sweep of all 62 route
+files → 10 confirmed inversions admin-gated: CDN (all 8 endpoints + de-scoped get/list), migration
+(all 6), backup-policy CRUD (all 5), incident writers (→ AdminUser, also closing a cross-tenant
+alert-resolve BOLA), plus surgical guards on `install_php_extension`, `ws_metrics`, and vault-scoped
+`secrets` metadata, and an executor volume-branch owner-is-admin defense-in-depth check. Backend
+only; runtime-only. The frontend already gated all of these.
+
 ## [2.16.0] - 2026-07-21
 
 DNS-surface security hardening — the audit-coverage rotation's fresh-eyes pass over the

@@ -942,6 +942,14 @@ pub async fn restore_db_backup(
         "encryption_key": encryption_key,
     });
 
+    // Defense-in-depth (parity with delete_db_backup, which guards this): reject any
+    // traversal in the stored db_name/filename before composing the agent path. Both
+    // come from server-generated rows today, but keep restore and delete symmetric.
+    if backup.filename.contains('/') || backup.filename.contains("..") || backup.filename.contains('\0')
+        || backup.db_name.contains('/') || backup.db_name.contains("..") || backup.db_name.contains('\0') {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid backup path"));
+    }
+
     let agent_path = format!("/db-backups/{}/restore/{}", backup.db_name, backup.filename);
     let result = agent.post(&agent_path, Some(body)).await
         .map_err(|e| agent_error("Database restore", e))?;

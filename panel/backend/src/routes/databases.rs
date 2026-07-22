@@ -7,9 +7,13 @@ use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
 use crate::error::{internal_error, err, agent_error, paginate, ApiError};
-use crate::routes::reseller_dashboard::check_reseller_quota;
 use crate::services::agent::AgentError;
 use crate::AppState;
+
+/// Hard per-account cap on total databases, independent of any reseller quota.
+/// Bounds how much of the shared, host-wide DB port pool + host RAM a single
+/// tenant can consume so one account cannot deny database creation to everyone.
+const MAX_DATABASES_PER_USER: i64 = 25;
 
 /// Convert an agent error to a user-facing error for SQL operations.
 /// Unlike `agent_error()`, this passes through the actual SQL error message.
@@ -21,6 +25,12 @@ fn sql_error(e: AgentError) -> ApiError {
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str().map(String::from)))
                 .unwrap_or(body);
+            // Strip the Docker-daemon infra prefix so only the DB engine's SQL
+            // diagnostic is surfaced (don't leak container/daemon internals).
+            let msg = msg
+                .strip_prefix("Error response from daemon: ")
+                .unwrap_or(&msg)
+                .to_string();
             err(StatusCode::BAD_REQUEST, &msg)
         }
         other => agent_error("SQL query", other),
@@ -97,6 +107,22 @@ pub async fn create(
         return Err(err(StatusCode::NOT_FOUND, "Site not found"));
     }
 
+    // Hard per-account cap on total databases (independent of reseller quota) so a
+    // single tenant cannot exhaust the shared, host-wide DB port pool / host RAM.
+    let (db_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM databases d JOIN sites s ON d.site_id = s.id WHERE s.user_id = $1",
+    )
+    .bind(claims.sub)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| internal_error("create databases", e))?;
+    if db_count >= MAX_DATABASES_PER_USER {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            &format!("Database limit reached ({MAX_DATABASES_PER_USER} per account)"),
+        ));
+    }
+
     // Validate name
     if body.name.is_empty() || body.name.len() > 63 {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid database name"));
@@ -133,9 +159,6 @@ pub async fn create(
         ));
     }
 
-    // Check reseller quota before creating database
-    check_reseller_quota(&state.db, claims.sub, "databases").await?;
-
     // Generate password and find available port
     let password = uuid::Uuid::new_v4().to_string().replace('-', "");
     let port = find_available_port(&state, engine).await?;
@@ -144,9 +167,15 @@ pub async fn create(
     let encrypted_password = crate::services::secrets_crypto::encrypt_credential(&password, &state.config.jwt_secret)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
+    // Atomically reserve one slot against the caller's reseller quota (if any). The old
+    // check-then-increment was TOCTOU-racy — concurrent creates all read the same stale
+    // `used_databases` and each incremented past `max`. A conditional UPDATE ... RETURNING
+    // makes the check and the increment one statement. Released on any failure below.
+    let reserved_quota = reserve_reseller_db_slot(&state, claims.sub).await?;
+
     // Insert DB record first to atomically claim the port (unique index prevents races).
     // container_id is empty until the agent creates it.
-    let db_record: Database = sqlx::query_as(
+    let db_record: Database = match sqlx::query_as(
         "INSERT INTO databases (site_id, name, engine, db_user, db_password_enc, container_id, port) \
          VALUES ($1, $2, $3, $4, $5, '', $6) \
          RETURNING id, site_id, name, engine, db_user, container_id, port, created_at",
@@ -159,13 +188,16 @@ pub async fn create(
     .bind(port)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
-            err(StatusCode::CONFLICT, "Port or database name conflict, please retry")
-        } else {
-            internal_error("create databases", e)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if reserved_quota { release_reseller_db_slot(&state, claims.sub).await; }
+            if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+                return Err(err(StatusCode::CONFLICT, "Port or database name conflict, please retry"));
+            }
+            return Err(internal_error("create databases", e));
         }
-    })?;
+    };
 
     // Call agent to create container
     let agent_body = serde_json::json!({
@@ -178,11 +210,12 @@ pub async fn create(
     let result = match agent.post("/databases", Some(agent_body)).await {
         Ok(r) => r,
         Err(e) => {
-            // Clean up the DB record if agent fails
+            // Clean up the DB record + release the reserved quota slot if the agent fails.
             let _ = sqlx::query("DELETE FROM databases WHERE id = $1")
                 .bind(db_record.id)
                 .execute(&state.db)
                 .await;
+            if reserved_quota { release_reseller_db_slot(&state, claims.sub).await; }
             return Err(agent_error("Database creation", e));
         }
     };
@@ -201,11 +234,7 @@ pub async fn create(
         .await
         .map_err(|e| internal_error("create databases", e))?;
 
-    // Increment reseller database counter
-    let _ = sqlx::query(
-        "UPDATE reseller_profiles SET used_databases = used_databases + 1, updated_at = NOW() \
-         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)"
-    ).bind(claims.sub).execute(&state.db).await;
+    // (Reseller counter already incremented atomically by reserve_reseller_db_slot above.)
 
     tracing::info!("Database created: {} ({}, port {})", body.name, engine, port);
 
@@ -310,8 +339,8 @@ async fn get_db_info(
     id: Uuid,
     user_id: Uuid,
 ) -> Result<(String, String, String, i32), ApiError> {
-    let row: Option<(String, String, String, Option<i32>)> = sqlx::query_as(
-        "SELECT d.name, d.engine, d.db_password_enc, d.port \
+    let row: Option<(String, String, String, Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT d.name, d.engine, d.db_password_enc, d.port, d.container_id \
          FROM databases d JOIN sites s ON d.site_id = s.id \
          WHERE d.id = $1 AND s.user_id = $2",
     )
@@ -321,8 +350,19 @@ async fn get_db_info(
     .await
     .map_err(|e| internal_error("remove databases", e))?;
 
-    let (name, engine, password_enc, port) =
+    let (name, engine, password_enc, port, container_id) =
         row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
+    // Security (H1, v2.19.0): every exec/reset path resolves the target container by
+    // the (per-site, NON-unique) name `dockpanel-db-{name}`. create() inserts the row
+    // with an EMPTY container_id and only fills it after the agent confirms the
+    // container was created; on a global Docker name collision the row is deleted, but
+    // during the agent round-trip a tenant's transient colliding-name row is visible.
+    // Docker's global name uniqueness guarantees a row with a NON-EMPTY container_id
+    // owns its uniquely-named container, so refusing to operate on an empty container_id
+    // closes the cross-tenant reset/query race for every get_db_info caller at once.
+    if container_id.as_deref().unwrap_or("").is_empty() {
+        return Err(err(StatusCode::NOT_FOUND, "Database not found"));
+    }
     let port = port.unwrap_or(5432);
     // Decrypt password for agent use (with legacy plaintext fallback)
     let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(&password_enc, &state.config.jwt_secret);
@@ -628,12 +668,65 @@ pub async fn schema_overview(
     })))
 }
 
+/// Atomically reserve one database slot against the caller's reseller quota.
+/// Returns Ok(true) if a slot was reserved (caller must release it on a later
+/// failure), Ok(false) if the user has no reseller (nothing to enforce/release),
+/// or Err(403) if the reseller's database quota is exhausted. The conditional
+/// UPDATE ... RETURNING makes the quota check and the increment a single atomic
+/// statement, closing the check-then-increment TOCTOU.
+async fn reserve_reseller_db_slot(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+    let reserved: Option<i32> = sqlx::query_scalar(
+        "UPDATE reseller_profiles SET used_databases = used_databases + 1, updated_at = NOW() \
+         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL) \
+           AND (max_databases IS NULL OR used_databases < max_databases) \
+         RETURNING 1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("reserve reseller quota", e))?;
+
+    if reserved.is_some() {
+        return Ok(true); // slot reserved + counter incremented atomically
+    }
+
+    // 0 rows updated: either the user has no reseller/profile (nothing to enforce),
+    // or the profile exists but the quota condition failed (quota exhausted).
+    let has_profile: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT rp.user_id FROM reseller_profiles rp \
+         WHERE rp.user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("reserve reseller quota", e))?;
+
+    if has_profile.is_some() {
+        return Err(err(StatusCode::FORBIDDEN, "Reseller database quota exceeded"));
+    }
+    Ok(false) // no reseller → nothing reserved
+}
+
+/// Release a reserved reseller database slot (compensating decrement) when a
+/// create fails after `reserve_reseller_db_slot` succeeded.
+async fn release_reseller_db_slot(state: &AppState, user_id: Uuid) {
+    let _ = sqlx::query(
+        "UPDATE reseller_profiles SET used_databases = GREATEST(used_databases - 1, 0), updated_at = NOW() \
+         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)",
+    )
+    .bind(user_id)
+    .execute(&state.db)
+    .await;
+}
+
 /// Find an available port using a single SQL query to find the first gap.
 async fn find_available_port(state: &AppState, engine: &str) -> Result<i32, ApiError> {
-    // Choose port range based on engine
+    // Choose port range based on engine. Ranges are intentionally wide so that the
+    // per-account cap (MAX_DATABASES_PER_USER) leaves ample headroom and one tenant
+    // cannot exhaust the shared, host-wide pool.
     let (range_start, range_end) = match engine {
-        "mysql" | "mariadb" => (3307, 3400),
-        _ => (5433, 5500),
+        "mysql" | "mariadb" => (3307, 3600),
+        _ => (5433, 5700),
     };
 
     // Find first unused port in range with a single query
@@ -707,62 +800,24 @@ pub async fn update_pitr_config(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
+    _scope: ServerScope,
     Json(body): Json<PitrConfigRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    // Ownership + container-readiness check (get_db_info also enforces the H1 guard).
+    let (name, _engine, _password, _port) = get_db_info(&state, id, claims.sub).await?;
     let enabled = body.pitr_enabled.unwrap_or(false);
     let hours = body.retention_hours.unwrap_or(24).max(1).min(720);
-    let container = format!("dockpanel-db-{name}");
 
-    // Configure WAL/binlog on the database container
-    if enabled {
-        let config_sql = match engine.as_str() {
-            "postgres" => {
-                // PostgreSQL: enable WAL archiving
-                "ALTER SYSTEM SET wal_level = 'replica'; \
-                 ALTER SYSTEM SET archive_mode = 'on'; \
-                 ALTER SYSTEM SET archive_command = 'cp %p /var/lib/postgresql/data/wal_archive/%f'; \
-                 SELECT pg_reload_conf()".to_string()
-            }
-            "mysql" | "mariadb" => {
-                // MySQL/MariaDB: enable binary logging (already on by default in recent versions)
-                "SET GLOBAL binlog_expire_logs_seconds = ".to_string() + &(hours * 3600).to_string()
-            }
-            _ => return Err(err(StatusCode::BAD_REQUEST, "Unsupported engine for PITR")),
-        };
-
-        // Create WAL archive directory for PostgreSQL
-        if engine == "postgres" {
-            let _ = agent.post("/databases/query", Some(serde_json::json!({
-                "container": &container, "engine": &engine, "user": &name,
-                "password": &password, "database": &name,
-                "sql": "SELECT 1", // Dummy query to ensure container is running
-            }))).await;
-
-            // Create archive dir via exec
-            let _ = agent.post("/exec", Some(serde_json::json!({
-                "container": &container,
-                "command": "mkdir -p /var/lib/postgresql/data/wal_archive",
-            }))).await;
-        }
-
-        // Apply config
-        let _ = agent.post("/databases/query", Some(serde_json::json!({
-            "container": &container, "engine": &engine, "user": &name,
-            "password": &password, "database": &name, "sql": &config_sql,
-        }))).await;
-
-        // Create base backup for PostgreSQL PITR
-        if engine == "postgres" {
-            let _ = agent.post("/exec", Some(serde_json::json!({
-                "container": &container,
-                "command": format!("pg_basebackup -D /var/lib/postgresql/data/pitr_backup -Ft -z -U {} -w", name),
-            }))).await;
-        }
-    }
-
+    // NOTE (v2.19.0): the previous implementation ran `ALTER SYSTEM SET archive_mode='on'`
+    // on enable but the disable path had no inverse — so archiving was un-revertable through
+    // the panel and grew WAL without bound after a container restart (the archive_command
+    // targeted a directory that the accompanying mkdir/pg_basebackup never created, because
+    // those posted to a non-existent agent `/exec` route and were swallowed with `let _ =`).
+    // The harmful/dead container mutation is removed; we persist only the intent flag until
+    // real, symmetric WAL archiving is implemented (pitr_restore returns 501 until then).
     // Save config
+
+
     sqlx::query(
         "INSERT INTO db_pitr_config (database_id, pitr_enabled, retention_hours) \
          VALUES ($1, $2, $3) \
@@ -790,74 +845,22 @@ pub async fn pitr_restore(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
-    Json(body): Json<serde_json::Value>,
+    _scope: ServerScope,
+    Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
-    let container = format!("dockpanel-db-{name}");
+    // Ownership + container-readiness check (get_db_info also enforces the H1 guard).
+    let _ = get_db_info(&state, id, claims.sub).await?;
 
-    let target_time = body.get("target_time").and_then(|v| v.as_str())
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "target_time is required (ISO 8601)"))?;
-
-    // Validate timestamp format
-    let _parsed = chrono::DateTime::parse_from_rfc3339(target_time)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid timestamp format (use ISO 8601)"))?;
-
-    // Check PITR is enabled
-    let config: Option<(bool,)> = sqlx::query_as(
-        "SELECT pitr_enabled FROM db_pitr_config WHERE database_id = $1"
-    ).bind(id).fetch_optional(&state.db).await
-    .map_err(|e| internal_error("pitr restore", e))?;
-
-    if config.map(|(e,)| e) != Some(true) {
-        return Err(err(StatusCode::BAD_REQUEST, "PITR is not enabled for this database"));
-    }
-
-    let restore_result = match engine.as_str() {
-        "postgres" => {
-            // PostgreSQL: use pg_restore with recovery target
-            let sql = format!(
-                "SELECT pg_create_restore_point('pitr_restore_{}'); \
-                 -- Restore target time: {}",
-                chrono::Utc::now().timestamp(), target_time
-            );
-            agent.post("/databases/query", Some(serde_json::json!({
-                "container": &container, "engine": &engine, "user": &name,
-                "password": &password, "database": &name, "sql": &sql,
-            }))).await
-        }
-        "mysql" | "mariadb" => {
-            // MySQL: use mysqlbinlog replay to target timestamp
-            // Validate name and password contain only safe chars to prevent shell injection
-            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Err(err(StatusCode::BAD_REQUEST, "Invalid database name"));
-            }
-            if password.contains('\'') || password.contains('\\') || password.contains('\0') {
-                return Err(internal_error("pitr", "Invalid database password characters"));
-            }
-            let cmd = format!(
-                "mysqlbinlog --stop-datetime='{}' /var/lib/mysql/binlog.* | mysql -u '{}' -p'{}' '{}'",
-                target_time, name, password, name
-            );
-            agent.post("/exec", Some(serde_json::json!({
-                "container": &container,
-                "command": &cmd,
-            }))).await
-        }
-        _ => return Err(err(StatusCode::BAD_REQUEST, "Unsupported engine for PITR")),
-    };
-
-    match restore_result {
-        Ok(_) => {
-            crate::services::activity::log_activity(
-                &state.db, claims.sub, &claims.email, "database.pitr_restore",
-                Some("database"), Some(&name), Some(target_time), None,
-            ).await;
-
-            Ok(Json(serde_json::json!({ "ok": true, "restored_to": target_time })))
-        }
-        Err(e) => Err(agent_error("PITR restore", e)),
-    }
+    // Honesty (v2.19.0): point-in-time restore was never functional and used to LIE.
+    // The postgres branch only wrote a WAL restore-point marker (pg_create_restore_point
+    // performs NO rollback) then returned {ok:true, restored_to:...}; the mysql branch +
+    // the WAL-archive setup posted to a non-existent agent `/exec` route so nothing ran.
+    // Return an explicit 501 instead of a false success until real PITR is implemented
+    // (this also retires the dead mysqlbinlog shell string that only reached the 404 route).
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "Point-in-time restore is not yet implemented",
+    ))
 }
 
 /// POST /api/databases/{id}/reset-password — Reset the database password.
