@@ -100,49 +100,81 @@ fn validate_custom_nginx(custom: &str) -> Result<(), String> {
     }
 
     for line in custom.lines() {
-        let trimmed = line.trim();
+        let line_trimmed = line.trim();
 
         // Skip empty lines
-        if trimmed.is_empty() {
+        if line_trimmed.is_empty() {
             continue;
         }
 
         // Reject comment-only lines (comment injection)
-        if trimmed.starts_with('#') {
+        if line_trimmed.starts_with('#') {
             return Err("Custom nginx config must not contain comment lines starting with '#'".into());
         }
 
-        // Check for dangerous directives (case-insensitive)
-        let lower = trimmed.to_lowercase();
-        for dangerous in DANGEROUS_DIRECTIVES {
-            if lower.starts_with(dangerous) {
+        // nginx separates statements with ';', so a single LINE can carry many
+        // directives. Validating only the first token let an attacker smuggle a
+        // dangerous directive past the whitelist, e.g.
+        //   "sendfile on; access_log /var/www/victim/public/shell.php;"
+        // (leading token 'sendfile' is allowed, the chained access_log was never
+        // inspected → cross-tenant log-poisoning file-write/RCE). Split on ';'
+        // and validate EVERY statement independently.
+        for stmt in line_trimmed.split(';') {
+            let trimmed = stmt.trim();
+
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // A statement must not start a comment either.
+            if trimmed.starts_with('#') {
+                return Err("Custom nginx config must not contain comment lines starting with '#'".into());
+            }
+
+            // Check for dangerous directives (case-insensitive)
+            let lower = trimmed.to_lowercase();
+            for dangerous in DANGEROUS_DIRECTIVES {
+                if lower.starts_with(dangerous) {
+                    return Err(format!(
+                        "Custom nginx config contains forbidden directive: {dangerous}"
+                    ));
+                }
+            }
+
+            // Extract the directive name (first word of the statement)
+            let directive = trimmed
+                .split(|c: char| c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+
+            if directive.is_empty() {
+                continue;
+            }
+
+            if !ALLOWED_NGINX_DIRECTIVES.contains(&directive.as_str()) {
                 return Err(format!(
-                    "Custom nginx config contains forbidden directive: {dangerous}"
+                    "Custom nginx directive '{}' is not in the allowed list. Allowed: {}",
+                    directive,
+                    ALLOWED_NGINX_DIRECTIVES.join(", ")
                 ));
             }
-        }
-
-        // Extract the directive name (first word before whitespace or ';')
-        let directive = trimmed
-            .split(|c: char| c.is_whitespace() || c == ';')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-
-        if directive.is_empty() {
-            continue;
-        }
-
-        if !ALLOWED_NGINX_DIRECTIVES.contains(&directive.as_str()) {
-            return Err(format!(
-                "Custom nginx directive '{}' is not in the allowed list. Allowed: {}",
-                directive,
-                ALLOWED_NGINX_DIRECTIVES.join(", ")
-            ));
         }
     }
 
     Ok(())
+}
+
+/// Defense-in-depth: strip characters that would break out of an
+/// `add_header Name "<value>" always;` directive. The backend already rejects
+/// these (routes/mod.rs::is_safe_header_value), but the agent renders the value
+/// into a root-owned nginx config, so it sanitizes again at this render choke
+/// point — any future/legacy caller that forwards an unvalidated CSP /
+/// Permissions-Policy value cannot inject nginx directives.
+fn sanitize_header_value(v: &str) -> String {
+    v.chars()
+        .filter(|c| !matches!(c, '"' | '\\' | '\n' | '\r' | '\0' | '{' | '}'))
+        .collect()
 }
 
 /// Validate a PHP-FPM socket path.
@@ -217,8 +249,15 @@ pub fn render_site_config(
     ctx.insert("waf_mode", &config.waf_mode.as_deref().unwrap_or("detection"));
 
     // CSP and security headers
-    ctx.insert("csp_policy", &config.csp_policy.as_deref().unwrap_or(""));
-    ctx.insert("permissions_policy", &config.permissions_policy.as_deref().unwrap_or("camera=(), microphone=(), geolocation=()"));
+    // Rendered verbatim into `add_header ... "<value>" always;` — sanitize so a
+    // stray `"`/`\`/brace cannot break out of the quoted argument and inject
+    // directives (backend also validates via is_safe_header_value).
+    let csp_safe = sanitize_header_value(config.csp_policy.as_deref().unwrap_or(""));
+    let perms_safe = sanitize_header_value(
+        config.permissions_policy.as_deref().unwrap_or("camera=(), microphone=(), geolocation=()"),
+    );
+    ctx.insert("csp_policy", &csp_safe);
+    ctx.insert("permissions_policy", &perms_safe);
 
     // Bot protection
     ctx.insert("bot_protection", &config.bot_protection.as_deref().unwrap_or("off"));
@@ -381,5 +420,43 @@ pub async fn reload() -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::error!("Nginx reload failed: {stderr}");
         Err(format!("Nginx reload failed: {stderr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── custom_nginx per-statement validation — s241 C2 ─────────────────
+
+    #[test]
+    fn custom_nginx_blocks_semicolon_chained_directive() {
+        // The whole-line-token bypass: a whitelisted leading directive must not
+        // let a dangerous directive ride along after ';'.
+        assert!(validate_custom_nginx("sendfile on; access_log /var/www/victim/public/shell.php;").is_err());
+        assert!(validate_custom_nginx("gzip on; return 301 https://evil$request_uri;").is_err());
+        assert!(validate_custom_nginx("add_header X y; proxy_pass http://169.254.169.254/;").is_err());
+        assert!(validate_custom_nginx("client_max_body_size 10m; error_log /tmp/x;").is_err());
+    }
+
+    #[test]
+    fn custom_nginx_allows_benign_statements() {
+        assert!(validate_custom_nginx("client_max_body_size 20m;").is_ok());
+        assert!(validate_custom_nginx("gzip on; gzip_types text/css application/json;").is_ok());
+        assert!(validate_custom_nginx("").is_ok());
+        // Block-escape and comment injection still rejected.
+        assert!(validate_custom_nginx("location / { root /etc; }").is_err());
+        assert!(validate_custom_nginx("# sneaky").is_err());
+    }
+
+    // ── header-value sanitization — s241 C1 (agent defense-in-depth) ────
+
+    #[test]
+    fn header_sanitize_strips_breakout_chars() {
+        assert_eq!(sanitize_header_value("default-src 'self'; script-src 'self'"), "default-src 'self'; script-src 'self'");
+        // Quote / backslash / braces removed so they can't close the add_header arg.
+        assert_eq!(sanitize_header_value("x\" always; location /p { }"), "x always; location /p  ");
+        assert!(!sanitize_header_value("a\"b\\c{d}").contains('"'));
+        assert!(!sanitize_header_value("a\"b\\c{d}").contains('\\'));
     }
 }

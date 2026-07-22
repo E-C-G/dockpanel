@@ -283,6 +283,26 @@ async fn auto_fix_safe_findings(
                 {
                     Ok(_) => {
                         tracing::info!("Auto-fix: SSL renewed successfully for {domain}");
+
+                        // Preserve the site's full config (WAF/CSP/Permissions-
+                        // Policy/rate-limit/custom_nginx/bot-protection) — the
+                        // agent's provision only renders a subset. Best-effort.
+                        if let Ok(site) = sqlx::query_as::<_, crate::models::Site>("SELECT * FROM sites WHERE domain = $1")
+                            .bind(domain)
+                            .fetch_one(pool)
+                            .await
+                        {
+                            if let Err(e) = agent
+                                .put(
+                                    &format!("/nginx/sites/{}", site.domain),
+                                    crate::routes::sites::build_nginx_body(&site),
+                                )
+                                .await
+                            {
+                                tracing::warn!("Auto-fix: full vhost rebuild after SSL renewal failed for {}: {e}", site.domain);
+                            }
+                        }
+
                         crate::services::system_log::log_event(
                             pool,
                             "info",

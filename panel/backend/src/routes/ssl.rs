@@ -12,6 +12,38 @@ use crate::models::Site;
 use crate::AppState;
 use crate::services::activity;
 
+/// After an SSL provision/renew, re-render the FULL nginx vhost from the site's
+/// current DB config. The agent's SSL provision/renew only renders a SUBSET
+/// (WAF / CSP / Permissions-Policy / rate-limit / custom_nginx / bot-protection
+/// all default off), so without this a renewal silently strips a hardened site's
+/// security directives. `build_nginx_body` is the same canonical builder every
+/// other config-rebuild path uses. Best-effort: a failure leaves the site on the
+/// agent's (functional, SSL-enabled) subset config and is logged.
+async fn rebuild_vhost_after_ssl(
+    state: &AppState,
+    agent: &crate::services::agent::AgentHandle,
+    site_id: Uuid,
+) {
+    match sqlx::query_as::<_, Site>("SELECT * FROM sites WHERE id = $1")
+        .bind(site_id)
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(site) => {
+            if let Err(e) = agent
+                .put(
+                    &format!("/nginx/sites/{}", site.domain),
+                    crate::routes::sites::build_nginx_body(&site),
+                )
+                .await
+            {
+                tracing::warn!("Full vhost rebuild after SSL op failed for {}: {e}", site.domain);
+            }
+        }
+        Err(e) => tracing::warn!("Vhost rebuild after SSL op: could not load site {site_id}: {e}"),
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct ProvisionQuery {
     /// Optional ACME profile override ("classic" / "tlsserver" / "shortlived").
@@ -174,6 +206,8 @@ pub async fn provision(
 
     tracing::info!("SSL provisioned for {}", site.domain);
 
+    rebuild_vhost_after_ssl(&state, &agent, id).await;
+
     // GAP 15: Auto-activate paused monitors now that SSL/DNS is working
     let _ = sqlx::query(
         "UPDATE monitors SET enabled = TRUE WHERE site_id = $1 AND enabled = FALSE AND status = 'pending'"
@@ -327,6 +361,8 @@ pub async fn provision_dns01(
     .await
     .map_err(|e| internal_error("dns01 update", e))?;
 
+    rebuild_vhost_after_ssl(&state, &agent, id).await;
+
     let label = if wildcard { "Wildcard SSL (DNS-01)" } else { "SSL (DNS-01)" };
     tracing::info!("{label} provisioned for {}", site.domain);
     activity::log_activity(
@@ -436,6 +472,8 @@ pub async fn renew(
             .await;
         }
     }
+
+    rebuild_vhost_after_ssl(&state, &agent, id).await;
 
     tracing::info!("SSL renewed for {} by {}", site.domain, claims.email);
     activity::log_activity(

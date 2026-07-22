@@ -175,14 +175,14 @@ async fn upload_cert(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Failed to write cert: {e}") })),
         ))?;
-    tokio::fs::write(&key_path, &body.private_key).await
+    // Write the private key 0600-at-creation. The previous write-then-async-chmod
+    // left the key world/group-readable (0644) for the duration of a chmod
+    // subprocess — a local disclosure race on a shared box.
+    ssl::write_key_file(&key_path, &body.private_key).await
         .map_err(|e| (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to write key: {e}") })),
+            Json(serde_json::json!({ "error": e })),
         ))?;
-
-    // Set permissions
-    let _ = safe_command("chmod").args(["600", &key_path]).output().await;
 
     // Enable SSL in nginx — read existing config to determine runtime
     let site_conf = format!("/etc/nginx/sites-enabled/{}.conf", body.domain);

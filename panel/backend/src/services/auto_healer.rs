@@ -665,6 +665,26 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
                 }
             }
             tracing::info!("Auto-heal: SSL renewed for {domain}");
+
+            // Re-render the full vhost so the auto-renewal preserves the site's
+            // WAF / CSP / Permissions-Policy / rate-limit / custom_nginx /
+            // bot-protection (the agent's renew only renders a subset). Best-effort.
+            if let Ok(site) = sqlx::query_as::<_, crate::models::Site>("SELECT * FROM sites WHERE id = $1")
+                .bind(site_id)
+                .fetch_one(pool)
+                .await
+            {
+                if let Err(e) = agent
+                    .put(
+                        &format!("/nginx/sites/{}", site.domain),
+                        crate::routes::sites::build_nginx_body(&site),
+                    )
+                    .await
+                {
+                    tracing::warn!("Auto-heal: full vhost rebuild after renewal failed for {}: {e}", site.domain);
+                }
+            }
+
             SSL_RENEWALS_SUCCESS.fetch_add(1, Ordering::Relaxed);
 
             // Panel notification

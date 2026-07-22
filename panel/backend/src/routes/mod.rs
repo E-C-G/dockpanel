@@ -94,6 +94,36 @@ pub fn is_valid_domain(domain: &str) -> bool {
     }) && domain.contains('.')
 }
 
+/// Reserved panel/control-plane domains that a tenant must never be able to
+/// claim, alias onto, clone onto, or rename onto. Mirrors the list `create()`
+/// enforces (routes/sites.rs) — factored out so every domain-introducing path
+/// (create / clone / rename / add_alias) shares ONE guard and cannot drift.
+/// Matches an exact domain or any subdomain of a reserved zone.
+pub fn is_reserved_domain(domain: &str) -> bool {
+    const RESERVED: [&str; 3] = ["dockpanel.dev", "panel.example.com", "docs.dockpanel.dev"];
+    let d = domain.trim().to_lowercase();
+    RESERVED
+        .iter()
+        .any(|r| d == *r || d.ends_with(&format!(".{r}")))
+}
+
+/// Validate a value destined for an nginx `add_header Name "<value>" always;`
+/// directive (CSP / Permissions-Policy). The value is rendered verbatim inside a
+/// double-quoted argument in a `.conf` template, and Tera does NOT autoescape
+/// `.conf`, so an unescaped `"` (or a trailing `\`) closes the quoted string
+/// early and lets the remainder inject arbitrary nginx directives. `;` is
+/// intentionally allowed — a real CSP uses it as a directive separator and it is
+/// inert inside the quotes.
+pub fn is_safe_header_value(v: &str) -> bool {
+    !v.contains('"')
+        && !v.contains('\\')
+        && !v.contains('\n')
+        && !v.contains('\r')
+        && !v.contains('\0')
+        && !v.contains('{')
+        && !v.contains('}')
+}
+
 /// Validate a resource name (database, app, etc.).
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -329,6 +359,13 @@ pub fn is_safe_nginx_config(config: &str) -> Result<(), &'static str> {
         "ssl_certificate /etc/shadow",
         "alias /etc/", "alias /root/", "alias /home/",
         "root /etc/", "root /root/", "root /home/",
+        // File-writing directives: an attacker chained one past the agent's
+        // per-line whitelist via ';' (e.g. "sendfile on; access_log
+        // /var/www/victim/public/shell.php;") to poison a log into another
+        // tenant's webroot. A substring match catches it regardless of position;
+        // the agent's per-statement allowlist (services/nginx.rs) is the
+        // authoritative gate.
+        "access_log", "error_log",
     ];
     for d in &dangerous {
         if lower.contains(d) {
@@ -342,6 +379,46 @@ pub fn is_safe_nginx_config(config: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Reserved (control-plane) domains — s241 H2/H3 ───────────────────
+
+    #[test]
+    fn reserved_domains_rejected() {
+        assert!(is_reserved_domain("dockpanel.dev"));
+        assert!(is_reserved_domain("docs.dockpanel.dev"));
+        assert!(is_reserved_domain("anything.dockpanel.dev")); // subdomain
+        assert!(is_reserved_domain("DOCKPANEL.DEV")); // case-insensitive
+        assert!(is_reserved_domain("panel.example.com"));
+        // Legitimate tenant domains are allowed.
+        assert!(!is_reserved_domain("example.com"));
+        assert!(!is_reserved_domain("dockpanel.dev.evil.com")); // not a suffix match
+        assert!(!is_reserved_domain("notdockpanel.dev")); // no leading dot
+    }
+
+    // ── add_header value validation — s241 C1 ───────────────────────────
+
+    #[test]
+    fn header_value_rejects_nginx_breakout() {
+        // A real CSP (semicolons + single quotes) is accepted.
+        assert!(is_safe_header_value("default-src 'self'; script-src 'self' https:"));
+        assert!(is_safe_header_value("camera=(), microphone=(), geolocation=()"));
+        // The break-out characters that close the quoted add_header argument are rejected.
+        assert!(!is_safe_header_value("x\" always; location /pwn/ { alias /var/www/; }"));
+        assert!(!is_safe_header_value("a\\")); // trailing backslash escapes the closing quote
+        assert!(!is_safe_header_value("a\nb"));
+        assert!(!is_safe_header_value("a{b}"));
+    }
+
+    // ── custom_nginx blocklist — s241 C2 (backend defense-in-depth) ─────
+
+    #[test]
+    fn nginx_config_blocks_chained_access_log() {
+        // The ';'-chained log-poisoning payload must be rejected at the backend too.
+        assert!(is_safe_nginx_config("sendfile on; access_log /var/www/victim/public/shell.php;").is_err());
+        assert!(is_safe_nginx_config("gzip on; error_log /var/www/x/y.php;").is_err());
+        // A benign directive still passes.
+        assert!(is_safe_nginx_config("client_max_body_size 20m;").is_ok());
+    }
 
     // ── Domain validation ───────────────────────────────────────────────
 

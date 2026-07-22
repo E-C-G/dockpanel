@@ -146,10 +146,8 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
 
-    // Block reserved panel domains
-    let reserved = ["dockpanel.dev", "panel.example.com", "docs.dockpanel.dev"];
-    let domain_lower = body.domain.to_lowercase();
-    if reserved.iter().any(|r| domain_lower == *r || domain_lower.ends_with(&format!(".{r}"))) {
+    // Block reserved panel domains (shared guard — see clone/rename/add_alias).
+    if crate::routes::is_reserved_domain(&body.domain) {
         return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
     }
 
@@ -166,6 +164,32 @@ pub async fn create(
             StatusCode::BAD_REQUEST,
             "proxy_port is required for proxy runtime",
         ));
+    }
+
+    // Validate an explicitly-supplied proxy port. Unvalidated, it (a) renders as
+    // `proxy_pass http://127.0.0.1:<port>` → loopback SSRF into internal
+    // services, and (b) is fed to the auto-firewall `ufw deny <port>/tcp`, which
+    // would clobber a global allow rule (e.g. deny 443 → box-wide outage).
+    // Auto-allocated node/python ports (chosen below from a free 5000-5999 slot)
+    // are inherently safe and skip this.
+    if let Some(port) = body.proxy_port {
+        if !is_safe_proxy_port(port) {
+            return Err(err(StatusCode::BAD_REQUEST,
+                "proxy_port must be between 1024 and 65535 and not a reserved/system port"));
+        }
+        let taken: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM sites WHERE proxy_port = $1 AND server_id = $2 AND user_id <> $3",
+        )
+        .bind(port)
+        .bind(server_id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("proxy port check", e))?;
+        if taken.is_some() {
+            return Err(err(StatusCode::CONFLICT,
+                "That port is already in use by another site on this server"));
+        }
     }
 
     // Node/Python require app_command
@@ -959,31 +983,12 @@ pub async fn switch_php(
         ));
     }
 
-    let mut agent_body = serde_json::json!({
-        "runtime": "php",
-        "php_socket": format!("unix:/run/php/php{version}-fpm.sock"),
-        "fastcgi_cache": site.fastcgi_cache,
-        "redis_cache": site.redis_cache,
-        "redis_db": site.redis_db,
-        "waf_enabled": site.waf_enabled,
-        "waf_mode": site.waf_mode,
-    });
-
-    if let Some(ref preset) = site.php_preset {
-        agent_body["php_preset"] = serde_json::json!(preset);
-    }
-    if let Some(ref custom) = site.custom_nginx {
-        agent_body["custom_nginx"] = serde_json::json!(custom);
-    }
-    if site.ssl_enabled {
-        agent_body["ssl"] = serde_json::json!(true);
-        if let Some(ref cert) = site.ssl_cert_path {
-            agent_body["ssl_cert"] = serde_json::json!(cert);
-        }
-        if let Some(ref key) = site.ssl_key_path {
-            agent_body["ssl_key"] = serde_json::json!(key);
-        }
-    }
+    // Rebuild the FULL vhost from current config with only php_version changed.
+    // A hand-rolled partial body would silently drop the site's WAF / CSP /
+    // Permissions-Policy / bot-protection on every PHP switch.
+    let mut updated_site = site.clone();
+    updated_site.php_version = Some(version.to_string());
+    let agent_body = build_nginx_body(&updated_site);
 
     let agent_path = format!("/nginx/sites/{}", site.domain);
     agent
@@ -1139,42 +1144,10 @@ pub async fn update_limits(
     .await
     .map_err(|e| internal_error("update limits", e))?;
 
-    let mut agent_body = serde_json::json!({
-        "runtime": site.runtime,
-        "rate_limit": body.rate_limit,
-        "max_upload_mb": max_upload,
-        "php_memory_mb": php_memory,
-        "php_max_workers": php_workers,
-        "fastcgi_cache": site.fastcgi_cache,
-        "redis_cache": site.redis_cache,
-        "redis_db": site.redis_db,
-        "waf_enabled": site.waf_enabled,
-        "waf_mode": site.waf_mode,
-    });
-    if let Some(ref custom) = body.custom_nginx {
-        agent_body["custom_nginx"] = serde_json::json!(custom);
-    } else if let Some(ref existing) = site.custom_nginx {
-        agent_body["custom_nginx"] = serde_json::json!(existing);
-    }
-    if let Some(ref preset) = site.php_preset {
-        agent_body["php_preset"] = serde_json::json!(preset);
-    }
-
-    if let Some(port) = site.proxy_port {
-        agent_body["proxy_port"] = serde_json::json!(port);
-    }
-    if let Some(ref php) = site.php_version {
-        agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
-    }
-    if site.ssl_enabled {
-        agent_body["ssl"] = serde_json::json!(true);
-        if let Some(ref cert) = site.ssl_cert_path {
-            agent_body["ssl_cert"] = serde_json::json!(cert);
-        }
-        if let Some(ref key) = site.ssl_key_path {
-            agent_body["ssl_key"] = serde_json::json!(key);
-        }
-    }
+    // Rebuild the FULL vhost from the post-update site (includes the new limits +
+    // custom_nginx AND the site's WAF/CSP/Permissions-Policy/bot-protection that
+    // a hand-rolled partial body used to drop).
+    let agent_body = build_nginx_body(&updated);
 
     let agent_path = format!("/nginx/sites/{}", site.domain);
     agent
@@ -1597,7 +1570,7 @@ pub struct AddAliasBody {
 pub async fn add_alias(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<AddAliasBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1606,6 +1579,14 @@ pub async fn add_alias(
     }
 
     let domain = site_domain(&state, id, claims.sub).await?;
+
+    // An alias becomes an nginx `server_name` on the caller's own vhost. Without
+    // this guard any tenant could attach ANOTHER tenant's (or the panel's own)
+    // live domain as an alias and hijack its traffic / intercept its ACME
+    // HTTP-01 challenge. Reject reserved domains and any domain already served
+    // by a site or git deployment on this server.
+    ensure_domain_available(&state, &body.alias, server_id).await?;
+
     let result = agent
         .post(
             "/nginx/aliases/add",
@@ -1882,6 +1863,35 @@ pub async fn clone_site(
         .map_err(|e| internal_error("clone site", e))?;
     let source = source.ok_or_else(|| err(StatusCode::NOT_FOUND, "Source site not found"))?;
 
+    // clone_site creates a brand-new site and must enforce the SAME admission
+    // controls create() does — otherwise it is a create() with none of the
+    // guards: it bypassed lockdown, the per-hour rate limit, the reseller quota,
+    // the reserved-domain block, and the cross-table (git_deploys) uniqueness
+    // check, letting a tenant mass-create sites during a lockdown and even
+    // overwrite another tenant's git-deployed domain.
+    if security_hardening::is_locked_down(&state.db).await {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "System is in lockdown mode"));
+    }
+    {
+        let max_sites: i64 = security_hardening::get_setting_bool(&state.db, "security_site_rate_limit", true)
+            .await
+            .then(|| 3i64)
+            .unwrap_or(999);
+        let recent: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sites WHERE user_id = $1 AND created_at > NOW() - INTERVAL '1 hour'",
+        )
+        .bind(claims.sub)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((0,));
+        if recent.0 >= max_sites {
+            return Err(err(StatusCode::TOO_MANY_REQUESTS,
+                &format!("Site creation rate limit: max {max_sites} sites per hour")));
+        }
+    }
+    check_reseller_quota(&state.db, claims.sub, "sites").await?;
+    ensure_domain_available(&state, target_domain, server_id).await?;
+
     // Create new site record
     let new_site: Site = sqlx::query_as(
         "INSERT INTO sites (user_id, server_id, domain, runtime, status, php_version, root_path, rate_limit, max_upload_mb, php_memory_mb, php_max_workers, php_preset, app_command) \
@@ -1939,6 +1949,13 @@ pub async fn clone_site(
 
     activity::log_activity(&state.db, claims.sub, &claims.email, "site.clone",
         Some("site"), Some(target_domain), Some(&source.domain), None).await;
+
+    // Increment reseller site counter (parity with create() — clone previously
+    // left the quota counter stale, permanently under-counting a tenant's sites).
+    let _ = sqlx::query(
+        "UPDATE reseller_profiles SET used_sites = used_sites + 1, updated_at = NOW() \
+         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)"
+    ).bind(claims.sub).execute(&state.db).await;
 
     fire_event(&state.db, "site.created", serde_json::json!({
         "site_id": new_site.id, "domain": target_domain, "runtime": &source.runtime, "cloned_from": &source.domain,
@@ -2134,6 +2151,13 @@ pub async fn rename_domain(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
 
+    // Same reserved-domain block create() enforces — otherwise a tenant could
+    // rename a site they own onto a panel control-plane domain (dockpanel.dev /
+    // docs.dockpanel.dev) and shadow the panel's own vhost for phishing.
+    if crate::routes::is_reserved_domain(&new_domain) {
+        return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
+    }
+
     if new_domain == site.domain {
         return Err(err(StatusCode::BAD_REQUEST, "New domain is the same as current domain"));
     }
@@ -2311,37 +2335,13 @@ pub async fn toggle_fastcgi_cache(
         })));
     }
 
-    // Rebuild nginx config with cache setting
-    let mut agent_body = serde_json::json!({
-        "runtime": "php",
-        "fastcgi_cache": enabled,
-        "rate_limit": site.rate_limit,
-        "max_upload_mb": site.max_upload_mb,
-        "php_memory_mb": site.php_memory_mb,
-        "php_max_workers": site.php_max_workers,
-    });
-    if let Some(ref preset) = site.php_preset {
-        agent_body["php_preset"] = serde_json::json!(preset);
-    }
-    if let Some(ref custom) = site.custom_nginx {
-        agent_body["custom_nginx"] = serde_json::json!(custom);
-    }
-    if let Some(ref php) = site.php_version {
-        agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
-    }
-    if site.ssl_enabled {
-        agent_body["ssl"] = serde_json::json!(true);
-        if let Some(ref cert) = site.ssl_cert_path {
-            agent_body["ssl_cert"] = serde_json::json!(cert);
-        }
-        if let Some(ref key) = site.ssl_key_path {
-            agent_body["ssl_key"] = serde_json::json!(key);
-        }
-    }
-
+    // Rebuild the FULL vhost with only fastcgi_cache changed — a hand-rolled
+    // partial body used to drop the site's WAF/CSP/Permissions-Policy/bot-protection.
+    let mut updated_site = site.clone();
+    updated_site.fastcgi_cache = enabled;
     agent.put(
         &format!("/nginx/sites/{}", site.domain),
-        agent_body,
+        build_nginx_body(&updated_site),
     ).await.map_err(|e| agent_error("FastCGI cache", e))?;
 
     // Update DB
@@ -2477,39 +2477,14 @@ pub async fn toggle_redis_cache(
         ).await.map_err(|e| agent_error("Redis cache disable", e))?;
     }
 
-    // Rebuild nginx config with redis_cache setting
-    let mut agent_body = serde_json::json!({
-        "runtime": "php",
-        "fastcgi_cache": site.fastcgi_cache,
-        "redis_cache": enabled,
-        "redis_db": redis_db,
-        "rate_limit": site.rate_limit,
-        "max_upload_mb": site.max_upload_mb,
-        "php_memory_mb": site.php_memory_mb,
-        "php_max_workers": site.php_max_workers,
-    });
-    if let Some(ref preset) = site.php_preset {
-        agent_body["php_preset"] = serde_json::json!(preset);
-    }
-    if let Some(ref custom) = site.custom_nginx {
-        agent_body["custom_nginx"] = serde_json::json!(custom);
-    }
-    if let Some(ref php) = site.php_version {
-        agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
-    }
-    if site.ssl_enabled {
-        agent_body["ssl"] = serde_json::json!(true);
-        if let Some(ref cert) = site.ssl_cert_path {
-            agent_body["ssl_cert"] = serde_json::json!(cert);
-        }
-        if let Some(ref key) = site.ssl_key_path {
-            agent_body["ssl_key"] = serde_json::json!(key);
-        }
-    }
-
+    // Rebuild the FULL vhost with only redis settings changed — a hand-rolled
+    // partial body used to drop the site's WAF/CSP/Permissions-Policy/bot-protection.
+    let mut updated_site = site.clone();
+    updated_site.redis_cache = enabled;
+    updated_site.redis_db = redis_db;
     agent.put(
         &format!("/nginx/sites/{}", site.domain),
-        agent_body,
+        build_nginx_body(&updated_site),
     ).await.map_err(|e| agent_error("Redis nginx config", e))?;
 
     // Update DB
@@ -2614,41 +2589,14 @@ pub async fn toggle_waf(
         ).await.map_err(|e| agent_error("WAF configure", e))?;
     }
 
-    // Rebuild nginx config with WAF setting
-    let mut agent_body = serde_json::json!({
-        "runtime": site.runtime,
-        "fastcgi_cache": site.fastcgi_cache,
-        "redis_cache": site.redis_cache,
-        "redis_db": site.redis_db,
-        "waf_enabled": enabled,
-        "waf_mode": mode,
-        "rate_limit": site.rate_limit,
-        "max_upload_mb": site.max_upload_mb,
-        "php_memory_mb": site.php_memory_mb,
-        "php_max_workers": site.php_max_workers,
-    });
-    if let Some(ref preset) = site.php_preset {
-        agent_body["php_preset"] = serde_json::json!(preset);
-    }
-    if let Some(ref custom) = site.custom_nginx {
-        agent_body["custom_nginx"] = serde_json::json!(custom);
-    }
-    if let Some(ref php) = site.php_version {
-        agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
-    }
-    if site.ssl_enabled {
-        agent_body["ssl"] = serde_json::json!(true);
-        if let Some(ref cert) = site.ssl_cert_path {
-            agent_body["ssl_cert"] = serde_json::json!(cert);
-        }
-        if let Some(ref key) = site.ssl_key_path {
-            agent_body["ssl_key"] = serde_json::json!(key);
-        }
-    }
-
+    // Rebuild the FULL vhost with only WAF settings changed — a hand-rolled
+    // partial body used to drop the site's CSP/Permissions-Policy/bot-protection.
+    let mut updated_site = site.clone();
+    updated_site.waf_enabled = enabled;
+    updated_site.waf_mode = mode.to_string();
     agent.put(
         &format!("/nginx/sites/{}", site.domain),
-        agent_body,
+        build_nginx_body(&updated_site),
     ).await.map_err(|e| agent_error("WAF nginx config", e))?;
 
     // Update DB
@@ -2748,8 +2696,53 @@ pub async fn optimize_images(
     Ok(Json(result))
 }
 
+/// Reserved/system/panel ports a user-supplied `proxy_port` must never be.
+/// Choosing one enables loopback SSRF (`proxy_pass http://127.0.0.1:<port>`)
+/// into internal services AND lets the auto-firewall `ufw deny <port>/tcp`
+/// clobber a global allow rule (e.g. deny 443 → box-wide HTTPS outage).
+fn is_safe_proxy_port(port: i32) -> bool {
+    const RESERVED: [i32; 20] = [
+        22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 5432, 6379,
+        27017, 11211, 3080, 8443, 9443, 2019,
+    ];
+    (1024..=65535).contains(&port) && !RESERVED.contains(&port)
+}
+
+/// Shared new-domain guard: rejects reserved control-plane domains and any
+/// domain already claimed by a site or a git deployment on this server. Used by
+/// clone_site and add_alias so the guard set create() enforces cannot drift.
+async fn ensure_domain_available(
+    state: &AppState,
+    domain: &str,
+    server_id: Uuid,
+) -> Result<(), ApiError> {
+    if crate::routes::is_reserved_domain(domain) {
+        return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
+    }
+    let existing: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM sites WHERE domain = $1")
+        .bind(domain)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("domain availability", e))?;
+    if existing.is_some() {
+        return Err(err(StatusCode::CONFLICT, "Domain already in use"));
+    }
+    let git_conflict: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM git_deploys WHERE domain = $1 AND server_id = $2",
+    )
+    .bind(domain)
+    .bind(server_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("domain availability", e))?;
+    if git_conflict.is_some() {
+        return Err(err(StatusCode::CONFLICT, "Domain already in use by a git deployment"));
+    }
+    Ok(())
+}
+
 /// Build the full nginx agent body from a Site model. Shared by all config-rebuild paths.
-fn build_nginx_body(site: &crate::models::Site) -> serde_json::Value {
+pub(crate) fn build_nginx_body(site: &crate::models::Site) -> serde_json::Value {
     let mut body = serde_json::json!({
         "runtime": site.runtime,
         "fastcgi_cache": site.fastcgi_cache,
@@ -2810,18 +2803,25 @@ pub async fn update_security_headers(
     let csp = body.get("csp_policy").and_then(|v| v.as_str()).map(|s| s.to_string());
     let perms = body.get("permissions_policy").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    // Validate CSP (max 4KB, no dangerous injections)
+    // Validate CSP (max 4KB, no nginx directive injection). Both values render
+    // verbatim into `add_header ... "<value>" always;`, so a `"` (or `\`/brace)
+    // would break out of the quoted argument and inject arbitrary root-run nginx
+    // directives (location/alias/access_log/proxy_pass). is_safe_header_value
+    // keeps `;` (a real CSP needs it) but rejects the break-out characters.
     if let Some(ref csp_val) = csp {
         if csp_val.len() > 4096 {
             return Err(err(StatusCode::BAD_REQUEST, "CSP policy must be under 4KB"));
         }
-        if csp_val.contains('\n') || csp_val.contains('\r') || csp_val.contains('\0') {
+        if !crate::routes::is_safe_header_value(csp_val) {
             return Err(err(StatusCode::BAD_REQUEST, "CSP policy contains invalid characters"));
         }
     }
     if let Some(ref perms_val) = perms {
         if perms_val.len() > 2048 {
             return Err(err(StatusCode::BAD_REQUEST, "Permissions-Policy must be under 2KB"));
+        }
+        if !crate::routes::is_safe_header_value(perms_val) {
+            return Err(err(StatusCode::BAD_REQUEST, "Permissions-Policy contains invalid characters"));
         }
     }
 
@@ -2909,4 +2909,30 @@ pub async fn toggle_bot_protection(
         "ok": true,
         "bot_protection": mode,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── proxy_port validation — s241 H4 (SSRF + firewall-clobber DoS) ────
+
+    #[test]
+    fn proxy_port_rejects_reserved_and_out_of_range() {
+        // Reserved / system / panel ports are rejected (would enable loopback
+        // SSRF and let the auto-firewall `ufw deny` clobber a global allow).
+        for p in [22, 25, 80, 443, 3306, 5432, 6379, 3080, 8443, 9443] {
+            assert!(!is_safe_proxy_port(p), "port {p} must be rejected");
+        }
+        // Out-of-range rejected.
+        assert!(!is_safe_proxy_port(80));
+        assert!(!is_safe_proxy_port(1023));
+        assert!(!is_safe_proxy_port(70000));
+        assert!(!is_safe_proxy_port(-1));
+        // Ordinary high app ports are accepted (incl. the 5000-5999 app range).
+        assert!(is_safe_proxy_port(8080));
+        assert!(is_safe_proxy_port(3000));
+        assert!(is_safe_proxy_port(5001));
+        assert!(is_safe_proxy_port(65535));
+    }
 }

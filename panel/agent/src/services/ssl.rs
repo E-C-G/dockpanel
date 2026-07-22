@@ -13,6 +13,39 @@ const ACME_ACCOUNT_PATH: &str = "/etc/dockpanel/ssl/acme-account.json";
 const SSL_DIR: &str = "/etc/dockpanel/ssl";
 const ACME_WEBROOT: &str = "/var/www/acme";
 
+/// Write a secret file (a TLS private key) with 0600 applied AT CREATION,
+/// closing the write-then-chmod window where the agent (running as root under
+/// the default 022 umask) leaves the key briefly world/group-readable (0644) —
+/// a local disclosure race on a shared box. `.mode(0o600)` sets the permission
+/// as the file is created; the trailing `set_permissions` re-tightens an
+/// already-existing file (mode() is ignored when the file already exists).
+pub async fn write_key_file(path: &str, content: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await
+            .map_err(|e| format!("Failed to open key file: {e}"))?;
+        f.write_all(content.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write key: {e}"))?;
+        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, content)
+            .await
+            .map_err(|e| format!("Failed to write key: {e}"))
+    }
+}
+
 /// Options controlling an ACME order — profile selection + ARI replacement chain.
 /// `None` or all-None fields means "classic, no prior cert" (backwards-compatible).
 #[derive(Default, Clone)]
@@ -226,18 +259,8 @@ pub async fn provision_cert(
     tokio::fs::write(&cert_path, &cert_chain_pem)
         .await
         .map_err(|e| format!("Failed to write cert: {e}"))?;
-    tokio::fs::write(&key_path, &private_key_pem)
-        .await
-        .map_err(|e| format!("Failed to write key: {e}"))?;
-
-    // Restrict key permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tokio::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).await {
-            tracing::error!("Failed to set key file permissions for {}: {}", domain, e);
-        }
-    }
+    // Write the private key 0600-at-creation (no world-readable 0644 window).
+    write_key_file(&key_path, &private_key_pem).await?;
 
     // Clean up challenge files
     let challenge_dir = format!("{ACME_WEBROOT}/.well-known/acme-challenge");
@@ -439,15 +462,8 @@ pub async fn provision_cert_dns01(
     tokio::fs::write(&cert_path, &cert_chain_pem)
         .await
         .map_err(|e| format!("Write cert: {e}"))?;
-    tokio::fs::write(&key_path, &private_key_pem)
-        .await
-        .map_err(|e| format!("Write key: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).await;
-    }
+    // Write the private key 0600-at-creation (no world-readable 0644 window).
+    write_key_file(&key_path, &private_key_pem).await?;
 
     let expiry = get_cert_expiry(&cert_path).await;
     tracing::info!("SSL ({label}) provisioned for {domain}");
