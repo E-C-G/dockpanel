@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.20.0] - 2026-07-22
+
+Tenant-database isolation — the follow-up to v2.19.0's Databases audit, closing the two isolation
+findings it deferred. Both are runtime-only (no migration); MariaDB was already isolated and is
+unchanged.
+
+### Security
+- **PostgreSQL tenant databases no longer run as the cluster superuser (in-container RCE foothold
+  closed).** A per-site postgres database was provisioned with `POSTGRES_USER={name}`, which the
+  postgres image bootstraps as the cluster **superuser** — so the database's own owner could
+  `COPY ... TO/FROM PROGRAM` (arbitrary command execution inside the container) and read server
+  files. New postgres databases now keep the image-default `postgres` superuser with a random,
+  discarded password (reachable only over the in-container socket, never over the published port),
+  and the tenant connects as a separately-provisioned **`NOSUPERUSER`** role that owns only its own
+  database and `public` schema. The tenant login name, password and connection string are unchanged;
+  it can still create/drop tables, browse, back up/restore and rotate its own password, but
+  `COPY..TO/FROM PROGRAM` and server-file reads are now denied. Existing databases keep their prior
+  role (the change applies to newly-created databases).
+- **Cross-tenant lateral movement between database containers closed on existing installs.** All
+  per-tenant database containers share the `dockpanel-db` bridge; v2.19.0 disabled inter-container
+  communication (`enable_icc=false`) but only when the network was first created, so installs whose
+  network predated that kept ICC on (and even new databases there joined the ICC-on network). The
+  agent now reconciles an existing ICC-on `dockpanel-db` network to `enable_icc=false` (one-time,
+  idempotent), so a compromised or abusive database container can no longer address sibling tenants'
+  database containers. Published `127.0.0.1` ports are preserved across the reconcile.
+- **Reserved database names.** Because a postgres tenant is now a real role that owns its database, a
+  database name matching a system/admin identity (`postgres`, `template0`, `template1`, `mysql`,
+  `sys`, `information_schema`, `performance_schema`) is rejected at creation.
+
 ## [2.19.0] - 2026-07-22
 
 Databases-surface security hardening — the audit-coverage rotation's fresh-eyes pass over the

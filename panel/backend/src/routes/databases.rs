@@ -15,6 +15,24 @@ use crate::AppState;
 /// tenant can consume so one account cannot deny database creation to everyone.
 const MAX_DATABASES_PER_USER: i64 = 25;
 
+/// Database names that collide with a system/admin identity. Since v2.20.0 the tenant
+/// `{name}` becomes a real postgres role that OWNS database `{name}` (M1: the tenant is
+/// no longer the cluster superuser), so a name matching the cluster's own superuser /
+/// template DBs (postgres) or system schemas (mariadb) must be rejected. Case-insensitive.
+fn is_reserved_db_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "postgres",
+        "template0",
+        "template1",
+        "mysql",
+        "sys",
+        "information_schema",
+        "performance_schema",
+    ];
+    let lower = name.to_ascii_lowercase();
+    RESERVED.contains(&lower.as_str())
+}
+
 /// Convert an agent error to a user-facing error for SQL operations.
 /// Unlike `agent_error()`, this passes through the actual SQL error message.
 fn sql_error(e: AgentError) -> ApiError {
@@ -135,6 +153,13 @@ pub async fn create(
         return Err(err(
             StatusCode::BAD_REQUEST,
             "Database name must be alphanumeric with underscores",
+        ));
+    }
+
+    if is_reserved_db_name(&body.name) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Database name is reserved (system/admin name)",
         ));
     }
 
@@ -917,4 +942,19 @@ pub async fn reset_password(
         "ok": true,
         "password": new_password,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_reserved_db_name;
+
+    #[test]
+    fn reserved_db_names_rejected_case_insensitive() {
+        for n in ["postgres", "Postgres", "TEMPLATE1", "template0", "mysql", "information_schema", "performance_schema", "sys"] {
+            assert!(is_reserved_db_name(n), "{n} should be reserved");
+        }
+        for n in ["blog", "app_db", "wordpress", "shop", "my_data"] {
+            assert!(!is_reserved_db_name(n), "{n} should be allowed");
+        }
+    }
 }

@@ -27,8 +27,15 @@ pub async fn create_database(
     let docker =
         Docker::connect_with_local_defaults().map_err(|e| format!("Docker connect failed: {e}"))?;
 
-    // Ensure network exists
+    // Ensure the shared DB bridge exists AND has inter-container communication
+    // disabled (H2: block cross-tenant lateral movement between DB containers).
     ensure_network(&docker).await?;
+
+    // M1: for postgres the container's bootstrap superuser (`postgres`) gets a
+    // random, immediately-discarded password. The tenant NEVER connects as the
+    // superuser — a separate NON-superuser owner role (named {name}) is provisioned
+    // after start. Unused for MariaDB (which is already DB-scoped/non-root).
+    let admin_password = uuid::Uuid::new_v4().to_string().replace('-', "");
 
     let (image, env, container_port) = match engine {
         "mysql" | "mariadb" => (
@@ -45,8 +52,12 @@ pub async fn create_database(
             "postgres:16-alpine",
             vec![
                 format!("POSTGRES_DB={name}"),
-                format!("POSTGRES_USER={name}"),
-                format!("POSTGRES_PASSWORD={password}"),
+                // NOTE: POSTGRES_USER is deliberately NOT set to {name} anymore — that
+                // bootstrapped the tenant as the cluster SUPERUSER (M1: COPY..TO PROGRAM
+                // in-container RCE foothold). The image default superuser `postgres` is
+                // kept with this random, discarded password; the real tenant role is
+                // created NON-superuser by provision_postgres_tenant_role() below.
+                format!("POSTGRES_PASSWORD={admin_password}"),
             ],
             "5432/tcp",
         ),
@@ -137,6 +148,28 @@ pub async fn create_database(
             )
             .await;
         return Err(format!("Failed to start container: {e}"));
+    }
+
+    // M1: postgres tenant now runs as a NON-superuser owner. Provision that role now
+    // that the container is up. If it fails the container has no usable tenant login,
+    // so tear it down and surface the error (backend create() then deletes its row +
+    // releases the reseller slot). MariaDB is already DB-scoped/non-root — skip.
+    if !matches!(engine, "mysql" | "mariadb") {
+        if let Err(e) =
+            provision_postgres_tenant_role(&container_name, name, &admin_password, password).await
+        {
+            let _ = docker
+                .remove_container(
+                    &container.id,
+                    Some(bollard::container::RemoveContainerOptions {
+                        v: true,
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(e);
+        }
     }
 
     tracing::info!("Database container created: {container_name} ({engine}, port {port})");
@@ -539,32 +572,201 @@ pub async fn reset_password(
     Ok(())
 }
 
-/// Ensure the dockpanel-db Docker network exists.
-async fn ensure_network(docker: &Docker) -> Result<(), String> {
-    use bollard::network::CreateNetworkOptions;
-
-    match docker.inspect_network::<String>(DB_NETWORK, None).await {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            docker
-                .create_network(CreateNetworkOptions {
-                    name: DB_NETWORK,
-                    driver: "bridge",
-                    // Disable inter-container communication on the shared DB bridge so a
-                    // compromised/abusive tenant DB container cannot address sibling
-                    // tenants' DB containers (lateral movement). DB containers only need
-                    // their 127.0.0.1-published host port, never container-to-container
-                    // traffic. NOTE: only applies when the network is first created;
-                    // existing installs keep ICC until the network is recreated.
-                    options: HashMap::from([
-                        ("com.docker.network.bridge.enable_icc", "false"),
-                    ]),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| format!("Failed to create network: {e}"))?;
-            tracing::info!("Created Docker network: {DB_NETWORK}");
-            Ok(())
+/// After a fresh postgres container starts, provision the NON-superuser tenant owner
+/// role (M1). Runs as the bootstrap superuser `postgres` over the in-container socket;
+/// waits for readiness first (initdb + POSTGRES_DB creation take a moment).
+async fn provision_postgres_tenant_role(
+    container: &str,
+    db_name: &str,
+    admin_password: &str,
+    tenant_password: &str,
+) -> Result<(), String> {
+    // Wait until postgres accepts connections to the tenant DB (mirrors backup_verify).
+    let mut ready = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let ok = safe_command("docker")
+            .arg("exec")
+            .arg("-e")
+            .arg(format!("PGPASSWORD={admin_password}"))
+            .arg(container)
+            .arg("psql")
+            .arg("-U")
+            .arg("postgres")
+            .arg("-d")
+            .arg(db_name)
+            .arg("-c")
+            .arg("SELECT 1")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            ready = true;
+            break;
         }
+    }
+    if !ready {
+        return Err("PostgreSQL did not become ready within 30s".to_string());
+    }
+
+    let sql = tenant_role_sql(db_name, tenant_password);
+    let output = safe_command("docker")
+        .arg("exec")
+        .arg("-e")
+        .arg(format!("PGPASSWORD={admin_password}"))
+        .arg(container)
+        .arg("psql")
+        .arg("-U")
+        .arg("postgres")
+        .arg("-d")
+        .arg(db_name)
+        .arg("-v")
+        .arg("ON_ERROR_STOP=1")
+        .arg("-c")
+        .arg(&sql[0])
+        .arg("-c")
+        .arg(&sql[1])
+        .arg("-c")
+        .arg(&sql[2])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to provision tenant role: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to provision tenant role: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// The three statements that hand a fresh postgres DB to a NON-superuser tenant owner
+/// named `db_name`: create the role (NOSUPERUSER so it cannot COPY..TO PROGRAM /
+/// pg_read_server_files — the M1 RCE foothold), give it the database, and give it the
+/// `public` schema (PG15+ no longer grants PUBLIC CREATE, so DB ownership alone would
+/// not let the tenant create tables). Run as the admin superuser, connected to the DB.
+fn tenant_role_sql(db_name: &str, password: &str) -> [String; 3] {
+    // Escape single quotes in the password string literal. Identifiers are validated to
+    // [A-Za-z0-9_] upstream, so the quoted role/db name needs no escaping.
+    let pw = password.replace('\'', "''");
+    [
+        format!(
+            "CREATE ROLE \"{db_name}\" LOGIN PASSWORD '{pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE;"
+        ),
+        format!("ALTER DATABASE \"{db_name}\" OWNER TO \"{db_name}\";"),
+        format!("ALTER SCHEMA public OWNER TO \"{db_name}\";"),
+    ]
+}
+
+/// Ensure the shared `dockpanel-db` bridge exists AND has inter-container communication
+/// disabled. No consumer connects to a managed DB over this network (every consumer uses
+/// the 127.0.0.1-published host port), so ICC can be off — which blocks a compromised
+/// tenant DB container from reaching sibling tenants' DB containers (H2 lateral movement).
+///
+/// s242 set `enable_icc=false` only when the network was FIRST created, so installs whose
+/// `dockpanel-db` predates that keep ICC on (and even NEW DBs there join the ICC-on net) —
+/// the gap that made the s242 mitigation partial. This reconciles a legacy ICC-on network
+/// to ICC=false (one-time, idempotent) since ICC is a create-time, in-place-immutable option.
+async fn ensure_network(docker: &Docker) -> Result<(), String> {
+    match docker.inspect_network::<String>(DB_NETWORK, None).await {
+        Ok(net) => {
+            let icc_off = net
+                .options
+                .as_ref()
+                .and_then(|o| o.get("com.docker.network.bridge.enable_icc"))
+                .map(|v| v == "false")
+                .unwrap_or(false);
+            if icc_off {
+                return Ok(());
+            }
+            // Recreating the network requires disconnecting attached DB containers first.
+            let attached: Vec<String> = net
+                .containers
+                .as_ref()
+                .map(|c| c.keys().cloned().collect())
+                .unwrap_or_default();
+            reconcile_network_icc(docker, &attached).await
+        }
+        Err(_) => create_db_network(docker).await,
+    }
+}
+
+/// Create the shared DB bridge with inter-container communication disabled.
+async fn create_db_network(docker: &Docker) -> Result<(), String> {
+    use bollard::network::CreateNetworkOptions;
+    docker
+        .create_network(CreateNetworkOptions {
+            name: DB_NETWORK,
+            driver: "bridge",
+            options: HashMap::from([("com.docker.network.bridge.enable_icc", "false")]),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("Failed to create network: {e}"))?;
+    tracing::info!("Created Docker network: {DB_NETWORK} (enable_icc=false)");
+    Ok(())
+}
+
+/// Recreate `dockpanel-db` with ICC disabled, reconnecting every attached DB container.
+/// One-time reconcile for pre-s242 installs whose network still has ICC enabled.
+async fn reconcile_network_icc(docker: &Docker, attached: &[String]) -> Result<(), String> {
+    use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
+    // Disconnect so the network can be removed. Published 127.0.0.1 ports are
+    // re-established from the container's HostConfig on reconnect (lab-verified).
+    for cid in attached {
+        let _ = docker
+            .disconnect_network(
+                DB_NETWORK,
+                DisconnectNetworkOptions {
+                    container: cid.as_str(),
+                    force: true,
+                },
+            )
+            .await;
+    }
+    docker
+        .remove_network(DB_NETWORK)
+        .await
+        .map_err(|e| format!("Failed to remove legacy DB network for ICC reconcile: {e}"))?;
+    create_db_network(docker).await?;
+    for cid in attached {
+        docker
+            .connect_network(
+                DB_NETWORK,
+                ConnectNetworkOptions {
+                    container: cid.as_str(),
+                    endpoint_config: Default::default(),
+                },
+            )
+            .await
+            .map_err(|e| format!("Failed to reconnect {cid} to hardened DB network: {e}"))?;
+    }
+    tracing::info!(
+        "Reconciled {DB_NETWORK} to enable_icc=false ({} container(s) reconnected)",
+        attached.len()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_role_sql_is_non_superuser() {
+        let sql = tenant_role_sql("blog_db", "secret");
+        assert!(sql[0].contains("NOSUPERUSER"));
+        assert!(sql[0].contains("NOCREATEDB"));
+        assert!(sql[0].contains("NOCREATEROLE"));
+        // Must NOT grant superuser — the space-prefixed token excludes NOSUPERUSER.
+        assert!(!sql[0].contains(" SUPERUSER"));
+        assert!(sql[0].contains("CREATE ROLE \"blog_db\""));
+        assert!(sql[1].contains("ALTER DATABASE \"blog_db\" OWNER TO \"blog_db\""));
+        assert!(sql[2].contains("ALTER SCHEMA public OWNER TO \"blog_db\""));
+    }
+
+    #[test]
+    fn tenant_role_sql_escapes_password_quote() {
+        let sql = tenant_role_sql("app", "a'b");
+        assert!(sql[0].contains("PASSWORD 'a''b'"));
     }
 }
