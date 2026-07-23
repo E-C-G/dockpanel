@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.22.1] - 2026-07-23
+
+### Fixed
+- **Suspending a user no longer fails with a 500.** The `chk_users_role` check constraint (recreated
+  by the reseller migration) allowed only `admin` / `reseller` / `user`, so writing the `suspended`
+  role that suspension uses violated the constraint on every install — suspension had been completely
+  non-functional. The constraint now includes `suspended`. Surfaced by driving the v2.22.0 suspension
+  hardening against a live database.
+
 ## [2.22.0] - 2026-07-23
 
 Authz & multi-tenancy hardening. A fresh audit of the account/role/tenancy core (users, teams,
