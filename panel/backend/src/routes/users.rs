@@ -166,19 +166,44 @@ pub async fn update(
         if !["admin", "reseller", "user"].contains(&role.as_str()) {
             return Err(err(StatusCode::BAD_REQUEST, "Role must be admin, reseller, or user"));
         }
-        sqlx::query("UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2")
+        let role_changed = role.as_str() != _user.role;
+        // An admin cannot change their OWN role (mirrors the self-guards on
+        // toggle_suspend/remove): prevents accidental self-lockout AND closes the
+        // re-escalation path where a stale admin token flips itself back to admin.
+        if id == claims.sub && role_changed {
+            return Err(err(StatusCode::BAD_REQUEST, "Cannot change your own role"));
+        }
+        // Only mutate + revoke on an ACTUAL change — a no-op self-submit must not log the
+        // caller out. The last-admin guard is folded into the UPDATE's WHERE so a demotion
+        // can never orphan the panel of admins (the row updates only if the new role is
+        // admin, the current role isn't admin, or more than one admin remains); this is
+        // atomic-as-a-statement rather than the check-then-act it replaced. Clearing
+        // reseller_id on promotion keeps a tenant-root from staying owned by another
+        // reseller (PRIV-03).
+        if role_changed {
+            let res = sqlx::query(
+                "UPDATE users SET role = $1, \
+                 reseller_id = CASE WHEN $1 IN ('reseller','admin') THEN NULL ELSE reseller_id END, \
+                 updated_at = NOW() \
+                 WHERE id = $2 \
+                   AND ($1 = 'admin' OR role <> 'admin' OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1)",
+            )
             .bind(role)
             .bind(id)
             .execute(&state.db)
             .await
             .map_err(|e| internal_error("update users", e))?;
 
-        // Invalidate all sessions — role change must take effect immediately
-        sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
-            .bind(id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| internal_error("update users", e))?;
+            if res.rows_affected() == 0 {
+                // The user exists (fetched above), so a 0-row update means the last-admin
+                // guard in the WHERE blocked the demotion.
+                return Err(err(StatusCode::BAD_REQUEST, "Cannot demote the last admin"));
+            }
+
+            // Role change must take effect immediately — actually revoke the victim's live
+            // token(s). A plain DELETE of user_sessions is a no-op against the stateless JWT.
+            crate::routes::auth::revoke_all_user_sessions(&state, id).await;
+        }
     }
 
     if let Some(ref password) = body.password {
@@ -200,6 +225,10 @@ pub async fn update(
             .execute(&state.db)
             .await
             .map_err(|e| internal_error("update users", e))?;
+
+        // A password change must evict the user's live token(s) — same invariant as
+        // reset_password (admin + self-service) and reseller update_user.
+        crate::routes::auth::revoke_all_user_sessions(&state, id).await;
     }
 
     activity::log_activity(
@@ -258,12 +287,10 @@ pub async fn toggle_suspend(
         .await
         .map_err(|e| internal_error("toggle_suspend", e))?;
 
-    // Invalidate all sessions for this user
-    sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| internal_error("toggle_suspend", e))?;
+    // Actually revoke the user's live token(s) — a plain DELETE of user_sessions does
+    // not invalidate the stateless JWT, so suspension would otherwise be a no-op for
+    // up to 2h (and the suspended user could keep whatever role their token carries).
+    crate::routes::auth::revoke_all_user_sessions(&state, id).await;
 
     tracing::info!("{action} by {}: {} -> role={new_role}", claims.email, user.email);
     let ip = crate::routes::client_ip(&headers);
@@ -330,12 +357,9 @@ pub async fn reset_password(
         .await
         .map_err(|e| internal_error("reset_password", e))?;
 
-    // Invalidate all sessions for this user
-    sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| internal_error("reset_password", e))?;
+    // Actually revoke the user's live token(s) so a stolen/active session cannot
+    // survive the reset — matches the self-service reset path (auth.rs).
+    crate::routes::auth::revoke_all_user_sessions(&state, id).await;
 
     tracing::info!("Password reset by admin {} for user {}", claims.email, user.email);
     let ip = crate::routes::client_ip(&headers);
@@ -365,6 +389,10 @@ pub async fn remove(
         .await
         .map_err(|e| internal_error("remove users", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "User not found"))?;
+
+    // Revoke the user's live token(s) BEFORE deletion — otherwise the stateless JWT
+    // keeps authenticating as a now-nonexistent principal until it expires.
+    crate::routes::auth::revoke_all_user_sessions(&state, id).await;
 
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(id)

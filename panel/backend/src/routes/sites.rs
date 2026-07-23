@@ -19,6 +19,52 @@ use crate::error::{internal_error, err, agent_error, paginate, ApiError};
 use crate::models::Site;
 use crate::routes::is_valid_domain;
 use crate::routes::reseller_dashboard::check_reseller_quota;
+
+/// Atomically reserve one site slot against the site owner's reseller quota. The
+/// conditional UPDATE ... RETURNING closes the check-then-increment TOCTOU. Returns
+/// Ok(true) if a slot was reserved (release it on a later failure), Ok(false) if the
+/// user has no reseller (nothing to enforce), or Err(403) if the quota is exhausted.
+/// Mirrors databases::reserve_reseller_db_slot.
+async fn reserve_reseller_site_slot(state: &AppState, user_id: uuid::Uuid) -> Result<bool, ApiError> {
+    let reserved: Option<i32> = sqlx::query_scalar(
+        "UPDATE reseller_profiles SET used_sites = used_sites + 1, updated_at = NOW() \
+         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL) \
+           AND (max_sites IS NULL OR used_sites < max_sites) \
+         RETURNING 1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("reserve reseller site quota", e))?;
+
+    if reserved.is_some() {
+        return Ok(true);
+    }
+    let has_profile: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT rp.user_id FROM reseller_profiles rp \
+         WHERE rp.user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("reserve reseller site quota", e))?;
+
+    if has_profile.is_some() {
+        return Err(err(StatusCode::FORBIDDEN, "Reseller site quota exceeded"));
+    }
+    Ok(false)
+}
+
+/// Release a reserved site slot (compensating decrement) on a later failure.
+async fn release_reseller_site_slot(state: &AppState, user_id: uuid::Uuid) {
+    let _ = sqlx::query(
+        "UPDATE reseller_profiles SET used_sites = GREATEST(used_sites - 1, 0), updated_at = NOW() \
+         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)",
+    )
+    .bind(user_id)
+    .execute(&state.db)
+    .await;
+}
 use crate::services::activity;
 use crate::services::extensions::fire_event;
 use crate::services::notifications;
@@ -366,6 +412,12 @@ pub async fn create(
     agent_body["waf_enabled"] = serde_json::json!(false);
     agent_body["waf_mode"] = serde_json::json!("detection");
 
+    // Atomically reserve the reseller site-quota slot BEFORE the agent creates the
+    // nginx vhost — closes the check-then-increment TOCTOU without orphaning an nginx
+    // config on a quota-race (the open tx below rolls back the uncommitted site row if
+    // this rejects). The early check_reseller_quota above is a fast-path UX pre-check.
+    let site_slot_reserved = reserve_reseller_site_slot(&state, claims.sub).await?;
+
     // Call agent to create nginx config
     let agent_path = format!("/nginx/sites/{}", body.domain);
     match agent.put(&agent_path, agent_body).await {
@@ -374,8 +426,12 @@ pub async fn create(
 
             // Agent succeeded — commit the transaction so the site record is persisted
             // (background tasks like monitors, backups, SSL need the site to exist)
-            tx.commit().await
-                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Transaction commit failed: {e}")))?;
+            if let Err(e) = tx.commit().await {
+                if site_slot_reserved {
+                    release_reseller_site_slot(&state, claims.sub).await;
+                }
+                return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Transaction commit failed: {e}")));
+            }
 
             // Update status to active
             sqlx::query(
@@ -418,11 +474,7 @@ pub async fn create(
                 "site_id": site.id, "domain": site.domain, "runtime": site.runtime,
             }));
 
-            // Increment reseller site counter
-            let _ = sqlx::query(
-                "UPDATE reseller_profiles SET used_sites = used_sites + 1, updated_at = NOW() \
-                 WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)"
-            ).bind(claims.sub).execute(&state.db).await;
+            // Reseller site counter already incremented atomically by the reserve above.
 
             // NOTE: Auto-monitor creation disabled — on fresh installs without DNS
             // configured, auto-created monitors immediately show "down" which confuses
@@ -851,6 +903,10 @@ pub async fn create(
 
             // tx is dropped here, automatically rolling back the INSERT
             drop(tx);
+            // Release the reseller quota slot reserved just before the agent call.
+            if site_slot_reserved {
+                release_reseller_site_slot(&state, claims.sub).await;
+            }
 
             emit_step(&logs, site_id, "nginx", "Configuring web server", "error",
                 Some(format!("Agent error: {e}")));
@@ -1889,11 +1945,15 @@ pub async fn clone_site(
                 &format!("Site creation rate limit: max {max_sites} sites per hour")));
         }
     }
-    check_reseller_quota(&state.db, claims.sub, "sites").await?;
     ensure_domain_available(&state, target_domain, server_id).await?;
+    // Atomically reserve the reseller site-quota slot AFTER the (fallible) domain checks
+    // so a rejected clone cannot leak a quota slot; this mirrors create(), where the
+    // reserve is the last pre-check before the mutation. Release it if the INSERT fails;
+    // if a later agent step fails the site row persists and legitimately holds the slot.
+    let clone_slot_reserved = reserve_reseller_site_slot(&state, claims.sub).await?;
 
     // Create new site record
-    let new_site: Site = sqlx::query_as(
+    let new_site: Site = match sqlx::query_as::<_, Site>(
         "INSERT INTO sites (user_id, server_id, domain, runtime, status, php_version, root_path, rate_limit, max_upload_mb, php_memory_mb, php_max_workers, php_preset, app_command) \
          VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *"
     )
@@ -1910,13 +1970,20 @@ pub async fn clone_site(
     .bind(&source.php_preset)
     .bind(&source.app_command)
     .fetch_one(&state.db).await
-    .map_err(|e| {
-        if e.to_string().contains("duplicate") || e.to_string().contains("unique") {
-            err(StatusCode::CONFLICT, "A site with this domain already exists")
-        } else {
-            internal_error("clone site", e)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            if clone_slot_reserved {
+                release_reseller_site_slot(&state, claims.sub).await;
+            }
+            let msg = e.to_string();
+            return Err(if msg.contains("duplicate") || msg.contains("unique") {
+                err(StatusCode::CONFLICT, "A site with this domain already exists")
+            } else {
+                internal_error("clone site", e)
+            });
         }
-    })?;
+    };
 
     // Clone files via agent
     agent.post("/nginx/clone-site", Some(serde_json::json!({
@@ -1950,12 +2017,7 @@ pub async fn clone_site(
     activity::log_activity(&state.db, claims.sub, &claims.email, "site.clone",
         Some("site"), Some(target_domain), Some(&source.domain), None).await;
 
-    // Increment reseller site counter (parity with create() — clone previously
-    // left the quota counter stale, permanently under-counting a tenant's sites).
-    let _ = sqlx::query(
-        "UPDATE reseller_profiles SET used_sites = used_sites + 1, updated_at = NOW() \
-         WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)"
-    ).bind(claims.sub).execute(&state.db).await;
+    // Reseller site counter already incremented atomically by the reserve above.
 
     fire_event(&state.db, "site.created", serde_json::json!({
         "site_id": new_site.id, "domain": target_domain, "runtime": &source.runtime, "cloned_from": &source.domain,

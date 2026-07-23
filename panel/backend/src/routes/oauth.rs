@@ -282,6 +282,12 @@ pub async fn callback(
         }
     };
 
+    // Block suspended accounts on the OAuth login path too (parity with password and
+    // passkey login) — otherwise suspension is bypassable by logging in via OAuth.
+    if user.role == "suspended" {
+        return Err(err(StatusCode::FORBIDDEN, "Account suspended"));
+    }
+
     // If 2FA is enabled, issue a temporary token and redirect to 2FA challenge
     if user.totp_enabled {
         let now = chrono::Utc::now().timestamp() as usize;
@@ -327,7 +333,7 @@ pub async fn callback(
         role: user.role.clone(),
         iat: now,
         exp: now + 7200, // 2 hours
-        jti: Some(jti),
+        jti: Some(jti.clone()),
     };
 
     let token = jsonwebtoken::encode(
@@ -336,6 +342,21 @@ pub async fn callback(
         &jsonwebtoken::EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
     )
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("JWT encode failed: {e}")))?;
+
+    // Record the session so it is visible to session management AND — critically —
+    // revocable: the DELETE user_sessions RETURNING jti -> blacklist sweeps (logout,
+    // admin de-escalation, self-service reset) can only reach a session that has a row.
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let ip = headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let _ = sqlx::query(
+        "INSERT INTO user_sessions (user_id, jti, ip_address, user_agent) VALUES ($1, $2, $3, $4)"
+    )
+    .bind(user.id)
+    .bind(&jti)
+    .bind(&ip)
+    .bind(&ua)
+    .execute(&state.db)
+    .await;
 
     crate::services::activity::log_activity(
         &state.db, user.id, &user.email, "auth.oauth_login",

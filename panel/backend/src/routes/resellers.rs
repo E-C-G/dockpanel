@@ -140,8 +140,10 @@ pub async fn create(
         }
     }
 
-    // Update user role to reseller (idempotent if already reseller)
-    sqlx::query("UPDATE users SET role = 'reseller', updated_at = NOW() WHERE id = $1")
+    // Update user role to reseller (idempotent if already reseller). Clear reseller_id:
+    // a reseller is a tenant root and must never remain owned by another reseller, else
+    // the parent reseller could manage/delete this newly-promoted reseller (PRIV-03).
+    sqlx::query("UPDATE users SET role = 'reseller', reseller_id = NULL, updated_at = NOW() WHERE id = $1")
         .bind(user_id)
         .execute(&state.db)
         .await
@@ -294,6 +296,10 @@ pub async fn remove(
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("remove resellers", e))?;
+
+    // Revoke the demoted user's token(s) so a stale role='reseller' claim can't linger
+    // in an active JWT (completes the revoke-on-role-change invariant).
+    crate::routes::auth::revoke_all_user_sessions(&state, profile.user_id).await;
 
     // Clear reseller_id on any users that belonged to this reseller
     sqlx::query("UPDATE users SET reseller_id = NULL, updated_at = NOW() WHERE reseller_id = $1")

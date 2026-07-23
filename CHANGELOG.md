@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.22.0] - 2026-07-23
+
+Authz & multi-tenancy hardening. A fresh audit of the account/role/tenancy core (users, teams,
+resellers, and the auth extractors) found that the panel's revocation and suspension machinery did
+not actually cut off an active session, that reseller quotas could be raced past their limits, and
+that team invites could be abused as an email relay. All fixed.
+
+### Security
+- **Suspend / role-change / password-reset / delete now actually revoke the user's active session.**
+  These admin actions previously deleted the session rows but never blacklisted the token — and the
+  panel authorizes from a stateless 2-hour JWT that carries the role — so a suspended (or demoted, or
+  password-reset, or deleted) user kept full access with their *old* role until the token expired; a
+  demoted admin could even re-promote themselves in that window. Every de-escalation path now
+  blacklists the token(s) through the same choke-point the self-service password-reset already used.
+- **Suspension is enforced at login.** Password, 2FA, and OAuth login now reject suspended accounts
+  (previously only the passkey path did), so a suspended user can no longer simply log in again.
+- **Admins can't orphan the panel of admins.** An admin can no longer change their own role, and the
+  last remaining admin can no longer be demoted.
+- **Reseller quotas are enforced atomically.** User- and site-creation used a check-then-increment
+  that concurrent requests could race past the plan limit; both now reserve the slot in a single
+  atomic statement (matching how database creation already worked).
+- **Promote-to-reseller clears the ownership pointer** so a newly-promoted reseller can no longer be
+  managed or deleted by their former parent reseller.
+- **Team invites can't be used as a spam/phishing relay.** The invite email now HTML-escapes the team
+  name and inviter address, invites are rate- and count-capped per team, and an invite can only be
+  redeemed by the email address it was issued to.
+- **OAuth logins are now recorded as sessions** (they previously left no session row, so no revocation
+  sweep could reach them) and are subject to the same suspension and revocation controls.
+
 ## [2.21.1] - 2026-07-23
 
 Installer overhaul + PHP 8.5 support. A fresh Ubuntu 26.04 install surfaced that PHP could not be

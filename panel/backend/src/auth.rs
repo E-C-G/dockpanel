@@ -99,6 +99,14 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         }
 
+        // A suspended account's token must not authenticate. A pre-suspension token
+        // carries the old role and is killed by the blacklist sweep on suspend; this
+        // is defense-in-depth against any suspended-role token ever being minted (the
+        // login/2FA/OAuth paths also reject "suspended" up front).
+        if claims.role == "suspended" {
+            return Err(err(StatusCode::FORBIDDEN, "Account suspended"));
+        }
+
         Ok(AuthUser(claims))
     }
 }

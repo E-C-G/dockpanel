@@ -143,26 +143,6 @@ pub async fn create_user(
         ));
     }
 
-    // Check quota
-    let quota: Option<(i32, Option<i32>)> = sqlx::query_as(
-        "SELECT used_users, max_users FROM reseller_profiles WHERE user_id = $1",
-    )
-    .bind(claims.sub)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| internal_error("create user", e))?;
-
-    let quota = quota.ok_or_else(|| err(StatusCode::NOT_FOUND, "Reseller profile not found"))?;
-
-    if let Some(max) = quota.1 {
-        if quota.0 >= max {
-            return Err(err(
-                StatusCode::FORBIDDEN,
-                "User quota exceeded — upgrade your reseller plan",
-            ));
-        }
-    }
-
     // Validate email
     if body.email.is_empty() || body.email.len() > 254 || !body.email.contains('@') {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid email"));
@@ -195,8 +175,12 @@ pub async fn create_user(
         .map_err(|e| internal_error("create user", e))?
         .to_string();
 
-    // Create user
-    let (user_id, user_email): (Uuid, String) = sqlx::query_as(
+    // Atomically reserve the user-quota slot BEFORE creating (closes the TOCTOU that
+    // let concurrent creates exceed max_users). reserve_reseller_user_slot both checks
+    // and increments in one statement; release it if the INSERT then fails.
+    reserve_reseller_user_slot(&state, claims.sub).await?;
+
+    let (user_id, user_email) = match sqlx::query_as::<_, (Uuid, String)>(
         "INSERT INTO users (email, password_hash, role, reseller_id) \
          VALUES ($1, $2, 'user', $3) RETURNING id, email",
     )
@@ -205,16 +189,13 @@ pub async fn create_user(
     .bind(claims.sub)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| internal_error("create user", e))?;
-
-    // Increment used_users counter
-    sqlx::query(
-        "UPDATE reseller_profiles SET used_users = used_users + 1 WHERE user_id = $1",
-    )
-    .bind(claims.sub)
-    .execute(&state.db)
-    .await
-    .map_err(|e| internal_error("create user", e))?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            release_reseller_user_slot(&state, claims.sub).await;
+            return Err(internal_error("create user", e));
+        }
+    };
 
     tracing::info!(
         "Reseller {} created user: {}",
@@ -259,7 +240,7 @@ pub async fn update_user(
             .map_err(|e| internal_error("update user", e))?
     } else {
         sqlx::query_as(
-            "SELECT id, email FROM users WHERE id = $1 AND reseller_id = $2",
+            "SELECT id, email FROM users WHERE id = $1 AND reseller_id = $2 AND role = 'user'",
         )
         .bind(id)
         .bind(claims.sub)
@@ -290,6 +271,10 @@ pub async fn update_user(
             .execute(&state.db)
             .await
             .map_err(|e| internal_error("update user", e))?;
+
+        // A password reset must evict the user's live token(s) (mirrors the admin
+        // users::reset_password fix) — otherwise a stolen session survives the reset.
+        crate::routes::auth::revoke_all_user_sessions(&state, id).await;
     }
 
     activity::log_activity(
@@ -329,7 +314,7 @@ pub async fn delete_user(
             .map_err(|e| internal_error("delete user", e))?
     } else {
         sqlx::query_as(
-            "SELECT id, email FROM users WHERE id = $1 AND reseller_id = $2",
+            "SELECT id, email FROM users WHERE id = $1 AND reseller_id = $2 AND role = 'user'",
         )
         .bind(id)
         .bind(claims.sub)
@@ -339,6 +324,11 @@ pub async fn delete_user(
     };
 
     let user = user.ok_or_else(|| err(StatusCode::NOT_FOUND, "User not found"))?;
+
+    // Revoke the user's live token(s) before deletion — otherwise the stateless JWT
+    // keeps authenticating as a now-nonexistent principal until it expires (mirrors
+    // users::remove).
+    crate::routes::auth::revoke_all_user_sessions(&state, id).await;
 
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(id)
@@ -397,6 +387,52 @@ pub async fn list_servers(
     .map_err(|e| internal_error("list servers", e))?;
 
     Ok(Json(servers))
+}
+
+/// Atomically reserve one user slot against the reseller's own quota (the reseller
+/// owns the profile keyed by their own user_id). The conditional UPDATE ... RETURNING
+/// makes the check and increment a single statement, closing the check-then-increment
+/// TOCTOU. Mirrors databases::reserve_reseller_db_slot.
+async fn reserve_reseller_user_slot(state: &AppState, reseller_id: Uuid) -> Result<(), ApiError> {
+    let reserved: Option<i32> = sqlx::query_scalar(
+        "UPDATE reseller_profiles SET used_users = used_users + 1, updated_at = NOW() \
+         WHERE user_id = $1 AND (max_users IS NULL OR used_users < max_users) \
+         RETURNING 1",
+    )
+    .bind(reseller_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("reserve reseller user quota", e))?;
+
+    if reserved.is_some() {
+        return Ok(());
+    }
+    // 0 rows: profile missing OR quota exhausted — distinguish for the right error.
+    let has_profile: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM reseller_profiles WHERE user_id = $1",
+    )
+    .bind(reseller_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("reserve reseller user quota", e))?;
+
+    if has_profile.is_some() {
+        Err(err(StatusCode::FORBIDDEN, "User quota exceeded — upgrade your reseller plan"))
+    } else {
+        Err(err(StatusCode::NOT_FOUND, "Reseller profile not found"))
+    }
+}
+
+/// Release a reserved user slot (compensating decrement) when the create fails after
+/// reserve_reseller_user_slot succeeded.
+async fn release_reseller_user_slot(state: &AppState, reseller_id: Uuid) {
+    let _ = sqlx::query(
+        "UPDATE reseller_profiles SET used_users = GREATEST(used_users - 1, 0), updated_at = NOW() \
+         WHERE user_id = $1",
+    )
+    .bind(reseller_id)
+    .execute(&state.db)
+    .await;
 }
 
 /// Check if a reseller has quota remaining for a resource type.

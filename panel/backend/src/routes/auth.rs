@@ -228,6 +228,12 @@ pub async fn login(
         attempts.remove(&ip);
     }
 
+    // Block login for suspended accounts (parity with the passkey path). Without this,
+    // suspension is bypassable by simply logging in again for a fresh token.
+    if user.role == "suspended" {
+        return Err(err(StatusCode::FORBIDDEN, "Account suspended"));
+    }
+
     // Block login if email not verified and SMTP is configured
     if !user.email_verified {
         let smtp_configured = {
@@ -460,6 +466,41 @@ fn record_login_attempt(
 ) {
     if let Ok(mut map) = attempts.lock() {
         map.entry(ip.to_string()).or_default().push(Instant::now());
+    }
+}
+
+/// Revoke ALL active sessions for a user: delete their `user_sessions` rows and
+/// blacklist every associated JWT `jti` — both in the in-memory blacklist (which
+/// `AuthUser` actually consults) AND the persistent `token_blacklist` table (so the
+/// revocation survives a restart). This is the ONLY correct way to cut off a
+/// still-valid token, because `AuthUser` authorizes from the stateless JWT and never
+/// reads `user_sessions`. Used by every admin-initiated de-escalation (suspend /
+/// role change / password reset / delete); mirrors the self-service reset_password path.
+pub async fn revoke_all_user_sessions(state: &AppState, user_id: uuid::Uuid) {
+    let sessions: Vec<(String,)> = sqlx::query_as(
+        "DELETE FROM user_sessions WHERE user_id = $1 RETURNING jti",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    if sessions.is_empty() {
+        return;
+    }
+    {
+        let mut blacklist = state.token_blacklist.write().await;
+        for (jti,) in &sessions {
+            blacklist.insert(jti.clone());
+        }
+    }
+    for (jti,) in &sessions {
+        let _ = sqlx::query(
+            "INSERT INTO token_blacklist (jti, expires_at) VALUES ($1, NOW() + INTERVAL '2 hours') ON CONFLICT DO NOTHING",
+        )
+        .bind(jti)
+        .execute(&state.db)
+        .await;
     }
 }
 
@@ -1110,6 +1151,12 @@ pub async fn twofa_verify(
         .fetch_one(&state.db)
         .await
         .map_err(|e| internal_error("2FA verify", e))?;
+
+    // Block suspended accounts at 2FA redemption too — closes the window where a
+    // temp token was minted just before suspension.
+    if user.role == "suspended" {
+        return Err(err(StatusCode::FORBIDDEN, "Account suspended"));
+    }
 
     let secret_b32_enc = user.totp_secret.as_ref().ok_or_else(|| {
         err(StatusCode::INTERNAL_SERVER_ERROR, "2FA secret missing")

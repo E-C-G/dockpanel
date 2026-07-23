@@ -217,6 +217,28 @@ pub async fn invite(
         return Err(err(StatusCode::FORBIDDEN, "Only owners and admins can invite members"));
     }
 
+    // Bound invite volume per team. Each invite sends an email to an arbitrary,
+    // caller-supplied recipient, so an uncapped invite endpoint is an SMTP spam /
+    // phishing amplifier — cap both the burst rate and the total team size.
+    let recent_invites: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM team_invites WHERE team_id = $1 AND created_at > NOW() - INTERVAL '1 hour'",
+    )
+    .bind(team_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| internal_error("invite", e))?;
+    if recent_invites.0 >= 20 {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "Invite limit reached for this team (max 20/hour)"));
+    }
+    let member_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM team_members WHERE team_id = $1")
+        .bind(team_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| internal_error("invite", e))?;
+    if member_count.0 >= 50 {
+        return Err(err(StatusCode::BAD_REQUEST, "Team member limit reached (50)"));
+    }
+
     let email_addr = body.email.trim().to_lowercase();
     if email_addr.is_empty() || !email_addr.contains('@') {
         return Err(err(StatusCode::BAD_REQUEST, "Valid email required"));
@@ -281,7 +303,7 @@ pub async fn invite(
              <p>{} has invited you to join <strong>{}</strong> as a <strong>{role}</strong>.</p>\
              <p><a href=\"{invite_url}\" style=\"padding:10px 20px;background:#4F46E5;color:#fff;text-decoration:none;border-radius:6px\">Accept Invitation</a></p>\
              <p>This invitation expires in 7 days.</p>",
-            claims.email, team_name.0,
+            esc(&claims.email), esc(&team_name.0),
         ),
     )
     .await;
@@ -306,8 +328,14 @@ pub async fn accept_invite(
     .await
     .map_err(|e| internal_error("accept invite", e))?;
 
-    let (invite_id, team_id, _email, role) = invite
+    let (invite_id, team_id, invited_email, role) = invite
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "Invalid or expired invitation"))?;
+
+    // Bind the invite to its intended recipient — otherwise anyone holding the token
+    // (e.g. a forwarded invite email) could redeem it and join as the invited role.
+    if !invited_email.eq_ignore_ascii_case(&claims.email) {
+        return Err(err(StatusCode::FORBIDDEN, "This invitation was issued to a different email address"));
+    }
 
     // Add user as team member + delete invite atomically
     let mut tx = state.db.begin().await
@@ -421,6 +449,17 @@ pub async fn remove_member(
         .map_err(|e| internal_error("remove member", e))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Minimal HTML-text escape for values interpolated into invite email bodies
+/// (team name, inviter email). Prevents a crafted team name from injecting markup
+/// into the outbound HTML email.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 async fn get_member_role(state: &AppState, team_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
