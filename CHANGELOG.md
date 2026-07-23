@@ -6,6 +6,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.21.1] - 2026-07-23
+
+Installer overhaul + PHP 8.5 support. A fresh Ubuntu 26.04 install surfaced that PHP could not be
+installed (by the installer or the panel), the installer's summary claimed PHP-FPM was installed
+anyway, and the failed attempt left broken apt sources behind. All fixed, plus a rebuilt install
+experience.
+
+### Fixed
+- **PHP installs on Ubuntu 26.04 / PHP 8.5 distros.** PHP 8.5 made OPcache built-in, so
+  `php-opcache` has no installation candidate there — and that one dead package name failed the
+  installer's all-or-nothing apt transaction, cascading into a ppa:ondrej/php fallback that
+  publishes nothing for `resolute` yet. The installer and both agent PHP installers now install the
+  PHP core first, add only the extension packages the apt source actually has candidates for, and
+  fall back to a 3rd-party repo only after confirming it publishes for this release.
+- **A failed 3rd-party PHP repo attempt no longer breaks apt.** The old flow left
+  `ondrej-ubuntu-php-*.sources` behind after a failed add, so every later `apt-get update` on the
+  box errored with a 404. Installer and agent now remove the dead source and refresh the index.
+- **The install summary tells the truth.** "Installed services" was a hardcoded list that named
+  PHP-FPM even when its install had just failed. The summary now reports exactly what succeeded
+  (with versions) and what didn't, with the retry path and the install log location.
+- **Settings → Services → Install PHP worked only up to PHP 8.3.** Version detection probed
+  8.3/8.2/8.1 and fell back to a php8.3 install no repo could satisfy on newer distros. It now
+  reads the distro's default from `apt-cache depends php-fpm` first, then probes newest-first.
+- **PHP 8.5 selectable everywhere** — site create/detail dropdowns, the site PHP-switch API, the
+  CLI, the agent allowlist, PHP-FPM pool sweeps, and the IaC export.
+
+### Added — installer experience
+- **Live progress**: long operations show an animated spinner with elapsed seconds (static lines
+  when not a terminal).
+- **Failure box**: if the install dies anywhere it names the exact step, shows the last install-log
+  lines, the full log path, and the safe re-run command — instead of stopping mid-paint.
+- **Full install log** at `/var/log/dockpanel-install.log` (0600) capturing every step's output.
+- **Release-asset integrity**: binaries + frontend downloads are sha256-verified against the
+  release's `checksums.txt` (mismatch aborts); downloads retry on transient network errors.
+- **Honest progress bar**: sized to the steps that will actually run — no more 93% → 100% jump.
+- **All input up front**: the domain prompt happens before the first step, so the install never
+  stops to wait for a human once it starts.
+- Version line in the summary; `✓` only ever marks completed facts (in-progress actions animate),
+  and an SSL-provisioning failure prints as a warning instead of a checkmark.
+
+## [2.21.0] - 2026-07-22
+
+Git Deploy security & correctness hardening — the audit rotation's fresh-eyes pass over the Git
+Deploy surface (backend routes, webhook gateway, deploy scheduler/preview cleanup, agent git_build).
+Operator-only surface (admin-gated), so no cross-tenant exposure; backend + agent, runtime-only.
+
+### Fixed
+- **Preview cleanup actually tears previews down.** `git_previews.container_name` is stored with the
+  `dockpanel-git-` prefix the agent re-adds; the three automatic cleanup callers (TTL, stuck-preview,
+  webhook branch-delete) passed it verbatim, so the doubled prefix made teardown a no-op that leaked
+  the container, image, nginx vhost, SSL cert, and a still-bound port. All callers now strip the
+  prefix first.
+- **The deploy concurrency lock now exists.** The old guard queried `git_deploy_history` for a
+  `building` status that is never written there, so it never fired. Replaced across all three deploy
+  paths with an atomic conditional UPDATE on `git_deploys.status` (30-minute self-heal window with a
+  heartbeat before long builds; a DB error is a 500, not a false "already building" 409), with the
+  config fetch ordered before the lock so a fetch error cannot strand it.
+- `deploy_cron` is now format-validated to exactly what the scheduler accepts (stored values are
+  grandfathered on edit).
+
+### Security
+- **Domain-validation parity** for deploy domains: create/update reject invalid and reserved
+  domains (grandfathering unchanged values); the agent adds a defense-in-depth floor blocking nginx
+  metacharacters before the config write; preview subdomain slugs are DNS-sanitized.
+- **SSRF hardening**: the webhook gateway HTTP client no longer follows redirects (a 302 could
+  bounce the allow-checked URL to 127.0.0.1), and the shared internal-address validator now blocks
+  IPv6 ULA/link-local, IPv4-mapped IPv6, and CGNAT ranges (also protects monitors and alerts).
+
 ## [2.20.0] - 2026-07-22
 
 Tenant-database isolation — the follow-up to v2.19.0's Databases audit, closing the two isolation

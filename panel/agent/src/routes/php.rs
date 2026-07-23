@@ -9,12 +9,15 @@ use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 
 use super::AppState;
 
-/// Allowed PHP versions (ondrej/php PPA).
-const ALLOWED_VERSIONS: &[&str] = &["8.1", "8.2", "8.3", "8.4"];
+/// Allowed PHP versions (distro repos, deb.sury.org, or ondrej/php PPA).
+const ALLOWED_VERSIONS: &[&str] = &["8.1", "8.2", "8.3", "8.4", "8.5"];
 
-/// Common PHP extensions to install with each version.
+/// PHP extensions to install with each version — each is installed only if
+/// this apt source actually has a candidate for it. Newer PHP releases build
+/// some of these in (8.5 absorbed opcache), so a fixed all-or-nothing list
+/// would fail the entire transaction over one obsolete package name.
 const COMMON_EXTENSIONS: &[&str] = &[
-    "cli", "common", "mysql", "pgsql", "sqlite3", "curl", "gd", "mbstring",
+    "mysql", "pgsql", "sqlite3", "curl", "gd", "mbstring",
     "xml", "zip", "bcmath", "intl", "readline", "opcache", "redis", "imagick",
 ];
 
@@ -140,18 +143,35 @@ async fn install_version(
         let os_id = parse("ID");
         let codename = parse("VERSION_CODENAME");
 
+        // Each repo script: (1) pre-checks that the 3rd-party repo actually
+        // publishes for this release — brand-new distro releases lag behind
+        // (ppa:ondrej/php had no Ubuntu 26.04 builds at that release's
+        // launch); (2) verifies the requested version exists after adding.
+        // Failing either way exits non-zero, and the failure branch below
+        // REMOVES the added source — a dead source left behind breaks every
+        // later `apt-get update` on the box with a 404.
         let repo_cmd = if os_id == "debian" && !codename.is_empty() {
             tracing::info!("Adding deb.sury.org repo for Debian ({codename})...");
             format!(
-                "apt-get update -qq && apt-get install -y -qq apt-transport-https lsb-release ca-certificates curl gnupg && \
+                "curl -sfI --max-time 15 https://packages.sury.org/php/dists/{codename}/Release > /dev/null || \
+                     {{ echo 'deb.sury.org publishes no PHP packages for Debian {codename} yet' >&2; exit 42; }}; \
+                 apt-get update -qq && apt-get install -y -qq apt-transport-https lsb-release ca-certificates curl gnupg && \
                  curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg && \
                  echo 'deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ {codename} main' > /etc/apt/sources.list.d/sury-php.list && \
-                 apt-get update -qq"
+                 apt-get update -qq && \
+                 {{ apt-cache policy php{version}-fpm 2>/dev/null | grep -q 'Candidate: [0-9]' || \
+                     {{ echo 'php{version}-fpm is still unavailable after adding deb.sury.org' >&2; exit 43; }}; }}"
             )
-        } else if os_id == "ubuntu" {
-            tracing::info!("Adding ppa:ondrej/php for Ubuntu...");
-            "apt-get update -qq && apt-get install -y -qq software-properties-common && \
-             add-apt-repository -y ppa:ondrej/php && apt-get update -qq".to_string()
+        } else if os_id == "ubuntu" && !codename.is_empty() {
+            tracing::info!("Adding ppa:ondrej/php for Ubuntu ({codename})...");
+            format!(
+                "curl -sfI --max-time 15 https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/{codename}/Release > /dev/null || \
+                     {{ echo 'ppa:ondrej/php publishes no packages for Ubuntu {codename} yet' >&2; exit 42; }}; \
+                 apt-get update -qq && apt-get install -y -qq software-properties-common && \
+                 add-apt-repository -y ppa:ondrej/php && apt-get update -qq && \
+                 {{ apt-cache policy php{version}-fpm 2>/dev/null | grep -q 'Candidate: [0-9]' || \
+                     {{ echo 'php{version}-fpm is still unavailable after adding ppa:ondrej/php' >&2; exit 43; }}; }}"
+            )
         } else {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -170,6 +190,15 @@ async fn install_version(
 
         match repo_result {
             Ok(o) if !o.status.success() => {
+                // Roll the source back so a failed attempt can't poison apt.
+                let _ = safe_command_unsandboxed("bash", &[])
+                    .args(["-c",
+                        "rm -f /etc/apt/sources.list.d/sury-php.list \
+                               /etc/apt/sources.list.d/ondrej-ubuntu-php-*.sources \
+                               /etc/apt/sources.list.d/ondrej-ubuntu-php-*.list; \
+                         apt-get update -qq || true"])
+                    .output()
+                    .await;
                 let err = String::from_utf8_lossy(&o.stderr);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -194,21 +223,30 @@ async fn install_version(
         }
     }
 
-    // Build package list: php{version}-fpm + extensions
-    let mut packages = vec![format!("php{version}-fpm")];
-    for ext in COMMON_EXTENSIONS {
-        packages.push(format!("php{version}-{ext}"));
-    }
-    let pkg_str = packages.join(" ");
+    // Core first (must succeed), then every extension this apt source has a
+    // real candidate for. `apt-cache show` is not enough — a package can
+    // keep a stanza while its Candidate is "(none)" (php-opcache on Ubuntu
+    // 26.04, where OPcache became built-in) and one dead name fails the
+    // whole apt transaction.
+    let ext_names = COMMON_EXTENSIONS.join(" ");
+    let install_cmd = format!(
+        "set -e; export DEBIAN_FRONTEND=noninteractive; \
+         apt-get install -y -qq php{version}-fpm php{version}-cli php{version}-common; \
+         avail=''; \
+         for e in {ext_names}; do \
+             p=\"php{version}-$e\"; \
+             c=$(apt-cache policy \"$p\" 2>/dev/null | sed -n 's/^  Candidate: //p'); \
+             if [ -n \"$c\" ] && [ \"$c\" != '(none)' ]; then avail=\"$avail $p\"; fi; \
+         done; \
+         if [ -n \"$avail\" ]; then apt-get install -y -qq $avail; fi"
+    );
 
-    tracing::info!("Installing PHP {version}: {pkg_str}");
+    tracing::info!("Installing PHP {version} (core + available extensions)");
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
         safe_command_unsandboxed("bash", &[])
-            .args(["-c", &format!(
-                "apt-get install -y -qq {pkg_str} 2>&1"
-            )])
+            .args(["-c", &install_cmd])
             .output(),
     )
     .await;
@@ -260,7 +298,7 @@ async fn install_version(
 
     Ok(Json(InstallResponse {
         success: true,
-        message: format!("PHP {version} installed with {} extensions", COMMON_EXTENSIONS.len()),
+        message: format!("PHP {version} installed with FPM and all available extensions"),
         version: version.to_string(),
     }))
 }

@@ -41,8 +41,8 @@ pub async fn cmd_php_list(token: &str, output: &str) -> Result<(), String> {
 
 pub async fn cmd_php_install(token: &str, version: &str) -> Result<(), String> {
     match version {
-        "8.1" | "8.2" | "8.3" | "8.4" => {}
-        _ => return Err(format!("Invalid PHP version '{version}'. Supported: 8.1, 8.2, 8.3, 8.4")),
+        "8.1" | "8.2" | "8.3" | "8.4" | "8.5" => {}
+        _ => return Err(format!("Invalid PHP version '{version}'. Supported: 8.1, 8.2, 8.3, 8.4, 8.5")),
     }
 
     println!("Installing PHP {version}...");

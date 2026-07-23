@@ -52,13 +52,118 @@ NC='\033[0m'
 DIM='\033[2m'
 WHITE='\033[1;37m'
 
-log()    { echo -e "  ${GREEN}✓${NC} $1"; }
-warn()   { echo -e "  ${YELLOW}⚠${NC} $1"; }
-error()  { echo -e "  ${RED}✗${NC} $1" >&2; }
-info()   { echo -e "  ${CYAN}→${NC} $1"; }
+# ── Install log + terminal detection ─────────────────────────────────────
+# Everything a wrapped command prints is captured here, so a failure at any
+# step leaves full forensics behind instead of vanishing into >/dev/null.
+INSTALL_LOG="/var/log/dockpanel-install.log"
+IS_TTY=0
+if [ -t 1 ]; then IS_TTY=1; fi
+
+# Spinner frames: braille on UTF-8 terminals, plain ASCII everywhere else.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]*8*) SPIN_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' ;;
+    *)                SPIN_FRAMES='|/-\' ;;
+esac
+SPIN_NFRAMES=${#SPIN_FRAMES}
+
+plog() {  # append a plain line to the install log; never fails, never echoes
+    printf '%s\n' "$*" >> "$INSTALL_LOG" 2>/dev/null || true
+}
+
+log()    { echo -e "  ${GREEN}✓${NC} $1";   plog "  [ok]   $1"; }
+warn()   { echo -e "  ${YELLOW}⚠${NC} $1";  plog "  [warn] $1"; }
+error()  { echo -e "  ${RED}✗${NC} $1" >&2; plog "  [FAIL] $1"; }
+info()   { echo -e "  ${CYAN}→${NC} $1";    plog "  [..]   $1"; }
+
+# ── Spinner-wrapped command runner ───────────────────────────────────────
+# run "Label" cmd [args...] — runs cmd with all output captured to the
+# install log, animating a spinner + live elapsed seconds while it works
+# (falls back to a static line when stdout isn't a terminal). Returns the
+# command's exit code; the caller decides whether that's fatal.
+SPIN_PID=""
+run() {
+    local label="$1"; shift
+    plog "→ RUN: $label"
+    plog "  \$ $*"
+    local rc=0
+    if [ "$IS_TTY" = "1" ]; then
+        "$@" >> "$INSTALL_LOG" 2>&1 &
+        SPIN_PID=$!
+        local i=0 start now frame
+        start=$(date +%s)
+        while kill -0 "$SPIN_PID" 2>/dev/null; do
+            frame="${SPIN_FRAMES:$((i % SPIN_NFRAMES)):1}"
+            now=$(( $(date +%s) - start ))
+            # Colours live in the FORMAT string as literal escapes; the frame
+            # char goes through %s so a backslash frame (ASCII set) can't merge
+            # with a following escape and print literal garbage.
+            printf '\r\033[2K  \033[0;36m%s\033[0m %s \033[2m%ss\033[0m' "$frame" "$label" "$now"
+            i=$((i + 1))
+            sleep 0.12 2>/dev/null || sleep 1
+        done
+        if wait "$SPIN_PID"; then rc=0; else rc=$?; fi
+        SPIN_PID=""
+        printf '\r\033[2K'
+    else
+        info "$label"
+        if "$@" >> "$INSTALL_LOG" 2>&1; then rc=0; else rc=$?; fi
+    fi
+    plog "← DONE rc=$rc: $label"
+    return $rc
+}
+
+# ── Failure box (EXIT trap) ──────────────────────────────────────────────
+# If the installer dies anywhere before the summary, tell the user exactly
+# where it stopped, show the tail of the log, and how to retry — instead of
+# cutting off mid-paint.
+CURRENT_STEP_NAME="starting up"
+INSTALL_DONE=0
+on_exit() {
+    local rc=$?
+    if [ -n "$SPIN_PID" ]; then kill "$SPIN_PID" 2>/dev/null || true; fi
+    if [ "$INSTALL_DONE" = "1" ]; then return 0; fi
+    echo ""
+    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║           DockPanel install did not finish           ║${NC}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  Stopped during: ${BOLD}${CURRENT_STEP_NAME}${NC} (exit code ${rc})"
+    if [ -s "$INSTALL_LOG" ]; then
+        echo ""
+        echo -e "  Last lines of the install log:"
+        tail -n 8 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' || true
+        echo ""
+        echo -e "  Full log:  ${BOLD}${INSTALL_LOG}${NC}"
+    fi
+    echo ""
+    echo -e "  Re-running the installer is safe — it picks up where it left off:"
+    echo -e "    ${BOLD}curl -sL https://dockpanel.dev/install.sh | sudo bash${NC}"
+    echo ""
+    echo -e "  Stuck? Open an issue: https://github.com/ovexro/dockpanel/issues"
+    echo ""
+}
+trap on_exit EXIT
+
+# ── Service outcome tracking ─────────────────────────────────────────────
+# The final summary prints what ACTUALLY happened, not a wishlist.
+SVC_OK=()
+SVC_FAIL=()
+svc_ok()   { SVC_OK+=("$1"); }
+svc_fail() { SVC_FAIL+=("$1"); }
+
+join_comma() {
+    local out="" item
+    for item in "$@"; do
+        if [ -z "$out" ]; then out="$item"; else out="$out, $item"; fi
+    done
+    printf '%s' "$out"
+}
 
 # ── Progress tracking ─────────────────────────────────────────────────
-TOTAL_STEPS=15
+# TOTAL_STEPS is recomputed in main() once the install mode (release vs
+# source) and domain are known, so the bar reaches 100% exactly at the end
+# instead of jumping from 93%.
+TOTAL_STEPS=14
 CURRENT_STEP=0
 SETUP_START=0
 
@@ -75,7 +180,9 @@ progress_bar() {
 
 step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
+    CURRENT_STEP_NAME="$1"
     local pct=$((CURRENT_STEP * 100 / TOTAL_STEPS))
+    if [ "$pct" -gt 100 ]; then pct=100; fi
     local elapsed=""
     if [ "$SETUP_START" -gt 0 ]; then
         local now
@@ -87,6 +194,8 @@ step() {
     echo -e "  ${DIM}[${CURRENT_STEP}/${TOTAL_STEPS}]${NC} ${CYAN}$(progress_bar $pct)${NC} ${WHITE}${pct}%${NC}${elapsed}"
     echo -e "  ${BOLD}$1${NC}"
     echo ""
+    plog ""
+    plog "== STEP ${CURRENT_STEP}/${TOTAL_STEPS}: $1 =="
 }
 
 header() { step "$1"; }
@@ -134,27 +243,36 @@ APT_EOF
     fi
 }
 
+# Plain installers — meant to be wrapped in `run`, which captures their full
+# output into $INSTALL_LOG (the old versions swallowed output, so failures
+# left nothing to debug with).
 pkg_install() {
-    local output
     case "$PKG_MGR" in
-        apt) output=$(apt-get install -y "$@" 2>&1) ;;
-        dnf) output=$(dnf install -y "$@" 2>&1) ;;
-        yum) output=$(yum install -y "$@" 2>&1) ;;
+        apt) apt-get install -y "$@" ;;
+        dnf) dnf install -y "$@" ;;
+        yum) yum install -y "$@" ;;
     esac
-    local rc=$?
-    if [ $rc -ne 0 ]; then
-        warn "Failed to install: $* (exit code $rc)"
-        echo "$output" | tail -5 >&2
-        return $rc
-    fi
 }
 
 pkg_update() {
     case "$PKG_MGR" in
-        apt) apt-get update -y > /dev/null 2>&1 ;;
-        dnf) dnf check-update > /dev/null 2>&1 || true ;;
-        yum) yum check-update > /dev/null 2>&1 || true ;;
+        apt) apt-get update -y ;;
+        dnf) dnf check-update || true ;;
+        yum) yum check-update || true ;;
     esac
+}
+
+# True when apt has a real installation candidate for a package. `apt-cache
+# show` is NOT enough — on Ubuntu 26.04 `php-opcache` still has a stanza but
+# `Candidate: (none)` (OPcache became built-in in PHP 8.5), and one dead
+# package fails an entire apt transaction.
+apt_has_candidate() {
+    local c
+    # LC_ALL=C: apt-cache localises the "Candidate:" label (fr "Candidat :",
+    # de "Installationskandidat:"), which would make the sed match nothing on
+    # a non-English box and silently block the whole PHP install.
+    c=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | sed -n 's/^  Candidate: //p')
+    [ -n "$c" ] && [ "$c" != "(none)" ]
 }
 
 # ── Banner ───────────────────────────────────────────────────────────────
@@ -255,27 +373,31 @@ detect_os() {
 install_dependencies() {
     header "Installing Dependencies"
 
-    pkg_update
+    run "Refreshing package index" pkg_update || true
 
     # EPEL for RHEL-family (needed for certbot, fail2ban, etc.)
     if [ "$PKG_MGR" != "apt" ]; then
-        pkg_install epel-release || true
+        run "Enabling EPEL repository" pkg_install epel-release || true
     fi
 
-    pkg_install curl openssl ca-certificates
-
-    # lsb-release only on Debian-based
+    local BASE_PKGS="curl, openssl, ca-certificates"
     if [ "$PKG_MGR" = "apt" ]; then
-        pkg_install gnupg lsb-release
+        # gnupg + lsb-release only exist/matter on Debian-based
+        run "Installing base packages (${BASE_PKGS}, gnupg, lsb-release)" \
+            pkg_install curl openssl ca-certificates gnupg lsb-release
+    else
+        run "Installing base packages (${BASE_PKGS})" \
+            pkg_install curl openssl ca-certificates
     fi
 
     # Build tools required for Rust compilation (cmake for aws-lc-sys, gcc for ring)
     if [ "$INSTALL_FROM_RELEASE" != "1" ]; then
-        log "Installing build tools for Rust compilation..."
         if [ "$PKG_MGR" = "apt" ]; then
-            pkg_install build-essential cmake pkg-config libssl-dev
+            run "Installing build tools (build-essential, cmake, pkg-config, libssl-dev)" \
+                pkg_install build-essential cmake pkg-config libssl-dev
         else
-            pkg_install gcc gcc-c++ cmake make pkg-config openssl-devel
+            run "Installing build tools (gcc, cmake, make, pkg-config, openssl-devel)" \
+                pkg_install gcc gcc-c++ cmake make pkg-config openssl-devel
         fi
         log "Build tools installed"
     fi
@@ -289,11 +411,18 @@ install_docker() {
     if command -v docker &> /dev/null; then
         log "Docker already installed: $(docker --version | head -1)"
     else
-        log "Installing Docker..."
-        curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
+        run "Installing Docker (get.docker.com — takes a minute)" \
+            bash -c 'curl -fsSL https://get.docker.com | sh'
         systemctl enable --now docker > /dev/null 2>&1
+        if ! command -v docker &> /dev/null; then
+            error "Docker installation failed — see $INSTALL_LOG"
+            exit 1
+        fi
         log "Docker installed: $(docker --version | head -1)"
     fi
+    local dv
+    dv=$(docker --version 2>/dev/null | sed -n 's/^Docker version \([0-9.]*\).*/\1/p')
+    svc_ok "Docker${dv:+ $dv}"
 }
 
 install_nginx() {
@@ -302,15 +431,17 @@ install_nginx() {
     if command -v nginx &> /dev/null; then
         log "Nginx already installed"
     else
-        log "Installing Nginx..."
-        if [ "$PKG_MGR" = "apt" ]; then
-            pkg_install nginx
-        else
-            pkg_install nginx
-        fi
+        run "Installing Nginx" pkg_install nginx
         systemctl enable --now nginx > /dev/null 2>&1
+        if ! command -v nginx &> /dev/null; then
+            error "Nginx installation failed — see $INSTALL_LOG"
+            exit 1
+        fi
         log "Nginx installed"
     fi
+    local nv
+    nv=$(nginx -v 2>&1 | sed -n 's|^nginx version: nginx/\([0-9.]*\).*|\1|p')
+    svc_ok "Nginx${nv:+ $nv}"
 }
 
 install_node() {
@@ -325,13 +456,20 @@ install_node() {
     if command -v node &> /dev/null; then
         log "Node.js already installed: $(node --version)"
     else
-        log "Installing Node.js 20 LTS..."
+        # `set -o pipefail` inside the wrapper is load-bearing: without it a
+        # failed nodesource curl pipes nothing into `bash -` (which exits 0),
+        # the `&&` then installs the distro's much-older Node, and the build
+        # later dies cryptically. With pipefail the curl failure aborts here.
         if [ "$PKG_MGR" = "apt" ]; then
-            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - > /dev/null 2>&1
-            apt-get install -y nodejs > /dev/null 2>&1
+            run "Installing Node.js 20 LTS (nodesource)" \
+                bash -c 'set -o pipefail; curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs'
         else
-            curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - > /dev/null 2>&1
-            $PKG_MGR install -y nodejs > /dev/null 2>&1
+            run "Installing Node.js 20 LTS (nodesource)" \
+                bash -c "set -o pipefail; curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && $PKG_MGR install -y nodejs"
+        fi
+        if ! command -v node &> /dev/null; then
+            error "Node.js installation failed — see $INSTALL_LOG"
+            exit 1
         fi
         log "Node.js installed: $(node --version)"
     fi
@@ -417,41 +555,87 @@ setup_database() {
             docker volume rm dockpanel-pgdata > /dev/null 2>&1 || true
         fi
 
-        log "Creating PostgreSQL 16 container..."
-        docker run -d \
+        # POSTGRES_PASSWORD is passed via the environment (bare `-e` inherits),
+        # so the secret never appears in the logged command line.
+        POSTGRES_PASSWORD="$DB_PASSWORD" \
+        run "Creating PostgreSQL 16 container (pulls the image on first install)" \
+            docker run -d \
             --name "$DB_CONTAINER" \
             --restart unless-stopped \
             -e POSTGRES_DB=dockpanel \
             -e POSTGRES_USER=dockpanel \
-            -e "POSTGRES_PASSWORD=$DB_PASSWORD" \
+            -e POSTGRES_PASSWORD \
             -p "127.0.0.1:${DB_PORT}:5432" \
             -v dockpanel-pgdata:/var/lib/postgresql/data \
-            postgres:16-alpine > /dev/null 2>&1
+            postgres:16-alpine
         log "PostgreSQL container created (port $DB_PORT)"
     fi
 
     # Wait for PostgreSQL to be ready
-    log "Waiting for PostgreSQL..."
-    local WAITED=0
-    while [ "$WAITED" -lt 30 ]; do
-        if docker exec "$DB_CONTAINER" pg_isready -U dockpanel > /dev/null 2>&1; then
-            log "PostgreSQL ready"
-            return
-        fi
-        sleep 2
-        WAITED=$((WAITED + 2))
-    done
-    error "PostgreSQL did not become ready within 30s"
-    exit 1
+    if run "Waiting for PostgreSQL to accept connections" bash -c \
+        "for i in \$(seq 1 15); do docker exec $DB_CONTAINER pg_isready -U dockpanel && exit 0; sleep 2; done; exit 1"; then
+        log "PostgreSQL ready"
+    else
+        error "PostgreSQL did not become ready within 30s"
+        exit 1
+    fi
 }
 
 # ── Download Pre-built Binaries ──────────────────────────────────────────
+INSTALLED_VERSION=""
+
+# fetch_asset <asset-name> <dest> — download to a QUARANTINE temp file next to
+# dest, verify its sha256 against the release checksums.txt, and only move it
+# onto the live path AFTER it verifies — so the live executable path never
+# holds unverified bytes (a mismatch aborts without touching the old binary).
+# A checksum MISMATCH is fatal; a missing manifest only warns (availability
+# must not brick an install, integrity must). Sets FETCH_VERIFIED=1/0 so the
+# caller can report honestly whether a checksum was actually compared.
+FETCH_VERIFIED=0
+fetch_asset() {
+    local asset="$1" dest="$2"
+    local tmp="${dest}.dpdl.$$"
+    FETCH_VERIFIED=0
+    if ! run "Downloading ${asset}" \
+        curl --retry 3 --retry-delay 2 -sfL "${BASE_URL}/${asset}" -o "$tmp"; then
+        rm -f "$tmp"
+        error "Download failed: ${asset} — see $INSTALL_LOG"
+        exit 1
+    fi
+    if [ -s "$CHECKSUMS_FILE" ]; then
+        local want got
+        want=$(awk -v n="$asset" '$2 == n {print $1; exit}' "$CHECKSUMS_FILE")
+        if [ -n "$want" ]; then
+            got=$(sha256sum "$tmp" | awk '{print $1}')
+            if [ "$want" != "$got" ]; then
+                rm -f "$tmp"
+                error "Checksum MISMATCH for ${asset} — refusing to install a corrupt binary"
+                plog "expected $want got $got"
+                exit 1
+            fi
+            FETCH_VERIFIED=1
+        fi
+    fi
+    # Atomic swap into the live path (never `cp` onto a running binary).
+    mv -f "$tmp" "$dest"
+}
+
+# Truthful post-download line — "verified" ONLY when a checksum was compared.
+fetched_msg() {
+    local what="$1" path="$2"
+    if [ "$FETCH_VERIFIED" = "1" ]; then
+        log "${what} downloaded + verified ($(du -h "$path" | cut -f1))"
+    else
+        log "${what} downloaded ($(du -h "$path" | cut -f1)) — checksum not verified"
+    fi
+}
+
 download_binaries() {
     header "Downloading Pre-built Binaries"
 
     # Get latest release tag
     local RELEASE_TAG
-    RELEASE_TAG=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    RELEASE_TAG=$(curl --retry 3 --retry-delay 2 -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 
     if [ -z "$RELEASE_TAG" ]; then
         error "Could not determine latest release. Check https://github.com/${GITHUB_REPO}/releases"
@@ -459,7 +643,17 @@ download_binaries() {
     fi
 
     log "Latest release: $RELEASE_TAG"
-    local BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
+    INSTALLED_VERSION="$RELEASE_TAG"
+    BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
+
+    # Checksum manifest first — every later download is verified against it.
+    # mktemp (root-owned, O_EXCL, unpredictable) so a local user can't pre-seed
+    # a manifest that would make a tampered binary "verify".
+    CHECKSUMS_FILE=$(umask 077; mktemp /tmp/dockpanel-checksums.XXXXXX 2>/dev/null || echo "")
+    if [ -z "$CHECKSUMS_FILE" ] || ! curl --retry 3 --retry-delay 2 -sfL "${BASE_URL}/checksums.txt" -o "$CHECKSUMS_FILE" 2>/dev/null; then
+        warn "checksums.txt not available — skipping integrity verification"
+        : > "$CHECKSUMS_FILE" 2>/dev/null || CHECKSUMS_FILE=""
+    fi
 
     # Stop running services before overwriting their binaries. Re-running the
     # installer with services active causes `curl -o` to fail with "Text file
@@ -469,34 +663,28 @@ download_binaries() {
         systemctl stop dockpanel-api dockpanel-agent 2>/dev/null || true
     fi
 
-    # Download agent
-    log "Downloading agent (${DL_ARCH})..."
-    curl -sfL "${BASE_URL}/dockpanel-agent-linux-${DL_ARCH}" -o "$AGENT_BIN"
+    fetch_asset "dockpanel-agent-linux-${DL_ARCH}" "$AGENT_BIN"
     chmod +x "$AGENT_BIN"
-    log "Agent downloaded ($(du -h "$AGENT_BIN" | cut -f1))"
+    fetched_msg "Agent" "$AGENT_BIN"
 
-    # Download API
-    log "Downloading API (${DL_ARCH})..."
-    curl -sfL "${BASE_URL}/dockpanel-api-linux-${DL_ARCH}" -o "$API_BIN"
+    fetch_asset "dockpanel-api-linux-${DL_ARCH}" "$API_BIN"
     chmod +x "$API_BIN"
-    log "API downloaded ($(du -h "$API_BIN" | cut -f1))"
+    fetched_msg "API" "$API_BIN"
 
-    # Download CLI
-    log "Downloading CLI (${DL_ARCH})..."
-    curl -sfL "${BASE_URL}/dockpanel-cli-linux-${DL_ARCH}" -o "$CLI_BIN"
+    fetch_asset "dockpanel-cli-linux-${DL_ARCH}" "$CLI_BIN"
     chmod +x "$CLI_BIN"
-    log "CLI downloaded ($(du -h "$CLI_BIN" | cut -f1))"
+    fetched_msg "CLI" "$CLI_BIN"
 
-    # Download frontend
-    log "Downloading frontend..."
-    local FE_TARBALL="/tmp/dockpanel-frontend.tar.gz"
-    curl -sfL "${BASE_URL}/dockpanel-frontend.tar.gz" -o "$FE_TARBALL"
+    local FE_TARBALL
+    FE_TARBALL=$(umask 077; mktemp /tmp/dockpanel-frontend.XXXXXX.tar.gz 2>/dev/null || echo /tmp/dockpanel-frontend.tar.gz)
+    fetch_asset "dockpanel-frontend.tar.gz" "$FE_TARBALL"
 
     # Extract frontend — need a target directory
     local FE_DIR="/opt/dockpanel/frontend"
     mkdir -p "$FE_DIR"
     tar xzf "$FE_TARBALL" -C "$FE_DIR"
     rm -f "$FE_TARBALL"
+    [ -n "$CHECKSUMS_FILE" ] && rm -f "$CHECKSUMS_FILE"
 
     # If dist/ is nested inside, flatten it
     if [ -d "$FE_DIR/dist" ]; then
@@ -571,6 +759,9 @@ build_binaries() {
     cp "$CLI_SRC/target/release/dockpanel" "$CLI_BIN"
     chmod +x "$CLI_BIN"
     log "CLI built ($(du -h "$CLI_BIN" | cut -f1))"
+
+    INSTALLED_VERSION=$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null || echo "")
+    INSTALLED_VERSION="${INSTALLED_VERSION:+${INSTALLED_VERSION} (built from source)}"
 }
 
 # ── Build Frontend ───────────────────────────────────────────────────────
@@ -835,119 +1026,181 @@ NGINXEOF
 wait_for_health() {
     header "Health Check"
 
-    log "Waiting for API..."
-    local WAITED=0
-    while [ "$WAITED" -lt 30 ]; do
-        if curl -sf http://127.0.0.1:3080/api/health > /dev/null 2>&1; then
-            log "API healthy"
-            return
-        fi
-        sleep 2
-        WAITED=$((WAITED + 2))
-    done
-
-    warn "API not responding on port 3080 yet — check: journalctl -u dockpanel-api -n 20"
+    if run "Waiting for the API to answer on port 3080" bash -c \
+        'for i in $(seq 1 15); do curl -sf http://127.0.0.1:3080/api/health && exit 0; sleep 2; done; exit 1'; then
+        log "API healthy"
+    else
+        warn "API not responding on port 3080 yet — check: journalctl -u dockpanel-api -n 20"
+    fi
 }
 
-# ── Summary ──────────────────────────────────────────────────────────────
+# ── Recommended Services ─────────────────────────────────────────────────
+
+# install_php_set <prefix> — install <prefix>-fpm + <prefix>-cli, then every
+# extension metapackage this apt source actually has a candidate for.
+# A fixed list would fail the whole transaction over one obsolete name:
+# PHP 8.5 (Ubuntu 26.04) absorbed OPcache, so `php-opcache` no longer has an
+# installation candidate there — that single dead package is what broke the
+# old all-or-nothing install. Skipped names are reported, not fatal.
+install_php_set() {
+    local prefix="$1"
+    local exts="" skipped="" e
+    if ! run "Installing ${prefix}-fpm + ${prefix}-cli" apt-get install -y "${prefix}-fpm" "${prefix}-cli"; then
+        return 1
+    fi
+    for e in mysql pgsql curl gd mbstring xml zip bcmath intl readline opcache; do
+        if apt_has_candidate "${prefix}-${e}"; then
+            exts="$exts ${prefix}-${e}"
+        else
+            skipped="$skipped $e"
+        fi
+    done
+    if [ -n "$exts" ]; then
+        # shellcheck disable=SC2086
+        if ! run "Installing PHP extensions ($(echo $exts | wc -w) packages)" apt-get install -y $exts; then
+            warn "Some PHP extensions failed to install — see $INSTALL_LOG"
+        fi
+    fi
+    if [ -n "$skipped" ]; then
+        info "Skipped:${skipped} (built into this PHP version or not packaged)"
+    fi
+    return 0
+}
+
+# cleanup_php_repo — remove a 3rd-party PHP source that turned out not to
+# serve this release. Leaving it behind breaks EVERY later `apt-get update`
+# on the user's box with a 404 (this exact wreckage was found on a fresh
+# Ubuntu 26.04 install after the old installer's failed PPA attempt).
+cleanup_php_repo() {
+    rm -f /etc/apt/sources.list.d/sury-php.list \
+          /etc/apt/sources.list.d/ondrej-ubuntu-php-*.sources \
+          /etc/apt/sources.list.d/ondrej-ubuntu-php-*.list 2>/dev/null || true
+    run "Refreshing package index" apt-get update -y || true
+}
+
+install_php() {
+    if command -v php &> /dev/null; then
+        log "PHP already installed: $(php -v | head -1 | awk '{print $2}')"
+        svc_ok "PHP $(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) (FPM)"
+        return
+    fi
+
+    if [ "$PKG_MGR" = "apt" ]; then
+        # Re-source /etc/os-release — detect_os' copy is local to that function.
+        local OS_ID="" OS_CODENAME=""
+        if [ -f /etc/os-release ]; then
+            OS_ID=$(. /etc/os-release && echo "${ID:-}")
+            OS_CODENAME=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+        fi
+
+        # Step 1: the distro's own PHP. Covers Ubuntu 24.04 (8.3), Ubuntu
+        # 26.04 (8.5), Debian 12 (8.2), Debian 13 (8.4) — modern distros ship
+        # a usable PHP and need no 3rd-party repo at all.
+        local PHP_VER=""
+        if apt_has_candidate php-fpm && install_php_set php; then
+            PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)
+        fi
+
+        # Step 2: releases without a usable distro PHP fall back to a
+        # 3rd-party repo (Debian → deb.sury.org, Ubuntu → ppa:ondrej/php) —
+        # but ONLY after confirming that repo actually publishes for this
+        # release (brand-new releases lag), and with cleanup on failure so a
+        # dead source can never poison the box's apt state.
+        if [ -z "$PHP_VER" ]; then
+            local FALLBACK_VER="8.3" repo_added=0
+            if [ "$OS_ID" = "debian" ] && [ -n "$OS_CODENAME" ]; then
+                if curl -sfI --max-time 15 "https://packages.sury.org/php/dists/${OS_CODENAME}/Release" > /dev/null 2>&1; then
+                    if run "Adding deb.sury.org PHP repo (${OS_CODENAME})" bash -c "
+                        apt-get install -y apt-transport-https lsb-release ca-certificates curl gnupg &&
+                        curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg &&
+                        echo 'deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ ${OS_CODENAME} main' > /etc/apt/sources.list.d/sury-php.list &&
+                        apt-get update -y"; then
+                        repo_added=1
+                    fi
+                else
+                    warn "deb.sury.org publishes no PHP packages for Debian ${OS_CODENAME} yet"
+                fi
+            elif [ "$OS_ID" = "ubuntu" ] && [ -n "$OS_CODENAME" ]; then
+                if curl -sfI --max-time 15 "https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${OS_CODENAME}/Release" > /dev/null 2>&1; then
+                    if run "Adding ppa:ondrej/php (${OS_CODENAME})" bash -c "
+                        apt-get install -y software-properties-common &&
+                        add-apt-repository -y ppa:ondrej/php &&
+                        apt-get update -y"; then
+                        repo_added=1
+                    fi
+                else
+                    warn "ppa:ondrej/php publishes no packages for Ubuntu ${OS_CODENAME} yet"
+                fi
+            fi
+
+            if [ "$repo_added" = "1" ] && apt_has_candidate "php${FALLBACK_VER}-fpm"; then
+                if install_php_set "php${FALLBACK_VER}"; then
+                    PHP_VER="$FALLBACK_VER"
+                fi
+            fi
+            if [ -z "$PHP_VER" ] && [ "$repo_added" = "1" ]; then
+                cleanup_php_repo
+            fi
+        fi
+
+        if [ -n "$PHP_VER" ]; then
+            systemctl enable --now "php${PHP_VER}-fpm" > /dev/null 2>&1
+            log "PHP ${PHP_VER} installed with FPM"
+            svc_ok "PHP ${PHP_VER} (FPM)"
+        else
+            warn "PHP could not be installed — WordPress/PHP sites need it; retry later from Settings → Services"
+            svc_fail "PHP-FPM"
+        fi
+    else
+        # RHEL/Rocky/Fedora
+        if run "Installing PHP (distro packages)" pkg_install php-fpm php-cli php-common php-mysqlnd php-pgsql php-xml php-mbstring php-curl php-zip php-gd; then
+            systemctl enable --now php-fpm > /dev/null 2>&1
+            log "PHP installed with FPM"
+            svc_ok "PHP $(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) (FPM)"
+        else
+            warn "PHP could not be installed — retry later from Settings → Services"
+            svc_fail "PHP-FPM"
+        fi
+    fi
+}
+
 install_recommended_services() {
     header "Recommended Services"
 
     # PHP-FPM (needed for WordPress, PHP sites)
-    if ! command -v php &> /dev/null; then
-        log "Installing PHP-FPM..."
-        if [ "$PKG_MGR" = "apt" ]; then
-            # Re-source /etc/os-release — detect_os' copy is local to that function.
-            local OS_ID="" OS_CODENAME=""
-            if [ -f /etc/os-release ]; then
-                OS_ID=$(. /etc/os-release && echo "${ID:-}")
-                OS_CODENAME=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
-            fi
-
-            # Step 1: try default-repo php-fpm. Covers Debian 13/12 (PHP 8.4/8.2),
-            # Ubuntu 24.04 (PHP 8.3) — modern distros ship a usable PHP out of
-            # the box and don't need a 3rd-party repo at all.
-            local PHP_VER=""
-            if apt-cache show php-fpm > /dev/null 2>&1 \
-                && apt-get install -y php-fpm php-cli php-mysql php-pgsql php-curl \
-                    php-gd php-mbstring php-xml php-zip php-bcmath php-intl \
-                    php-readline php-opcache > /dev/null 2>&1; then
-                PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)
-            fi
-
-            # Step 2: fall back to a 3rd-party repo for PHP 8.3 if step 1 didn't
-            # land us on a usable PHP. Debian → deb.sury.org; Ubuntu → ppa:ondrej/php.
-            # The previous releases hardcoded the Ondrej PPA for both, which doesn't
-            # work on Debian — that's why fresh Debian 13 installs were warning
-            # "PHP 8.3 installation failed" (#57).
-            if [ -z "$PHP_VER" ]; then
-                PHP_VER="8.3"
-                if [ "$OS_ID" = "debian" ] && [ -n "$OS_CODENAME" ]; then
-                    log "Adding deb.sury.org repo for PHP ${PHP_VER}..."
-                    apt-get install -y apt-transport-https lsb-release ca-certificates curl gnupg > /dev/null 2>&1
-                    curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg 2>/dev/null
-                    echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ ${OS_CODENAME} main" \
-                        > /etc/apt/sources.list.d/sury-php.list
-                    apt-get update -y > /dev/null 2>&1
-                elif [ "$OS_ID" = "ubuntu" ]; then
-                    log "Adding ppa:ondrej/php for PHP ${PHP_VER}..."
-                    apt-get install -y software-properties-common > /dev/null 2>&1
-                    add-apt-repository -y ppa:ondrej/php > /dev/null 2>&1 || true
-                    apt-get update -y > /dev/null 2>&1
-                fi
-
-                if apt-get install -y php${PHP_VER}-fpm php${PHP_VER}-cli php${PHP_VER}-mysql \
-                    php${PHP_VER}-pgsql php${PHP_VER}-curl php${PHP_VER}-gd php${PHP_VER}-mbstring \
-                    php${PHP_VER}-xml php${PHP_VER}-zip php${PHP_VER}-bcmath php${PHP_VER}-intl \
-                    php${PHP_VER}-readline php${PHP_VER}-opcache > /dev/null 2>&1; then
-                    : # PHP_VER is already set
-                else
-                    warn "PHP ${PHP_VER} installation failed — install manually later from Settings → Services"
-                    PHP_VER=""
-                fi
-            fi
-
-            if [ -n "$PHP_VER" ]; then
-                systemctl enable --now php${PHP_VER}-fpm > /dev/null 2>&1
-                log "PHP ${PHP_VER} installed with FPM"
-            fi
-        else
-            # RHEL/Rocky/Fedora
-            if pkg_install php-fpm php-cli php-common php-mysqlnd php-pgsql php-xml php-mbstring php-curl php-zip php-gd; then
-                systemctl enable --now php-fpm > /dev/null 2>&1
-                log "PHP installed with FPM"
-            else
-                warn "PHP installation failed — install manually later from Settings → Services"
-            fi
-        fi
-    else
-        log "PHP already installed: $(php -v | head -1 | awk '{print $2}')"
-    fi
+    install_php
 
     # Certbot (needed for SSL certificates)
     if ! command -v certbot &> /dev/null; then
-        log "Installing Certbot..."
-        if pkg_install certbot python3-certbot-nginx; then
+        if run "Installing Certbot" pkg_install certbot python3-certbot-nginx; then
             systemctl enable --now certbot.timer > /dev/null 2>&1
             log "Certbot installed with auto-renewal"
+            svc_ok "Certbot"
         else
-            warn "Certbot installation failed — SSL provisioning will not work until installed"
+            warn "Certbot failed to install — SSL provisioning will not work until it is"
+            svc_fail "Certbot"
         fi
     else
         log "Certbot already installed"
+        svc_ok "Certbot"
     fi
 
     # UFW (firewall)
     if ! command -v ufw &> /dev/null; then
-        log "Installing UFW firewall..."
-        pkg_install ufw
-        ufw default deny incoming > /dev/null 2>&1
-        ufw default allow outgoing > /dev/null 2>&1
-        ufw allow 22/tcp > /dev/null 2>&1
-        ufw --force enable > /dev/null 2>&1
-        log "UFW installed and enabled"
+        if run "Installing UFW firewall" pkg_install ufw; then
+            ufw default deny incoming > /dev/null 2>&1
+            ufw default allow outgoing > /dev/null 2>&1
+            ufw allow 22/tcp > /dev/null 2>&1
+            ufw --force enable > /dev/null 2>&1
+            log "UFW installed and enabled"
+            svc_ok "UFW"
+        else
+            warn "UFW failed to install — no firewall is active"
+            svc_fail "UFW"
+        fi
     else
         log "UFW already installed"
+        svc_ok "UFW"
     fi
 
     # Ensure panel ports are always open (even if UFW was pre-existing)
@@ -962,13 +1215,8 @@ install_recommended_services() {
 
     # Fail2Ban (intrusion prevention)
     if ! command -v fail2ban-client &> /dev/null; then
-        log "Installing Fail2Ban..."
-        if ! pkg_install fail2ban; then
-            warn "Fail2Ban installation failed — install manually later from Settings → Services"
-            log "All recommended services ready"
-            return
-        fi
-        cat > /etc/fail2ban/jail.local << 'F2BEOF'
+        if run "Installing Fail2Ban" pkg_install fail2ban; then
+            cat > /etc/fail2ban/jail.local << 'F2BEOF'
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -983,13 +1231,24 @@ enabled = true
 [nginx-limit-req]
 enabled = true
 F2BEOF
-        systemctl enable --now fail2ban > /dev/null 2>&1
-        log "Fail2Ban installed with SSH + Nginx jails"
+            systemctl enable --now fail2ban > /dev/null 2>&1
+            log "Fail2Ban installed with SSH + Nginx jails"
+            svc_ok "Fail2Ban"
+        else
+            warn "Fail2Ban failed to install — retry later from Settings → Services"
+            svc_fail "Fail2Ban"
+        fi
     else
         log "Fail2Ban already installed"
+        svc_ok "Fail2Ban"
     fi
 
-    log "All recommended services ready"
+    # Honest section verdict — never claim "all ready" over a failure.
+    if [ ${#SVC_FAIL[@]} -eq 0 ]; then
+        log "All recommended services ready"
+    else
+        warn "$(join_comma "${SVC_FAIL[@]}") did not install — the panel still works; retry from Settings → Services"
+    fi
 }
 
 provision_panel_ssl() {
@@ -1005,16 +1264,19 @@ provision_panel_ssl() {
         return
     fi
 
-    log "Provisioning Let's Encrypt certificate for $PANEL_DOMAIN..."
-    if certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect 2>/dev/null; then
+    if run "Provisioning Let's Encrypt certificate for ${PANEL_DOMAIN}" \
+        certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then
         log "SSL certificate provisioned for $PANEL_DOMAIN"
     else
-        log "SSL provisioning failed — you can retry manually: certbot --nginx -d $PANEL_DOMAIN"
-        log "If using Cloudflare proxy, set SSL mode to 'Full' and try again"
+        warn "SSL provisioning failed — the panel still works over HTTP"
+        info "Retry manually: certbot --nginx -d $PANEL_DOMAIN"
+        info "If using Cloudflare proxy, set SSL mode to 'Full' and try again"
     fi
 }
 
 print_summary() {
+    INSTALL_DONE=1
+
     local SERVER_IP
     SERVER_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
                 hostname -I 2>/dev/null | awk '{print $1}' || \
@@ -1031,6 +1293,9 @@ print_summary() {
     echo -e "${GREEN}${BOLD}║         DockPanel installed successfully!            ║${NC}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
+    if [ -n "$INSTALLED_VERSION" ]; then
+        echo -e "  ${BOLD}Version:${NC}        ${INSTALLED_VERSION}"
+    fi
     if [ -n "$PANEL_DOMAIN" ]; then
         echo -e "  ${BOLD}Panel URL:${NC}      https://${PANEL_DOMAIN}"
     else
@@ -1055,13 +1320,23 @@ print_summary() {
     echo -e "    Agent token:    ${CONFIG_DIR}/agent.token"
     echo -e "    API env:        ${CONFIG_DIR}/api.env"
     echo -e "    Backups:        /var/backups/dockpanel/"
+    echo -e "    Install log:    ${INSTALL_LOG}"
     echo ""
     echo -e "  ${BOLD}Database:${NC}"
     echo -e "    Container:      ${DB_CONTAINER} (port ${DB_PORT})"
     echo -e "    Connect:        docker exec -it ${DB_CONTAINER} psql -U dockpanel -d dockpanel"
     echo ""
-    echo -e "  ${BOLD}Installed services:${NC}"
-    echo -e "    Docker, Nginx, PHP-FPM, Certbot, UFW, Fail2Ban"
+    # What ACTUALLY installed — never a hardcoded wishlist.
+    if [ ${#SVC_OK[@]} -gt 0 ]; then
+        echo -e "  ${BOLD}Installed services:${NC}"
+        echo -e "    $(join_comma "${SVC_OK[@]}")"
+    fi
+    if [ ${#SVC_FAIL[@]} -gt 0 ]; then
+        echo ""
+        echo -e "  ${YELLOW}${BOLD}⚠ Not installed:${NC}"
+        echo -e "    $(join_comma "${SVC_FAIL[@]}")"
+        echo -e "    ${DIM}Retry from the panel: Settings → Services · details: ${INSTALL_LOG}${NC}"
+    fi
     echo ""
     echo -e "  ${BOLD}Optional (install from panel):${NC}"
     echo -e "    Mail server:    Settings → Services or Mail page → Install"
@@ -1074,6 +1349,7 @@ print_summary() {
     echo -e "    3. Provision SSL (click the lock icon on any site)"
     echo -e "    4. Run diagnostics (Diagnostics → Run Scan)"
     echo ""
+    echo -e "  ${BOLD}Docs:${NC}     https://docs.dockpanel.dev"
     echo -e "  ${YELLOW}Update:${NC}   Run: bash /opt/dockpanel/scripts/update.sh"
     echo ""
 }
@@ -1126,17 +1402,30 @@ main() {
     SETUP_START=$(date +%s)
     print_banner
     check_root
+
+    # Start the install log. Prefer /var/log; if it's read-only (hardened /
+    # containerized host) fall back to a root-owned, unpredictable, O_EXCL temp
+    # file via mktemp — never a fixed /tmp path a local user could pre-create
+    # or symlink (the installer runs as root and logs config paths).
+    if : > "$INSTALL_LOG" 2>/dev/null; then
+        chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+    else
+        INSTALL_LOG=$(umask 077; mktemp /tmp/dockpanel-install.XXXXXX 2>/dev/null || echo /dev/null)
+    fi
+    plog "DockPanel installer started: $(date 2>/dev/null || true)"
+
+    # No apt/debconf prompt may ever block a piped installer
+    export DEBIAN_FRONTEND=noninteractive
+
     detect_pkg_manager
-    detect_os
-    preflight_checks
 
     # Auto-detect: if no source available, use release binaries
     if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
-        log "No source found — switching to pre-built binary download"
         INSTALL_FROM_RELEASE=1
     fi
 
-    # Ask for domain if not set via env
+    # Ask for the domain UP FRONT — all input happens before the first step,
+    # so the install never stops to wait for a human once it starts moving.
     if [ -z "$PANEL_DOMAIN" ]; then
         echo ""
         echo -e "${BOLD}Enter your panel domain (e.g. panel.example.com)${NC}"
@@ -1165,6 +1454,18 @@ main() {
         PANEL_PORT="80"  # Will be upgraded to 443 by certbot
     fi
 
+    # Every conditional step is now known — size the progress bar so it hits
+    # 100% exactly at the end (no phantom steps, no 93% → 100% jump).
+    TOTAL_STEPS=14
+    if [ "$INSTALL_FROM_RELEASE" != "1" ]; then
+        TOTAL_STEPS=$((TOTAL_STEPS + 1))   # build binaries + frontend = 2 steps vs 1 download step
+    fi
+    if [ -n "$PANEL_DOMAIN" ]; then
+        TOTAL_STEPS=$((TOTAL_STEPS + 1))   # panel SSL certificate step
+    fi
+
+    detect_os
+    preflight_checks
     check_source
     install_dependencies
     install_docker

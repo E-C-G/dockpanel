@@ -285,6 +285,7 @@ export default function Sites() {
                   onChange={(e) => setPhpVersion(e.target.value)}
                   className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800"
                 >
+                  <option value="8.5">PHP 8.5</option>
                   <option value="8.4">PHP 8.4</option>
                   <option value="8.3">PHP 8.3</option>
                   <option value="8.2">PHP 8.2</option>

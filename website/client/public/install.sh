@@ -60,7 +60,7 @@ if [ -d "$INSTALL_DIR/.git" ]; then
 else
     echo -e "${GREEN}[+]${NC} Downloading DockPanel..."
     rm -rf "$INSTALL_DIR"
-    git clone --depth 1 -b "$VERSION" https://github.com/ovexro/dockpanel.git "$INSTALL_DIR"
+    git clone --quiet --depth 1 -b "$VERSION" https://github.com/ovexro/dockpanel.git "$INSTALL_DIR"
 fi
 
 # Default to pre-built binaries unless BUILD_FROM_SOURCE=1

@@ -959,10 +959,10 @@ pub async fn switch_php(
 ) -> Result<Json<Site>, ApiError> {
     let version = body.version.trim();
 
-    if !["8.1", "8.2", "8.3", "8.4"].contains(&version) {
+    if !["8.1", "8.2", "8.3", "8.4", "8.5"].contains(&version) {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "Invalid PHP version. Allowed: 8.1, 8.2, 8.3, 8.4",
+            "Invalid PHP version. Allowed: 8.1, 8.2, 8.3, 8.4, 8.5",
         ));
     }
 

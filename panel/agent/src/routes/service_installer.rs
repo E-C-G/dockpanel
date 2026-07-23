@@ -51,8 +51,12 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
     let pdns_installed = is_installed("pdns-server").await;
     let pdns_running = is_active("pdns").await;
 
-    let php_installed = is_installed("php-fpm").await || is_installed("php8.4-fpm").await || is_installed("php8.3-fpm").await || is_installed("php8.2-fpm").await || is_installed("php8.1-fpm").await;
-    let php_running = is_active("php8.4-fpm").await || is_active("php8.3-fpm").await || is_active("php8.2-fpm").await || is_active("php8.1-fpm").await;
+    // Keep these version lists in lock-step with php.rs ALLOWED_VERSIONS — both
+    // installer paths (setup.sh, php.rs, this file) install `php{ver}-fpm`
+    // directly (never the `php-fpm` metapackage), so a missing version here
+    // reports an installed+running PHP as absent on the Services page.
+    let php_installed = is_installed("php-fpm").await || is_installed("php8.5-fpm").await || is_installed("php8.4-fpm").await || is_installed("php8.3-fpm").await || is_installed("php8.2-fpm").await || is_installed("php8.1-fpm").await;
+    let php_running = is_active("php8.5-fpm").await || is_active("php8.4-fpm").await || is_active("php8.3-fpm").await || is_active("php8.2-fpm").await || is_active("php8.1-fpm").await;
     let certbot_installed = which("certbot").await;
     let ufw_installed = which("ufw").await;
     let ufw_active = is_ufw_active().await;
@@ -100,17 +104,27 @@ async fn install_php() -> Result<Json<serde_json::Value>, ApiErr> {
     // Detect best PHP version available
     let version = detect_available_php().await.unwrap_or_else(|| "8.3".to_string());
 
-    let packages = format!(
-        "php{v}-fpm php{v}-cli php{v}-mysql php{v}-pgsql php{v}-sqlite3 \
-         php{v}-curl php{v}-gd php{v}-mbstring php{v}-xml php{v}-zip \
-         php{v}-bcmath php{v}-intl php{v}-readline php{v}-opcache",
+    // Core first (must succeed), then only the extensions this apt source
+    // has a real install candidate for — newer PHP releases build some in
+    // (8.5 absorbed opcache), and one candidate-less package name fails the
+    // entire apt transaction.
+    let install_cmd = format!(
+        "set -e; export DEBIAN_FRONTEND=noninteractive; \
+         apt-get -o Dpkg::Options::=--force-confnew install -y php{v}-fpm php{v}-cli; \
+         avail=''; \
+         for e in mysql pgsql sqlite3 curl gd mbstring xml zip bcmath intl readline opcache; do \
+             p=\"php{v}-$e\"; \
+             c=$(apt-cache policy \"$p\" 2>/dev/null | sed -n 's/^  Candidate: //p'); \
+             if [ -n \"$c\" ] && [ \"$c\" != '(none)' ]; then avail=\"$avail $p\"; fi; \
+         done; \
+         if [ -n \"$avail\" ]; then apt-get -o Dpkg::Options::=--force-confnew install -y $avail; fi",
         v = version
     );
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
         safe_command_unsandboxed("sh", &[])
-            .args(["-c", &format!("DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y {packages}")])
+            .args(["-c", &install_cmd])
             .output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PHP install timed out after 300s"))?
@@ -1397,7 +1411,31 @@ async fn cloudflared_status() -> Result<Json<serde_json::Value>, ApiErr> {
 }
 
 async fn detect_available_php() -> Option<String> {
-    for v in ["8.3", "8.2", "8.1"] {
+    // The distro's own default first: `apt-cache depends php-fpm` names the
+    // real package ("Depends: php8.5-fpm" on Ubuntu 26.04, php8.3-fpm on
+    // 24.04, php8.4-fpm on Debian 13). The old fixed probe list topped out
+    // at 8.3, so on any distro shipping a newer PHP it returned None and the
+    // caller fell back to a php8.3 install that no repo could satisfy.
+    if let Ok(Ok(o)) = tokio::time::timeout(
+        Duration::from_secs(120),
+        safe_command("apt-cache").args(["depends", "php-fpm"]).output()
+    ).await {
+        if o.status.success() {
+            let out = String::from_utf8_lossy(&o.stdout);
+            for line in out.lines() {
+                if let Some(rest) = line.trim().strip_prefix("Depends: php") {
+                    if let Some(v) = rest.strip_suffix("-fpm") {
+                        if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback probe, newest first (covers boxes with a 3rd-party PHP repo
+    // already configured but no php-fpm metapackage).
+    for v in ["8.5", "8.4", "8.3", "8.2", "8.1"] {
         let output = tokio::time::timeout(
             Duration::from_secs(120),
             safe_command("apt-cache").args(["show", &format!("php{v}-fpm")]).output()

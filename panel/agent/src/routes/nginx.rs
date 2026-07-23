@@ -399,7 +399,7 @@ async fn delete_site(
     }
 
     // PHP-FPM pool configs (all versions)
-    for version in &["8.1", "8.2", "8.3", "8.4"] {
+    for version in &["8.1", "8.2", "8.3", "8.4", "8.5"] {
         let pool_path = format!("/etc/php/{version}/fpm/pool.d/{pool_name}.conf");
         if std::path::Path::new(&pool_path).exists() {
             std::fs::remove_file(&pool_path).ok();
@@ -603,7 +603,7 @@ async fn rename_site(
     // 7. Rename PHP-FPM pool configs
     let old_pool = old_domain.replace('.', "_");
     let new_pool = new_domain.replace('.', "_");
-    for version in &["8.1", "8.2", "8.3", "8.4"] {
+    for version in &["8.1", "8.2", "8.3", "8.4", "8.5"] {
         let old_pool_path = format!("/etc/php/{version}/fpm/pool.d/{old_pool}.conf");
         let new_pool_path = format!("/etc/php/{version}/fpm/pool.d/{new_pool}.conf");
         if std::path::Path::new(&old_pool_path).exists() {
