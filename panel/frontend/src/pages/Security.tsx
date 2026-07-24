@@ -392,6 +392,8 @@ export default function Security() {
         return "bg-warn-500/10 text-warn-400";
       case "container_vuln":
         return "bg-danger-500/10 text-danger-400";
+      case "secret_leak":
+        return "bg-danger-500/10 text-danger-400";
       case "security_headers":
         return "bg-accent-500/10 text-accent-400";
       default:

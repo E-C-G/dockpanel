@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.25.0] - 2026-07-24
+
+Webroot secret scanning — the weekly security scan now flags hardcoded credentials in each site's
+document root, extending the existing scanner in response to user feedback.
+
+### Added
+- **Hardcoded-secret detection across site webroots.** The agent's full security scan now runs a
+  `scan_secrets` pass over `/var/www`, matching high-precision signatures for exposed credentials —
+  private keys (PEM), AWS access keys, Google/Stripe/GitHub/SendGrid/Slack API keys, hardcoded JWTs,
+  database URIs with embedded passwords, and labeled `key = "value"` credential assignments — in
+  source and config files (`*.php`, `*.js`, `*.py`, `*.yml`, `*.json`, …). Findings appear in the
+  existing Security tab with a "move it to an environment variable and rotate the credential"
+  remediation. The matched secret value is deliberately never stored in a finding, so a scan result
+  cannot itself leak a live credential. `.env` files, `node_modules`, `vendor`, and `.git` are
+  excluded, and each pattern is bounded (first-match-per-file cap + timeout) so a large or
+  adversarial webroot cannot exhaust the agent.
+
+## [2.24.0] - 2026-07-24
+
+Backups & restore integrity hardening, from a multi-agent audit of the backup/restore surface.
+
+### Fixed
+- **Policy-encrypted database backups were unrestorable.** Restore recomputed the decryption key from
+  a `backup_destinations.encryption_key` column that is never written, while the policy executor
+  encrypts with a key derived from the panel's JWT secret — so every encrypted DB backup failed to
+  restore (a hard 400). Both sides now derive the key from one shared function; proven end-to-end on
+  a fresh box (encrypt → byte-exact decrypt → restore).
+- **Verify and drill certified truncated backups as healthy.** The verify/drill rehearsal paths
+  ignored the decompressor's exit status, so a boundary-truncated `.gz` decompressed to a valid
+  prefix and passed. They now require the decompressor to succeed (bounded so a timed-out child can't
+  wedge the task). Site-backup verification, volume-restore validation, and Mongo dump/restore
+  streaming were hardened alongside.
+
 ## [2.23.0] - 2026-07-24
 
 Security hardening of the File Manager (per-site root-filesystem operations), from a fresh

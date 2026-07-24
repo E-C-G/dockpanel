@@ -58,15 +58,68 @@ const SUSPICIOUS_FILES: &[&str] = &[
     ".htaccess.bak", "wp-config.php.bak",
 ];
 
-/// Run a full security scan: file integrity, malware, ports, SSL, container vulns, security headers.
+/// A hardcoded-secret detection pattern for [`scan_secrets`]. `pattern` is a POSIX ERE
+/// (matched by `grep -E`, whose DFA engine has no backtracking — so no ReDoS risk even on
+/// adversarial input); `ci` runs it case-insensitively. The matched secret VALUE is
+/// deliberately never copied into a Finding — only the file, line, and label are recorded —
+/// so a scan result cannot itself leak (or, once backed up, archive) a live credential.
+struct SecretPattern {
+    pattern: &'static str,
+    label: &'static str,
+    severity: &'static str,
+    ci: bool,
+}
+
+/// High-precision hardcoded-credential signatures. Curated for low false-positive rate:
+/// vendor-prefixed key formats plus a labeled `key = "value"` heuristic that only fires on
+/// a quoted literal from a secret-shaped alphabet (so `password = getenv(...)` / `"${VAR}"`
+/// interpolations don't match).
+const SECRET_PATTERNS: &[SecretPattern] = &[
+    SecretPattern { pattern: r#"-----BEGIN [A-Z ]*PRIVATE KEY"#, label: "private key (PEM)", severity: "critical", ci: false },
+    SecretPattern { pattern: r#"AKIA[0-9A-Z]{16}"#, label: "AWS access key ID", severity: "critical", ci: false },
+    SecretPattern { pattern: r#"AIza[0-9A-Za-z_-]{35}"#, label: "Google API key", severity: "critical", ci: false },
+    SecretPattern { pattern: r#"sk_live_[0-9a-zA-Z]{24,}"#, label: "Stripe live secret key", severity: "critical", ci: false },
+    SecretPattern { pattern: r#"gh[pousr]_[0-9A-Za-z]{36,}"#, label: "GitHub token", severity: "critical", ci: false },
+    SecretPattern { pattern: r#"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"#, label: "SendGrid API key", severity: "critical", ci: false },
+    SecretPattern { pattern: r#"xox[baprs]-[0-9A-Za-z-]{10,}"#, label: "Slack token", severity: "warning", ci: false },
+    SecretPattern { pattern: r#"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"#, label: "hardcoded JWT", severity: "warning", ci: false },
+    SecretPattern { pattern: r#"(mysql|postgres|postgresql|mongodb|redis|amqp)://[^:@/[:space:]]*:[^@/[:space:]]+@"#, label: "database URI with embedded password", severity: "warning", ci: true },
+    SecretPattern { pattern: r#"(api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|passwd|password)['"]?[[:space:]]*(=>?|:)[[:space:]]*['"][A-Za-z0-9_./+=-]{8,}['"]"#, label: "hardcoded credential assignment", severity: "warning", ci: true },
+];
+
+/// File types scanned for secrets — source + config where credentials get hardcoded.
+/// `.env*` is deliberately NOT included: an env file is the CORRECT home for a secret (and
+/// DockPanel's nginx blocks dotfiles from being served), so flagging one would be pure noise.
+const SECRET_INCLUDE_GLOBS: &[&str] = &[
+    "*.php", "*.js", "*.jsx", "*.ts", "*.tsx", "*.mjs", "*.cjs", "*.py", "*.rb",
+    "*.go", "*.java", "*.cs", "*.yml", "*.yaml", "*.json", "*.xml", "*.ini",
+    "*.conf", "*.properties", "*.sh", "*.inc", "*.pem", "*.key",
+];
+
+/// Directories skipped when scanning for secrets — third-party code (not the tenant's own
+/// secrets, and huge) plus VCS/build/cache noise.
+const SECRET_EXCLUDE_DIRS: &[&str] = &[
+    "node_modules", "vendor", ".git", ".svn", "bower_components",
+    "cache", ".cache", "dist", "build",
+];
+
+/// Individual files skipped — machine-generated lockfiles and minified bundles: large and
+/// only ever a source of false positives.
+const SECRET_EXCLUDE_FILES: &[&str] = &[
+    "package-lock.json", "yarn.lock", "composer.lock", "*.min.js", "*.min.css",
+];
+
+/// Run a full security scan: file integrity, malware, ports, SSL, container vulns, security
+/// headers, and hardcoded webroot secrets.
 pub async fn run_full_scan() -> ScanResult {
-    let (integrity, malware, ports, ssl, container_vulns, headers) = tokio::join!(
+    let (integrity, malware, ports, ssl, container_vulns, headers, secrets) = tokio::join!(
         scan_file_integrity(),
         scan_malware(),
         scan_open_ports(),
         scan_ssl_expiry(),
         scan_container_vulnerabilities(),
         scan_security_headers(),
+        scan_secrets(),
     );
 
     let mut findings = Vec::new();
@@ -75,6 +128,7 @@ pub async fn run_full_scan() -> ScanResult {
     findings.extend(ssl);
     findings.extend(container_vulns);
     findings.extend(headers);
+    findings.extend(secrets);
 
     ScanResult {
         findings,
@@ -540,4 +594,211 @@ async fn scan_security_headers() -> Vec<Finding> {
     }
 
     findings
+}
+
+/// Scan every site's webroot for hardcoded secrets (API keys, tokens, private keys,
+/// credentials) that belong in an environment variable instead. Findings surface in the
+/// existing Security tab; the offending secret VALUE is never recorded (see [`SecretPattern`]).
+async fn scan_secrets() -> Vec<Finding> {
+    scan_secrets_in(&["/var/www"]).await
+}
+
+/// Core of [`scan_secrets`], parameterized on the roots so it is unit-testable against a
+/// fixture directory. Runs one bounded `grep` per pattern; `-r` (not `-R`) means grep does
+/// NOT descend into symlinked directories, so a tenant-planted symlink cannot redirect the
+/// scan outside its webroot (cf. the s247 sandbox-escape class).
+async fn scan_secrets_in(roots: &[&str]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    for root in roots {
+        if !std::path::Path::new(root).is_dir() {
+            continue;
+        }
+
+        for pat in SECRET_PATTERNS {
+            let mut cmd = safe_command("grep");
+            // `-m 1`: stop after the FIRST match per file — one match is enough to flag the
+            // file, and it caps grep's buffered stdout so a tenant-controlled file with millions
+            // of matching lines can't balloon the root agent's memory (matches `scan_malware`'s
+            // bounded `-l` profile). `kill_on_drop`: kill a timed-out grep when the future is
+            // dropped, since `safe_command` sets none (Lesson #76 — no orphaned child on timeout).
+            cmd.args(["-rnE", "-m", "1"]);
+            cmd.kill_on_drop(true);
+            if pat.ci {
+                cmd.arg("-i");
+            }
+            for inc in SECRET_INCLUDE_GLOBS {
+                cmd.arg(format!("--include={inc}"));
+            }
+            for exc in SECRET_EXCLUDE_DIRS {
+                cmd.arg(format!("--exclude-dir={exc}"));
+            }
+            for exf in SECRET_EXCLUDE_FILES {
+                cmd.arg(format!("--exclude={exf}"));
+            }
+            // `-e` marks the pattern explicitly so a leading `-` (the PEM header) is never
+            // mistaken for a grep flag.
+            cmd.arg("-e").arg(pat.pattern).arg(root);
+
+            let output = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cmd.output(),
+            )
+            .await
+            {
+                Ok(Ok(o)) => o,
+                _ => continue, // timed out, grep missing, or spawn failure — skip this pattern
+            };
+
+            // grep exits 1 on "no matches" (empty stdout) and 2 on error; both yield nothing
+            // to parse. We read only stdout and never surface the matched line's content.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().take(50) {
+                // Cap at 50 files/pattern to bound a pathological webroot. With `-m 1` each line
+                // is a distinct file, so on a multi-tenant box this covers more sites before the
+                // budget is exhausted (the crown-jewel vendor patterns each have their own cap).
+                if let Some((file, lineno)) = parse_grep_match(line) {
+                    findings.push(Finding {
+                        check_type: "secret_leak".into(),
+                        severity: pat.severity.into(),
+                        title: format!("Exposed secret: {}", pat.label),
+                        description: format!(
+                            "A {} was found in {file} at line {lineno}. \
+                             The secret value itself is intentionally not recorded by the scanner.",
+                            pat.label
+                        ),
+                        file_path: Some(file),
+                        remediation: Some(
+                            "Move the secret out of the webroot into an environment variable \
+                             (a .env file is not served by DockPanel's nginx) and rotate the \
+                             exposed credential."
+                                .into(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+/// Parse one `grep -rn` output line (`<path>:<lineno>:<content>`) into `(path, lineno)`,
+/// DISCARDING the content so a matched secret value can never propagate into a Finding.
+/// Splits at the first `:<digits>:` separator; returns None if the line has none. Kept
+/// dependency-free (no regex crate in the agent) and pure so it is unit-testable.
+fn parse_grep_match(line: &str) -> Option<(String, u32)> {
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(':') {
+        let colon = search_from + rel;
+        let after = &line[colon + 1..];
+        let digit_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_len > 0 && after[digit_len..].starts_with(':') {
+            // This IS grep's `PATH:LINENO:` separator (the leftmost `:<digits>:` boundary is
+            // always at or before the true separator, so `line[..colon]` is always a prefix of
+            // the path — never CONTENT). COMMIT to it and stop: never continue scanning past a
+            // real separator, or a `:<digits>:` inside CONTENT could pull the matched secret
+            // into the returned path. An overflowing line number saturates rather than making
+            // the parse "fail" and skip forward (the redaction-leak fix).
+            let lineno = after[..digit_len].parse::<u32>().unwrap_or(u32::MAX);
+            return Some((line[..colon].to_string(), lineno));
+        }
+        search_from = colon + 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod secret_scan_tests {
+    use super::*;
+
+    #[test]
+    fn parse_grep_match_extracts_path_and_line() {
+        assert_eq!(
+            parse_grep_match("/var/www/a.php:42:$key = \"AKIA...\";"),
+            Some(("/var/www/a.php".to_string(), 42))
+        );
+        // Content after the line number may itself contain colons — still parsed correctly.
+        assert_eq!(
+            parse_grep_match("/var/www/b.js:7:const u = \"redis://x:y@h\";"),
+            Some(("/var/www/b.js".to_string(), 7))
+        );
+        // No `:<digits>:` separator anywhere.
+        assert_eq!(parse_grep_match("no separator here"), None);
+        assert_eq!(parse_grep_match("/path/no/lineno:notdigits:x"), None);
+        // REDACTION REGRESSION: an overflowing line number (>u32::MAX, i.e. a >4GB file) must
+        // NOT make the parser skip the true separator and walk into CONTENT — that would pull
+        // the matched secret into the returned "path". It must saturate and stop.
+        let overflow =
+            parse_grep_match("/var/www/a.php:4294967296:$k=\"AKIA1234567890ABCDEF\":1:x");
+        assert_eq!(overflow, Some(("/var/www/a.php".to_string(), u32::MAX)));
+        assert!(
+            !overflow.unwrap().0.contains("AKIA"),
+            "a secret value must never appear in the parsed path"
+        );
+        // A colon INSIDE the path is handled — the separator is the first `:<digits>:`.
+        assert_eq!(
+            parse_grep_match("/var/www/od:d.php:12:secret"),
+            Some(("/var/www/od:d.php".to_string(), 12))
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_secrets_flags_and_redacts() {
+        // Secret VALUES planted in the fixture — every one must be ABSENT from the findings.
+        const AWS_ID: &str = "AKIA1234567890ABCDEF";
+        const PW_VAL: &str = "Sup3rSecretValue123";
+
+        let base = format!("/tmp/dockpanel-sectest-{}", uuid::Uuid::new_v4());
+        let site = format!("{base}/site");
+        let node_modules = format!("{site}/node_modules/pkg");
+        std::fs::create_dir_all(&node_modules).unwrap();
+
+        // The one file that should produce findings.
+        std::fs::write(
+            format!("{site}/app.php"),
+            format!(
+                "<?php\n\
+                 $aws = \"{AWS_ID}\";\n\
+                 $config = ['password' => '{PW_VAL}'];\n\
+                 $dsn = \"mysql://appuser:{PW_VAL}@db.example.com/app\";\n\
+                 // -----BEGIN RSA PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
+        // A .env file is the CORRECT home for a secret — must NOT be scanned.
+        std::fs::write(format!("{site}/.env"), format!("AWS_KEY={AWS_ID}\n")).unwrap();
+        // Third-party code under node_modules — must be skipped by --exclude-dir.
+        std::fs::write(format!("{node_modules}/evil.php"), format!("<?php $k=\"{AWS_ID}\";")).unwrap();
+
+        let findings = scan_secrets_in(&[site.as_str()]).await;
+        std::fs::remove_dir_all(&base).ok();
+
+        // Every finding is a secret_leak pointing only into app.php.
+        assert!(!findings.is_empty(), "expected secret findings, got none");
+        assert!(findings.iter().all(|f| f.check_type == "secret_leak"));
+        assert!(
+            findings.iter().all(|f| f.file_path.as_deref().is_some_and(|p| p.ends_with("app.php"))),
+            ".env and node_modules must not be scanned"
+        );
+
+        // The four distinct signatures in app.php were all detected.
+        let labels: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+        for expect in [
+            "AWS access key ID",
+            "hardcoded credential assignment",
+            "database URI with embedded password",
+            "private key (PEM)",
+        ] {
+            assert!(labels.iter().any(|l| l.contains(expect)), "missing finding: {expect}");
+        }
+
+        // REDACTION INVARIANT: no secret value appears anywhere in any finding.
+        for f in &findings {
+            assert!(!f.title.contains(AWS_ID) && !f.title.contains(PW_VAL));
+            assert!(!f.description.contains(AWS_ID) && !f.description.contains(PW_VAL));
+            let fp = f.file_path.clone().unwrap_or_default();
+            assert!(!fp.contains(AWS_ID) && !fp.contains(PW_VAL));
+        }
+    }
 }
