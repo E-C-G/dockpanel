@@ -255,7 +255,16 @@ pub async fn download_file(
         .map_err(|e| agent_error("File download", e))?;
 
     let disposition = content_disposition.unwrap_or_else(|| {
-        let filename = rel_path.split('/').last().unwrap_or("download");
+        // Sanitize exactly as the agent does before interpolating into the header
+        // (strip quote/backslash/CR/LF) so a filename can't break out of the
+        // quoted-string. This fallback fires whenever the agent's own header is
+        // undecodable (e.g. a non-ASCII filename), so the two paths must stay
+        // consistent.
+        let filename: String = rel_path
+            .split('/')
+            .last()
+            .unwrap_or("download")
+            .replace(['"', '\\', '\n', '\r'], "");
         format!("attachment; filename=\"{filename}\"")
     });
 
@@ -291,7 +300,12 @@ pub async fn upload_file(
         }
     }
 
-    // File upload size limit (100MB default)
+    // NOTE: the EFFECTIVE cap is axum's ~2MB default request-body limit (no
+    // DefaultBodyLimit override is set), which rejects larger bodies before this
+    // handler runs — so this 100MB check is a secondary guard, not the real limit.
+    // Raising the body limit to allow genuinely large uploads must land together
+    // with a per-tenant disk quota + rate limit (tracked in tech_debt) or it opens a
+    // shared-/var/www exhaustion vector.
     let content_size = body.content.len();
     let max_upload_bytes: usize = 100 * 1024 * 1024; // 100MB
     if content_size > max_upload_bytes {
@@ -299,7 +313,11 @@ pub async fn upload_file(
             &format!("File too large: {}MB (max 100MB)", content_size / (1024 * 1024))));
     }
 
-    // Block dangerous file extensions that could enable code execution
+    // Advisory hygiene only — NOT a security boundary. Tenant code isolation is the
+    // per-site PHP-FPM pool + the site-root confinement in resolve_safe_path; a tenant
+    // legitimately runs their own code (incl. .php) in their own webroot, so this
+    // blocklist is deliberately not replicated on write/create and must never be
+    // treated as preventing code execution.
     let lower_name = body.filename.to_lowercase();
     let dangerous_exts = [".phar", ".pht", ".phtml", ".shtml", ".htaccess"];
     if dangerous_exts.iter().any(|ext| lower_name.ends_with(ext)) {

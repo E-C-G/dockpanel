@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-07-24
+
+Security hardening of the File Manager (per-site root-filesystem operations), from a fresh
+multi-agent audit of the file-manager surface.
+
+### Security
+- **Fixed a File Manager sandbox escape (authenticated tenant → root-owned write outside the site
+  root).** The agent's path resolver validated a not-yet-existing target by canonicalizing only the
+  first existing ancestor and appending the remaining components unresolved. Because `exists()`
+  follows symlinks, a *dangling* symlink (whose target does not yet exist) was treated as an ordinary
+  new component, so a create/upload operation followed it and wrote **outside `/var/www/{domain}` as
+  root** (e.g. into `/etc/cron.d`). The resolver now rejects any symlink in the to-be-created path;
+  legitimate in-root symlink directories still work. Covered by new tests.
+- **Removed the unused `_server` magic-domain upload branch** in the agent — a latent root-write
+  primitive (able to target `/etc/nginx`, `/etc/dockpanel`, `/home`, `/opt`) that used a weaker,
+  hand-rolled traversal check and had no caller anywhere in the panel.
+- **Hardened the download filename header** — the backend's `Content-Disposition` fallback now
+  sanitizes the filename (quote/backslash/CRLF) to match the agent, preventing quoted-string breakout.
+
+### Fixed
+- **File edits no longer clobber a same-named `.tmp` sibling.** The atomic-write temp file used
+  `with_extension("tmp")`, so saving `report.php` could destroy an existing `report.tmp`. It now uses
+  a collision-free, fixed-length hidden temp name and cleans it up on failure.
+- **Directory listings never leak an absolute server path** — the relative-path strip now fails closed
+  to the bare filename when `/var/www` is itself a symlink.
+
 ## [2.22.1] - 2026-07-23
 
 ### Fixed

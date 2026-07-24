@@ -58,7 +58,7 @@ async fn file_upload(
     use crate::services::files as file_svc;
 
     // Validate domain
-    if domain != "_server" && !super::is_valid_domain(&domain) {
+    if !super::is_valid_domain(&domain) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
 
@@ -85,46 +85,13 @@ async fn file_upload(
         _ => body.path.clone(),
     };
 
-    let full_path = if domain == "_server" {
-        // Server-level upload: validate no traversal manually
-        let p = format!("/{}", target_rel.trim_start_matches('/'));
-        if p.contains("..") || p.contains('\0') {
-            return Err(err(StatusCode::BAD_REQUEST, "Path traversal not allowed"));
-        }
-        // Only allow uploads to specific directories
-        const ALLOWED_SERVER_PATHS: &[&str] = &[
-            "/var/www/",
-            "/etc/nginx/",
-            "/etc/dockpanel/",
-            "/var/backups/dockpanel/",
-            "/home/",
-            "/opt/",
-        ];
-        let allowed = ALLOWED_SERVER_PATHS.iter().any(|prefix| p.starts_with(prefix));
-        if !allowed {
-            return Err(err(StatusCode::BAD_REQUEST, "Upload path not in allowed directories"));
-        }
-        // Canonicalize parent to resolve symlinks, then re-check prefix
-        let path_buf = std::path::PathBuf::from(&p);
-        if let Some(parent) = path_buf.parent() {
-            if parent.exists() {
-                if let Ok(canon) = parent.canonicalize() {
-                    let canon_str = canon.to_string_lossy();
-                    let still_allowed = ALLOWED_SERVER_PATHS.iter().any(|prefix| {
-                        canon_str.starts_with(prefix.trim_end_matches('/'))
-                    });
-                    if !still_allowed {
-                        return Err(err(StatusCode::BAD_REQUEST, "Resolved path not in allowed directories"));
-                    }
-                }
-            }
-        }
-        path_buf
-    } else {
-        // Site upload: use resolve_safe_path to prevent TOCTOU race
-        file_svc::resolve_safe_path(&domain, &target_rel)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?
-    };
+    // Confine strictly to the site root via the shared, symlink-safe resolver.
+    // (The former `domain == "_server"` magic-domain branch — a root-write primitive
+    // that could target /etc/nginx, /etc/dockpanel, /home, /opt via a hand-rolled,
+    // weaker traversal check — was removed in s247: it had no live caller anywhere in
+    // the panel/CLI/scripts and was dead attack surface.)
+    let full_path = file_svc::resolve_safe_path(&domain, &target_rel)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
 
     // Create parent directory (safe — path already validated)
     if let Some(parent) = full_path.parent() {
