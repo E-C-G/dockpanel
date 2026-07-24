@@ -773,12 +773,13 @@ pub async fn create_db_backup(
     // Container name follows convention: dockpanel-db-{name}
     let container_name = format!("dockpanel-db-{db_name}");
 
-    // Get encryption key from destination if configured
-    let encryption_key: Option<String> = sqlx::query_scalar(
-        "SELECT bd.encryption_key FROM backup_destinations bd \
-         WHERE bd.encryption_enabled = TRUE \
-         LIMIT 1"
-    ).fetch_optional(&state.db).await.unwrap_or(None);
+    // Manual (ad-hoc) DB backups are not encrypted: there is no manual-encryption toggle —
+    // only policy-driven backups encrypt (via backup_policy_executor). The previous read of
+    // backup_destinations.encryption_key was dead (nothing writes that column) and always
+    // yielded None, so this preserves the actual behavior while removing the phantom query and
+    // keeping `encrypted` truthful. Encrypted policy backups remain restorable via the shared
+    // key derivation in restore_db_backup.
+    let encryption_key: Option<String> = None;
 
     // Call agent to dump database
     let body = serde_json::json!({
@@ -921,14 +922,13 @@ pub async fn restore_db_backup(
 
     let container_name = format!("dockpanel-db-{}", backup.db_name);
 
-    // Get encryption key if backup is encrypted
+    // Get encryption key if backup is encrypted. Policy-encrypted DB backups are encrypted by
+    // backup_policy_executor with a key derived from the process JWT secret; the restore MUST
+    // use the SAME derivation. The previous code read backup_destinations.encryption_key — a
+    // column nothing ever writes — so every encrypted-backup restore 400'd and DR was silently
+    // broken in encrypted mode (lesson #70). Use the shared single-source-of-truth derivation.
     let encryption_key: Option<String> = if backup.encrypted {
-        let key: Option<String> = sqlx::query_scalar(
-            "SELECT bd.encryption_key FROM backup_destinations bd \
-             WHERE bd.encryption_enabled = TRUE \
-             LIMIT 1"
-        ).fetch_optional(&state.db).await.unwrap_or(None);
-        Some(key.ok_or_else(|| err(StatusCode::BAD_REQUEST, "Encrypted backup but no encryption key found"))?)
+        Some(crate::services::backup_policy_executor::derive_backup_encryption_key(&state.config.jwt_secret))
     } else {
         None
     };

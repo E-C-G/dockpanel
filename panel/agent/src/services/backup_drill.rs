@@ -294,7 +294,7 @@ async fn run_mysql_drill(
     let restore_ok = match zcat_child {
         Ok(mut zcat) => match zcat.stdout.take() {
             Some(stdout) => {
-                let r = tokio::time::timeout(
+                let docker_ok = tokio::time::timeout(
                     std::time::Duration::from_secs(180),
                     safe_command("docker")
                         .args([
@@ -305,8 +305,19 @@ async fn run_mysql_drill(
                         .stdin(stdout.into_owned_fd().unwrap())
                         .output(),
                 )
-                .await;
-                r.map(|x| x.map(|o| o.status.success()).unwrap_or(false)).unwrap_or(false)
+                .await
+                .map(|x| x.map(|o| o.status.success()).unwrap_or(false)).unwrap_or(false);
+                // Require the decompressor to have succeeded: a boundary-truncated .gz makes
+                // zcat exit non-zero while mariadb sees a clean EOF and exits 0 (lesson #51).
+                // Otherwise the drill — billed as the strongest #51 rehearsal — certifies a
+                // corrupt backup as restorable and an operator may prune the only good copy.
+                // Bound the decompressor wait: safe_command sets no kill_on_drop, so a timed-out
+                // (dropped) docker future leaves docker orphaned holding zcat's pipe read-end — an
+                // UNbounded zcat.wait() could then hang the drill forever. zcat exits ~instantly on
+                // every non-hang path, so 5s is ample headroom.
+                let zcat_ok = tokio::time::timeout(std::time::Duration::from_secs(5), zcat.wait())
+                    .await.ok().and_then(|r| r.ok()).map(|s| s.success()).unwrap_or(false);
+                docker_ok && zcat_ok
             }
             None => false,
         },
@@ -415,7 +426,7 @@ async fn run_postgres_drill(
     let restore_ok = match zcat_child {
         Ok(mut zcat) => match zcat.stdout.take() {
             Some(stdout) => {
-                let r = tokio::time::timeout(
+                let docker_ok = tokio::time::timeout(
                     std::time::Duration::from_secs(180),
                     safe_command("docker")
                         .args([
@@ -434,8 +445,19 @@ async fn run_postgres_drill(
                         .stdin(stdout.into_owned_fd().unwrap())
                         .output(),
                 )
-                .await;
-                r.map(|x| x.map(|o| o.status.success()).unwrap_or(false)).unwrap_or(false)
+                .await
+                .map(|x| x.map(|o| o.status.success()).unwrap_or(false)).unwrap_or(false);
+                // --single-transaction rolls back a mid-statement failure, but a .gz cut on a
+                // clean statement boundary still lets psql COMMIT the partial prefix and exit 0.
+                // Require the decompressor to have succeeded too (lesson #51) — otherwise the
+                // strongest restore rehearsal green-lights a corrupt backup.
+                // Bound the decompressor wait: safe_command sets no kill_on_drop, so a timed-out
+                // (dropped) docker future leaves docker orphaned holding zcat's pipe read-end — an
+                // UNbounded zcat.wait() could then hang the drill forever. zcat exits ~instantly on
+                // every non-hang path, so 5s is ample headroom.
+                let zcat_ok = tokio::time::timeout(std::time::Duration::from_secs(5), zcat.wait())
+                    .await.ok().and_then(|r| r.ok()).map(|s| s.success()).unwrap_or(false);
+                docker_ok && zcat_ok
             }
             None => false,
         },

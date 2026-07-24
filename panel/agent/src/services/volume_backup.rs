@@ -111,7 +111,14 @@ pub async fn restore_volume(
                 "alpine:3.19",
                 "sh",
                 "-c",
-                &format!("rm -rf /volume/* /volume/..?* /volume/.[!.]* 2>/dev/null; tar xzf /backup/{filename} -C /volume"),
+                // Validate the archive can be read in full BEFORE wiping the live volume.
+                // Previously the `rm -rf` ran unconditionally, so a truncated/corrupt/empty
+                // backup destroyed the volume and THEN failed the extract — an irreversible
+                // drop-then-fail data loss with no rollback. `tar tzf` decompresses and walks
+                // the whole archive (catches gzip-CRC/truncation) without touching /volume;
+                // only on success do we clear + extract. `filename` is is_safe_filename-
+                // validated (alnum + -_. only), so it is safe to interpolate into the shell.
+                &format!("tar tzf /backup/{filename} >/dev/null 2>&1 || {{ echo 'backup archive is corrupt or truncated — volume left untouched' >&2; exit 3; }}; rm -rf /volume/* /volume/..?* /volume/.[!.]* 2>/dev/null; tar xzf /backup/{filename} -C /volume"),
             ])
             .output(),
     )

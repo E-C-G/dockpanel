@@ -16,6 +16,16 @@ pub struct VerificationCheck {
     pub message: String,
 }
 
+/// A site backup counts as verified only if every CRITICAL check passed. `has_entry_point`
+/// is informational (a valid non-web backup legitimately has no index.*) and must not gate
+/// the verdict. The previous `checks_passed >= checks_run - 1` slack certified a corrupt,
+/// non-extractable archive as passed=true whenever `extract_success` was the single failing
+/// check (only 2 checks run in that case) — the lesson-#51 EOF-as-success trap re-introduced
+/// in the verify safety net itself. Extracted so the decision is unit-testable.
+fn site_backup_passed(checks: &[VerificationCheck]) -> bool {
+    checks.iter().all(|c| c.name == "has_entry_point" || c.passed)
+}
+
 /// Verify a site backup: extract to temp dir, check file count and structure.
 pub async fn verify_site_backup(domain: &str, filename: &str) -> Result<VerificationResult, String> {
     let start = std::time::Instant::now();
@@ -89,7 +99,7 @@ pub async fn verify_site_backup(domain: &str, filename: &str) -> Result<Verifica
 
     let checks_run = checks.len() as i32;
     let checks_passed = checks.iter().filter(|c| c.passed).count() as i32;
-    let passed = checks_passed >= checks_run - 1; // Allow one non-critical check to fail
+    let passed = site_backup_passed(&checks);
 
     Ok(VerificationResult {
         passed,
@@ -242,7 +252,7 @@ async fn verify_mysql_restore(
             let zcat_stdout = zcat.stdout.take();
             match zcat_stdout {
                 Some(stdout) => {
-                    let docker_result = tokio::time::timeout(
+                    let docker_ok = tokio::time::timeout(
                         std::time::Duration::from_secs(120),
                         safe_command("docker")
                             .args([
@@ -254,10 +264,22 @@ async fn verify_mysql_restore(
                             .stdin(stdout.into_owned_fd().unwrap())
                             .output(),
                     )
-                    .await;
-                    docker_result
-                        .map(|r| r.map(|o| o.status.success()).unwrap_or(false))
-                        .unwrap_or(false)
+                    .await
+                    .map(|r| r.map(|o| o.status.success()).unwrap_or(false))
+                    .unwrap_or(false);
+                    // A truncated/corrupt .gz makes zcat exit non-zero while mariadb can read
+                    // a clean EOF at a statement boundary and exit 0 (lesson #51 EOF-as-success).
+                    // Require the decompressor to have succeeded too — mirrors the hardened
+                    // database_backup.rs::restore_mysql. Without it the verify safety net
+                    // certifies a corrupt backup as passed.
+                    // Bound the decompressor wait: safe_command sets no kill_on_drop, so a
+                    // timed-out (dropped) docker future leaves docker orphaned holding zcat's
+                    // pipe read-end — an UNbounded zcat.wait() could then hang the task forever.
+                    // zcat exits ~instantly on every non-hang path (docker drained the stream on
+                    // success; zcat already errored on truncation), so 5s is ample headroom.
+                    let zcat_ok = tokio::time::timeout(std::time::Duration::from_secs(5), zcat.wait())
+                        .await.ok().and_then(|r| r.ok()).map(|s| s.success()).unwrap_or(false);
+                    docker_ok && zcat_ok
                 }
                 None => false,
             }
@@ -369,7 +391,7 @@ async fn verify_postgres_restore(
             let zcat_stdout = zcat.stdout.take();
             match zcat_stdout {
                 Some(stdout) => {
-                    let docker_result = tokio::time::timeout(
+                    let docker_ok = tokio::time::timeout(
                         std::time::Duration::from_secs(120),
                         safe_command("docker")
                             .args([
@@ -391,10 +413,21 @@ async fn verify_postgres_restore(
                             .stdin(stdout.into_owned_fd().unwrap())
                             .output(),
                     )
-                    .await;
-                    docker_result
-                        .map(|r| r.map(|o| o.status.success()).unwrap_or(false))
-                        .unwrap_or(false)
+                    .await
+                    .map(|r| r.map(|o| o.status.success()).unwrap_or(false))
+                    .unwrap_or(false);
+                    // ON_ERROR_STOP+single-transaction catch a mid-statement truncation, but a
+                    // .gz cut on a clean statement boundary still lets psql see EOF and COMMIT
+                    // the partial prefix (exit 0). Require the decompressor to have succeeded
+                    // too (lesson #51) — mirrors database_backup.rs::restore_postgres.
+                    // Bound the decompressor wait: safe_command sets no kill_on_drop, so a
+                    // timed-out (dropped) docker future leaves docker orphaned holding zcat's
+                    // pipe read-end — an UNbounded zcat.wait() could then hang the task forever.
+                    // zcat exits ~instantly on every non-hang path (docker drained the stream on
+                    // success; zcat already errored on truncation), so 5s is ample headroom.
+                    let zcat_ok = tokio::time::timeout(std::time::Duration::from_secs(5), zcat.wait())
+                        .await.ok().and_then(|r| r.ok()).map(|s| s.success()).unwrap_or(false);
+                    docker_ok && zcat_ok
                 }
                 None => false,
             }
@@ -514,4 +547,58 @@ pub async fn verify_volume_backup(
         details: checks,
         duration_ms: start.elapsed().as_millis() as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chk(name: &str, passed: bool) -> VerificationCheck {
+        VerificationCheck { name: name.into(), passed, message: String::new() }
+    }
+
+    // s248: the site-backup verify verdict must treat extract_success + file_count as
+    // CRITICAL and has_entry_point as informational. The old `checks_passed >= checks_run - 1`
+    // slack certified a corrupt, non-extractable archive as passed (lesson #51 in the safety net).
+    #[test]
+    fn site_backup_fails_when_extract_fails() {
+        // Corrupt archive: file present (>100B) but tar extract fails → only 2 checks run.
+        let checks = vec![chk("file_exists", true), chk("extract_success", false)];
+        assert!(!site_backup_passed(&checks), "a non-extractable archive must NOT pass verify");
+    }
+
+    #[test]
+    fn site_backup_fails_on_empty_archive() {
+        // Extract succeeds but zero files → file_count is a critical failure.
+        let checks = vec![
+            chk("file_exists", true),
+            chk("extract_success", true),
+            chk("file_count", false),
+            chk("has_entry_point", false),
+        ];
+        assert!(!site_backup_passed(&checks));
+    }
+
+    #[test]
+    fn site_backup_passes_when_only_entry_point_missing() {
+        // A valid non-web backup (no index.*) must still pass — has_entry_point is informational.
+        let checks = vec![
+            chk("file_exists", true),
+            chk("extract_success", true),
+            chk("file_count", true),
+            chk("has_entry_point", false),
+        ];
+        assert!(site_backup_passed(&checks));
+    }
+
+    #[test]
+    fn site_backup_passes_all_critical() {
+        let checks = vec![
+            chk("file_exists", true),
+            chk("extract_success", true),
+            chk("file_count", true),
+            chk("has_entry_point", true),
+        ];
+        assert!(site_backup_passed(&checks));
+    }
 }

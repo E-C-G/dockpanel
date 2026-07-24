@@ -274,24 +274,31 @@ pub async fn dump_mongo(
     let filepath = dest_dir.join(&filename);
     let _filepath_str = filepath.to_str().ok_or("Invalid path encoding")?;
 
-    // mongodump --archive --gzip outputs directly, no need for separate gzip
+    // mongodump --archive --gzip streams the archive on stdout. Stream it straight to the
+    // dump file rather than buffering the ENTIRE archive in the agent's RAM via .output() —
+    // a multi-GB Mongo DB would OOM-kill the shared root agent (a tenant-triggerable
+    // cross-tenant DoS). The mysql/pg dump paths already stream via fd pipes; do the same
+    // here. stderr is still captured for the failure message; stdout goes to the file fd.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         async {
-            let child_output = safe_command("docker")
+            let file = std::fs::File::create(&filepath)
+                .map_err(|e| format!("Failed to create dump file: {e}"))?;
+            let child = safe_command("docker")
                 .args([
                     "exec", container_name,
                     "mongodump", "--db", db_name, "--archive", "--gzip",
                 ])
-                .stdout(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::from(file))
                 .stderr(std::process::Stdio::piped())
-                .output()
-                .await
+                // Kill mongodump if this future is dropped (e.g. the outer timeout fires), so it
+                // stops streaming into the dump file the moment we give up on it.
+                .kill_on_drop(true)
+                .spawn()
                 .map_err(|e| format!("Failed to run mongodump: {e}"))?;
 
-            // Write stdout to file
-            tokio::fs::write(&filepath, &child_output.stdout).await
-                .map_err(|e| format!("Failed to write dump file: {e}"))?;
+            let child_output = child.wait_with_output().await
+                .map_err(|e| format!("mongodump wait error: {e}"))?;
 
             if !child_output.status.success() {
                 let stderr = String::from_utf8_lossy(&child_output.stderr);
@@ -300,9 +307,19 @@ pub async fn dump_mongo(
             Ok(())
         }
     )
-    .await
-    .map_err(|_| "Database dump timed out (10 minutes)".to_string())?;
+    .await;
 
+    // On timeout the mongodump child is dropped (kill_on_drop=true) and killed, but the
+    // partially-streamed dump file remains on disk — remove it so it can't later surface as a
+    // "restorable" backup (the old .output() path never created a file until after success, so
+    // this cleanup is new-code-specific). Clean up on a normal dump error too.
+    let output = match output {
+        Ok(inner) => inner,
+        Err(_) => {
+            std::fs::remove_file(&filepath).ok();
+            return Err("Database dump timed out (10 minutes)".to_string());
+        }
+    };
     if let Err(e) = output {
         std::fs::remove_file(&filepath).ok();
         return Err(e);
@@ -481,8 +498,11 @@ pub async fn restore_mongo(
         return Err("Invalid database name".into());
     }
 
-    let file_data = tokio::fs::read(filepath).await
-        .map_err(|e| format!("Failed to read backup file: {e}"))?;
+    // Stream the archive from disk to mongorestore's stdin instead of reading the ENTIRE
+    // file into RAM (tokio::fs::read) — a multi-GB archive would OOM the shared root agent
+    // (same cross-tenant DoS class as the dump path). tokio::io::copy pipes in bounded chunks.
+    let mut file = tokio::fs::File::open(filepath).await
+        .map_err(|e| format!("Failed to open backup file: {e}"))?;
 
     let mut docker_child = safe_command("docker")
         .args([
@@ -499,7 +519,7 @@ pub async fn restore_mongo(
         .ok_or("Failed to capture docker stdin")?;
 
     let write_handle = tokio::spawn(async move {
-        stdin.write_all(&file_data).await?;
+        tokio::io::copy(&mut file, &mut stdin).await?;
         stdin.shutdown().await?;
         Ok::<_, std::io::Error>(())
     });

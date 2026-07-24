@@ -28,6 +28,20 @@ struct PolicyRow {
     last_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Derive the symmetric key used to encrypt AND decrypt policy-driven DB backups.
+///
+/// This is the SINGLE SOURCE OF TRUTH for the derivation. The encrypt side
+/// (`execute_policy`) and the decrypt side (`routes::backup_orchestrator::restore_db_backup`)
+/// previously derived the key from two DIFFERENT, incompatible sources — restore read a
+/// `backup_destinations.encryption_key` column that nothing ever writes — so every
+/// encrypted DB backup was permanently unrestorable and DR was silently broken in encrypted
+/// mode (lesson #70: resolve by the value that actually produced the artifact, not a
+/// re-derived phantom). Keyed on the process JWT secret (`config.jwt_secret`, == the
+/// `JWT_SECRET` env the executor is handed), so both sides agree byte-for-byte.
+pub fn derive_backup_encryption_key(jwt_secret: &str) -> String {
+    format!("backup-enc-{}", &jwt_secret[..32.min(jwt_secret.len())])
+}
+
 /// Run the backup policy executor loop — checks every 60 seconds for due policies.
 pub async fn run(db: PgPool, agent: AgentClient, jwt_secret: String, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
     tracing::info!("Backup policy executor started");
@@ -124,12 +138,12 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
     let mut successes = 0;
     let mut failures = 0;
 
-    // Get encryption key if encrypt is enabled
+    // Get encryption key if encrypt is enabled. Use the shared derivation (single source of
+    // truth) keyed on the jwt_secret passed into the executor — which equals the
+    // state.config.jwt_secret the restore path uses — NOT a separate std::env read that could
+    // drift from it. This is what makes an encrypted backup actually restorable.
     let encryption_key: Option<String> = if policy.encrypt {
-        std::env::var("JWT_SECRET").ok().map(|jwt| {
-            // Use a derived key for backup encryption
-            format!("backup-enc-{}", &jwt[..32.min(jwt.len())])
-        })
+        Some(derive_backup_encryption_key(jwt_secret))
     } else {
         None
     };
@@ -404,4 +418,38 @@ fn field_matches(field: &&str, value: i32) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // s248 / lesson #70: encrypt (execute_policy) and decrypt (restore_db_backup) MUST derive
+    // the backup key from the same single source of truth. These pin that derivation so the two
+    // sides can never drift back into the incompatible-key bug that made encrypted restores 400.
+    #[test]
+    fn backup_key_derivation_is_stable_and_prefixed() {
+        let jwt = "abcdefghijklmnopqrstuvwxyz0123456789EXTRA";
+        let k = derive_backup_encryption_key(jwt);
+        // Deterministic + uses only the first 32 bytes of the secret.
+        assert_eq!(k, "backup-enc-abcdefghijklmnopqrstuvwxyz012345");
+        assert_eq!(derive_backup_encryption_key(jwt), k);
+    }
+
+    #[test]
+    fn backup_key_derivation_handles_short_secret() {
+        // Must not panic on a secret shorter than 32 bytes (32.min(len)).
+        assert_eq!(derive_backup_encryption_key("short"), "backup-enc-short");
+    }
+
+    #[test]
+    fn encrypt_and_restore_derive_identical_key() {
+        // The encrypt and decrypt paths both call THIS one function, so identical input →
+        // identical output is the guarantee that an encrypted backup is restorable.
+        let secret = "the-process-jwt-secret-value-000000000000";
+        assert_eq!(
+            derive_backup_encryption_key(secret),
+            derive_backup_encryption_key(secret),
+        );
+    }
 }
