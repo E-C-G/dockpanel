@@ -150,6 +150,24 @@ pub async fn create(
         }
     }
 
+    // SSRF protection: per-monitor alert webhook URLs must not target internal
+    // addresses (parity with alerts.rs::upsert_rules — body values are otherwise
+    // unvalidated; inherited-from-global values were already vetted but are cheap to re-check).
+    if let Some(ref u) = slack_url {
+        if !u.is_empty() {
+            if let Err(e) = crate::helpers::validate_url_not_internal(u).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid Slack alert URL: {e}")));
+            }
+        }
+    }
+    if let Some(ref u) = discord_url {
+        if !u.is_empty() {
+            if let Err(e) = crate::helpers::validate_url_not_internal(u).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid Discord alert URL: {e}")));
+            }
+        }
+    }
+
     // Limit monitors per user (50)
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM monitors WHERE user_id = $1")
         .bind(claims.sub)
@@ -212,6 +230,22 @@ pub async fn update(
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             if let Err(e) = crate::helpers::validate_url_not_internal(trimmed).await {
                 return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor URL: {}", e)));
+            }
+        }
+    }
+
+    // SSRF protection: validate per-monitor alert URLs if being updated.
+    if let Some(ref u) = body.alert_slack_url {
+        if !u.is_empty() {
+            if let Err(e) = crate::helpers::validate_url_not_internal(u).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid Slack alert URL: {e}")));
+            }
+        }
+    }
+    if let Some(ref u) = body.alert_discord_url {
+        if !u.is_empty() {
+            if let Err(e) = crate::helpers::validate_url_not_internal(u).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid Discord alert URL: {e}")));
             }
         }
     }

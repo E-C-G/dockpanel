@@ -117,6 +117,27 @@ fn ip_is_internal(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// True if a redirect target `host` is internal: a literal internal IP, `localhost`,
+/// OR a hostname that resolves (blocking) to any internal IP. For use inside a reqwest
+/// redirect-policy closure, which is synchronous and cannot `.await` — so this resolves
+/// with the blocking std resolver. That is acceptable here: it only runs when a monitored
+/// target actually returns a 3xx (rare), inside the background uptime task. Fails CLOSED
+/// (treats an unresolvable target as internal) so a redirect is never followed blindly.
+pub fn host_resolves_internal_blocking(host: &str, port: u16) -> bool {
+    let h = host.trim_matches(|c| c == '[' || c == ']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip_is_internal(ip);
+    }
+    use std::net::ToSocketAddrs;
+    match (h, port).to_socket_addrs() {
+        Ok(addrs) => addrs.into_iter().any(|a| ip_is_internal(a.ip())),
+        Err(_) => true, // cannot resolve → do not follow
+    }
+}
+
 /// SSRF protection: validate that a URL does not resolve to an internal/private address.
 ///
 /// Checks loopback, private (RFC 1918), link-local, ULA, CGNAT, IPv4-mapped-IPv6,

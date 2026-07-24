@@ -111,6 +111,21 @@ fn validate_route(route: &str) -> Result<(), &'static str> {
     }
 }
 
+/// SSRF: `webhook:<url>` routes reach the notification client (which refuses redirects),
+/// but the destination must still not resolve to an internal address — validate_route only
+/// checks the scheme. Async, so it runs at the create/update call site rather than inside
+/// the sync validate_input. Parity with the alerts/monitors write paths.
+async fn validate_webhook_routes(input: &PolicyInput) -> Result<(), ApiError> {
+    for (i, step) in input.steps.iter().enumerate() {
+        if let Some(url) = step.route.strip_prefix("webhook:") {
+            if let Err(e) = crate::helpers::validate_url_not_internal(url).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("step {i}: webhook {e}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// GET /api/escalation-policies — Admin: list all policies.
 pub async fn list_policies(
     State(state): State<AppState>,
@@ -155,6 +170,7 @@ pub async fn create_policy(
     Json(input): Json<PolicyInput>,
 ) -> Result<Json<PolicyDto>, ApiError> {
     validate_input(&input)?;
+    validate_webhook_routes(&input).await?;
 
     let steps_json = serde_json::to_value(&input.steps)
         .map_err(|e| internal_error("serialize policy steps", e))?;
@@ -180,6 +196,7 @@ pub async fn update_policy(
     Json(input): Json<PolicyInput>,
 ) -> Result<Json<PolicyDto>, ApiError> {
     validate_input(&input)?;
+    validate_webhook_routes(&input).await?;
 
     let steps_json = serde_json::to_value(&input.steps)
         .map_err(|e| internal_error("serialize policy steps", e))?;

@@ -249,13 +249,26 @@ pub async fn test_webhook(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid webhook URL"));
     }
 
+    // SSRF: the destination is user-supplied and blind-followed; block internal
+    // addresses (admin-triggered, but defense-in-depth + parity with the send path).
+    if let Err(e) = crate::helpers::validate_url_not_internal(url).await {
+        return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid webhook URL: {e}")));
+    }
+
     let payload = if service == "slack" {
         serde_json::json!({ "text": "DockPanel test notification — your Slack webhook is working!" })
     } else {
         serde_json::json!({ "content": "DockPanel test notification — your Discord webhook is working!" })
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        // Refuse redirects: a public destination that 3xx-redirects to an internal
+        // address would otherwise bypass the SSRF allow-check above. Panic on build
+        // failure rather than falling back to a redirect-following default client.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build test-webhook http client");
     let resp = client.post(url).json(&payload).send().await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Webhook request failed: {e}")))?;
 
@@ -664,6 +677,16 @@ pub async fn import_config(
             let keyword = m.get("keyword").and_then(|v| v.as_str());
 
             if !name.is_empty() && !url.is_empty() {
+                // SSRF: validate the URL for any monitor type that will be HTTP-fetched by
+                // the uptime dispatcher (anything except tcp/ping/heartbeat — see
+                // uptime.rs check dispatcher's default arm), parity with the create path
+                // which the import loop otherwise bypasses. Skip an offending row rather
+                // than failing the whole import. (check_http also re-validates at run time.)
+                if !matches!(monitor_type, "tcp" | "ping" | "heartbeat")
+                    && crate::helpers::validate_url_not_internal(url).await.is_err()
+                {
+                    continue;
+                }
                 let result = sqlx::query(
                     "INSERT INTO monitors (user_id, name, url, monitor_type, check_interval, keyword) \
                      VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",

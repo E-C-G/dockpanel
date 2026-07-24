@@ -110,6 +110,18 @@ echo "=== Dependency audit ==="
 # which is indistinguishable from a real finding by exit code alone. Sniff the
 # output and fail OPEN on a network error — a gate that blocks on a DNS blip is
 # a gate that gets disabled.
+#
+# Reviewed advisory exceptions (comma-separated GHSA ids). HIGH/critical advisories
+# listed here are known non-exploitable in DockPanel's usage; every OTHER high/critical
+# still blocks. Keep the reason + revisit condition with each entry:
+#   GHSA-qwww-vcr4-c8h2  react-router RSC-mode CSRF bypass. The frontend is a Vite SPA
+#     (BrowserRouter; no @react-router server/framework packages; no server
+#     components/actions), so the RSC action path is unreachable — mutations go through the
+#     backend's own CSRF-protected API. The latest react-router-dom (7.18.1) is itself in
+#     the vulnerable 7.12.0-8.2.0 range; the only npm-offered fix is a breaking downgrade to
+#     7.11.0. Revisit + remove when a forward-patched release above the range ships.
+NPM_AUDIT_ALLOWLIST="GHSA-qwww-vcr4-c8h2"
+
 for DIR in panel/frontend website/client website/server; do
   [ -f "$DIR/package.json" ] || continue
   OUT=$( (cd "$DIR" && npm audit --audit-level=high) 2>&1 )
@@ -118,9 +130,30 @@ for DIR in panel/frontend website/client website/server; do
   elif echo "$OUT" | grep -qiE 'audit endpoint returned an error|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network'; then
     echo -e "${YELLOW}WARNING: npm audit could not reach the registry for ${DIR} — not enforced${NC}"
   else
-    echo -e "${RED}BLOCKED: npm audit found high/critical advisories in ${DIR}${NC}"
-    echo "$OUT" | grep -iE 'severity|vulnerabilities' | head -5
-    FOUND=1
+    # High/critical present. Enumerate the advisory ids and block unless EVERY one is in
+    # the reviewed allowlist. Fail closed: if the ids cannot be enumerated, block.
+    GHSAS=$( (cd "$DIR" && npm audit --json 2>/dev/null) \
+             | jq -r '.vulnerabilities[]? | select(.severity=="high" or .severity=="critical") | .via[]? | objects | .url' 2>/dev/null \
+             | grep -oE 'GHSA-[a-z0-9-]+' | sort -u )
+    if [ -z "$GHSAS" ]; then
+      echo -e "${RED}BLOCKED: npm audit found high/critical advisories in ${DIR} (could not enumerate for allowlist)${NC}"
+      echo "$OUT" | grep -iE 'severity|vulnerabilities' | head -5
+      FOUND=1
+    else
+      UNWAIVED=""
+      for G in $GHSAS; do
+        case ",$NPM_AUDIT_ALLOWLIST," in
+          *",$G,"*) ;;
+          *) UNWAIVED="$UNWAIVED $G" ;;
+        esac
+      done
+      if [ -n "$UNWAIVED" ]; then
+        echo -e "${RED}BLOCKED: npm audit high/critical advisories not in allowlist in ${DIR}:${UNWAIVED}${NC}"
+        FOUND=1
+      else
+        echo -e "${YELLOW}npm audit: ${DIR} high/critical advisories all in reviewed allowlist (${NPM_AUDIT_ALLOWLIST}) — not blocking${NC}"
+      fi
+    fi
   fi
 done
 

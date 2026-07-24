@@ -10,9 +10,48 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            // Do NOT follow redirects: the notify_*_url values are vetted by
+            // validate_url_not_internal only at write time, so a public URL that
+            // 3xx-redirects to http://127.0.0.1 / 169.254.169.254 would otherwise
+            // exfiltrate to / probe an internal address. Parity with
+            // webhook_gateway.rs::http_client.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default()
+            // Panic (rather than unwrap_or_default) if the builder fails: the default
+            // client FOLLOWS redirects, which would silently drop the SSRF control.
+            .expect("build notification http client")
     })
+}
+
+/// POST a JSON payload to a user-supplied Slack/Discord/webhook URL, re-validating
+/// it against SSRF at send time (DNS-rebinding defense — the write-time check can be
+/// defeated by a low-TTL record that flips to an internal IP before the alert fires).
+/// The shared http_client() additionally refuses redirects. Mirrors
+/// webhook_gateway.rs::forward_to_route. The re-validation is bounded by a 3s timeout so
+/// a slow/hostile resolver cannot serialize the alert path; fail-closed on error/timeout.
+async fn post_user_webhook(client: &reqwest::Client, url: &str, payload: serde_json::Value) {
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        crate::helpers::validate_url_not_internal(url),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("Notification webhook blocked at send time (SSRF/DNS-rebind?): {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("Notification webhook URL validation timed out; skipping send");
+            return;
+        }
+    }
+    let _ = client
+        .post(url)
+        .json(&payload)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
 }
 
 // ── Real-time notification broadcast (SSE) ─────────────────────────────────
@@ -113,12 +152,7 @@ pub async fn send_notification(
     if let Some(ref url) = channels.slack_url {
         if !url.is_empty() {
             let text = format_message(pool, "slack", subject, message, severity).await;
-            let _ = client
-                .post(url)
-                .json(&serde_json::json!({ "text": text }))
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
+            post_user_webhook(client, url, serde_json::json!({ "text": text })).await;
         }
     }
 
@@ -126,12 +160,7 @@ pub async fn send_notification(
     if let Some(ref url) = channels.discord_url {
         if !url.is_empty() {
             let content = format_message(pool, "discord", subject, message, severity).await;
-            let _ = client
-                .post(url)
-                .json(&serde_json::json!({ "content": content }))
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
+            post_user_webhook(client, url, serde_json::json!({ "content": content })).await;
         }
     }
 
@@ -165,18 +194,13 @@ pub async fn send_notification(
     if let Some(ref url) = channels.webhook_url {
         if !url.is_empty() {
             let custom_message = format_message(pool, "webhook", subject, message, severity).await;
-            let _ = client
-                .post(url)
-                .json(&serde_json::json!({
-                    "title": subject,
-                    "message": custom_message,
-                    "severity": severity,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "source": "dockpanel"
-                }))
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
+            post_user_webhook(client, url, serde_json::json!({
+                "title": subject,
+                "message": custom_message,
+                "severity": severity,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "source": "dockpanel"
+            })).await;
         }
     }
 }
@@ -300,12 +324,7 @@ pub async fn send_notification_with_runbook(
                     text.push_str(&format!("\n\n*Runbook:* _{excerpt}_"));
                 }
             }
-            let _ = client
-                .post(url)
-                .json(&serde_json::json!({ "text": text }))
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
+            post_user_webhook(client, url, serde_json::json!({ "text": text })).await;
         }
     }
 
@@ -320,12 +339,7 @@ pub async fn send_notification_with_runbook(
                     content.push_str(&format!("\n\n**Runbook:** *{excerpt}*"));
                 }
             }
-            let _ = client
-                .post(url)
-                .json(&serde_json::json!({ "content": content }))
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
+            post_user_webhook(client, url, serde_json::json!({ "content": content })).await;
         }
     }
 
@@ -379,12 +393,7 @@ pub async fn send_notification_with_runbook(
             if let Some(rurl) = runbook_url {
                 payload["runbook_url"] = serde_json::json!(rurl);
             }
-            let _ = client
-                .post(url)
-                .json(&payload)
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
+            post_user_webhook(client, url, payload).await;
         }
     }
 }

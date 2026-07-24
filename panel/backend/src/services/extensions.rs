@@ -8,8 +8,12 @@ fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            // Do NOT follow redirects: webhook_url / dest_url are vetted only at write
+            // time, so a public URL 3xx-redirecting to an internal address would exfiltrate
+            // to / probe it. Parity with notifications.rs + webhook_gateway.rs.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default()
+            .expect("build extensions http client")
     })
 }
 
@@ -77,6 +81,18 @@ pub async fn emit_event(pool: &PgPool, event_type: &str, data: serde_json::Value
                     return; // Exit this spawned task, don't deliver unsigned webhook
                 }
             };
+
+            // SSRF re-validation at send time (DNS-rebind defense — parity with
+            // webhook_gateway::forward_to_route). The client above already refuses redirects.
+            if let Err(e) = crate::helpers::validate_url_not_internal(&webhook_url).await {
+                tracing::warn!("Extension {ext_id} webhook blocked at send time (SSRF?): {e}");
+                let _ = sqlx::query(
+                    "INSERT INTO extension_events (extension_id, event_type, payload, response_body, duration_ms) \
+                     VALUES ($1, $2, $3, 'Blocked: webhook URL failed SSRF validation', 0)"
+                ).bind(ext_id).bind(&event_type).bind(&payload_str).execute(&pool).await;
+                ACTIVE_DELIVERIES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
 
             let result = http_client()
                 .post(&webhook_url)
@@ -169,6 +185,12 @@ pub fn fire_event(pool: &PgPool, event_type: &str, data: serde_json::Value) {
             let pool_clone = pool.clone();
 
             tokio::spawn(async move {
+                // SSRF re-validation at send time (parity with webhook_gateway; the shared
+                // client refuses redirects). Skip the whole retry chain if it fails.
+                if let Err(e) = crate::helpers::validate_url_not_internal(&dest).await {
+                    tracing::warn!("Extension webhook route dest blocked at send time (SSRF?): {e}");
+                    return;
+                }
                 let mut last_status = 0i32;
                 for attempt in 0..=(retry_count.max(0).min(5)) {
                     if attempt > 0 {

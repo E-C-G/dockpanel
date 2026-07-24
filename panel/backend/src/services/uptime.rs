@@ -26,7 +26,23 @@ pub async fn run(pool: PgPool, mut shutdown_rx: tokio::sync::broadcast::Receiver
     tracing::info!("Uptime monitor started");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // Follow up to 5 redirects (http->https etc.) but NEVER to an internal address —
+        // closes the redirect-to-internal SSRF/oracle bypass that a bare Policy::limited
+        // would follow. The target host is fully resolved (literal IPs AND hostnames that
+        // resolve to an internal IP are rejected); an over-limit chain surfaces as a
+        // network error (→ "down") rather than a spurious 3xx.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 5 {
+                return attempt.error("too many redirects");
+            }
+            let host = attempt.url().host_str().unwrap_or("").to_string();
+            let port = attempt.url().port_or_known_default().unwrap_or(80);
+            if crate::helpers::host_resolves_internal_blocking(&host, port) {
+                attempt.error("redirect to internal address blocked")
+            } else {
+                attempt.follow()
+            }
+        }))
         .danger_accept_invalid_certs(false)
         .build()
         .unwrap();
@@ -336,6 +352,13 @@ async fn check_heartbeat(monitor: &MonitorRow, pool: &PgPool) {
 
 /// HTTP check with optional keyword verification and custom headers.
 async fn check_http(monitor: &MonitorRow, client: &reqwest::Client) -> (Option<i32>, Option<String>, &'static str, i32) {
+    // SSRF re-validation at check time: the URL was vetted at write time, but a low-TTL
+    // DNS record can flip to an internal IP before the check runs (rebind), and monitors
+    // imported via /settings/import bypass the create-path guard entirely. Done BEFORE the
+    // timing window so its DNS lookup does not inflate the recorded response_time.
+    if let Err(e) = crate::helpers::validate_url_not_internal(&monitor.url).await {
+        return (None, Some(format!("URL blocked: {e}")), "down", 0);
+    }
     let start = Instant::now();
     let mut builder = client.get(&monitor.url);
 
@@ -359,7 +382,7 @@ async fn check_http(monitor: &MonitorRow, client: &reqwest::Client) -> (Option<i
     let response_time = start.elapsed().as_millis() as i32;
 
     match result {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let code = resp.status().as_u16() as i32;
             if !resp.status().is_success() {
                 return (Some(code), Some(format!("HTTP {code}")), "down", response_time);
@@ -368,7 +391,23 @@ async fn check_http(monitor: &MonitorRow, client: &reqwest::Client) -> (Option<i
             // Keyword check if configured
             if let Some(ref keyword) = monitor.keyword {
                 if !keyword.is_empty() {
-                    let body = resp.text().await.unwrap_or_default();
+                    // Bound the body read: an attacker-controlled target could otherwise
+                    // stream an unbounded body into memory (shared-process OOM on small
+                    // VPSes; the agent proxy caps responses the same way via
+                    // http_body_util::Limited). 2 MiB covers real HTML/JSON pages while
+                    // capping peak memory at ~2 MiB × 10 concurrent checks. Keyword match is
+                    // UTF-8/ASCII (from_utf8_lossy); an ASCII keyword always matches, a
+                    // non-ASCII keyword on a non-UTF-8 page may not.
+                    const MAX_BODY: usize = 2 * 1024 * 1024;
+                    let mut buf: Vec<u8> = Vec::new();
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        let take = (MAX_BODY - buf.len()).min(chunk.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                        if buf.len() >= MAX_BODY {
+                            break;
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf).to_string();
                     let contains = body.contains(keyword.as_str());
                     let must_contain = monitor.keyword_must_contain;
 

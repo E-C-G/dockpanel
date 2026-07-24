@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.26.0] - 2026-07-24
+
+Monitoring & alerting outbound-request hardening — a security audit of the monitoring, alerting, and
+incident stack found that several outbound HTTP paths (alert notifications, uptime checks, the webhook
+connectivity test, escalation webhooks, and extension webhooks) could be steered at internal addresses
+via HTTP redirects or DNS rebinding, and that an uptime keyword check could buffer an unbounded
+response body into memory. All are now closed.
+
+### Security
+- **Alert/notification webhooks no longer follow redirects and re-validate the destination at send
+  time.** Slack, Discord, and generic webhook alert deliveries used an HTTP client that followed
+  redirects, so a webhook URL that passed the internal-address check when saved could be 3xx-redirected
+  to a loopback / link-local / private address when the alert later fired (SSRF). The shared
+  notification client now refuses redirects and re-checks the destination immediately before each send
+  (defeating DNS-rebinding), matching the webhook-gateway forwarder.
+- **Per-monitor Slack/Discord alert URLs are now validated against internal addresses** on both create
+  and update (previously only the global alert-rule URLs were checked).
+- **Uptime HTTP checks re-validate the target at check time, refuse redirects to internal hosts, and
+  bound the response body.** A monitor URL that resolves publicly when saved but rebinds to an internal
+  IP is now rejected when the check runs; a redirect to an internal address (literal or resolving) is
+  refused; and the keyword-match body read is capped (2 MiB) so an attacker-controlled target cannot
+  stream an unbounded body into memory.
+- **The webhook connectivity test and imported-monitor URLs are validated against internal addresses,**
+  and the escalation-policy `webhook:` route now checks its URL against internal addresses (previously
+  only the scheme was validated).
+- **Extension webhook deliveries** (event emit + webhook-route forwarding) now refuse redirects and
+  re-validate the destination at send time, closing the same SSRF class as the alert path.
+
 ## [2.25.0] - 2026-07-24
 
 Webroot secret scanning — the weekly security scan now flags hardcoded credentials in each site's
