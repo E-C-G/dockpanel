@@ -998,7 +998,7 @@ pub static FIELDS: &[Field] = &[
     Field {
         id: "apps.deploy.port",
         surface: "Deploy a Docker app",
-        label: "Host port",
+        label: "Host Port",
         help: "The port on this server the app will answer on. DockPanel checks it is free \
                before the image is pulled.",
         more: "Published on 127.0.0.1 by default. To expose the app publicly, put a Reverse \

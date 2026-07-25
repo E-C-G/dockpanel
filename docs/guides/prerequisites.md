@@ -238,7 +238,7 @@ The container is created as `dockpanel-app-<name>`, so this name is what you wil
 
 Checked by `apps.name_available`.
 
-**Host port** — The port on this server the app will answer on. DockPanel checks it is free before the image is pulled.
+**Host Port** — The port on this server the app will answer on. DockPanel checks it is free before the image is pulled.
 
 Published on 127.0.0.1 by default. To expose the app publicly, put a Reverse Proxy site in front of it — that gets you a certificate and a domain instead of a port number.
 
