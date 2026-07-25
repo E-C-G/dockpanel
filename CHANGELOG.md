@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.31.2] - 2026-07-25
+
+### Fixed
+
+- **Creating your first website no longer takes the control panel offline (domain installs).**
+  `certbot --nginx` writes a wildcard `listen 443 ssl;` onto the panel's vhost, while
+  agent-generated site vhosts bind `<ip>:443 ssl`. nginx treats those as separate listen
+  sockets and the explicit-IP one wins every connection to that address, so the panel's
+  `server_name` was never consulted: the first site to receive a certificate became the
+  de-facto server for the panel's own domain, and the panel answered with that site's
+  content and certificate. `setup.sh` now pins the panel's `:443` to the interface IP after
+  certbot runs — the same convention `configure_nginx` already applied to `:80` — and
+  `update.sh` repairs boxes already in that state. Found by driving a real domain install on
+  a fresh box; verified by reproducing the outage before the fix and the survival after it.
+- **The listen repair restarts nginx instead of reloading it.** A reload cannot move an
+  already-bound `0.0.0.0:443` listener to a specific address — nginx inherits the old socket
+  and the rewrite silently no-ops, leaving an on-disk config that disagrees with what is
+  running. Both scripts now restart and then verify the socket rather than trusting an exit
+  code.
+- **`update.sh`'s `BASE_URL` repair now actually runs.** Its guard searched for `BASE_URL` as
+  an unanchored substring, which also matches the `DATABASE_URL=` line that `setup.sh` writes
+  first into every `api.env` — so the repair was skipped on every install that has ever
+  existed. It is now anchored, treats a valueless key as unset, and rewrites in place instead
+  of appending a second key.
+- **Automatic SSL renewal honours the panel-wide ACME contact.** `security_scanner` and
+  `auto_healer` read the site owner's address directly, bypassing the `acme_contact_email`
+  fallback that every issuance path uses. A box whose owner address cannot be a Let's Encrypt
+  contact (a reserved TLD, a typo) issued certificates fine and then silently failed to renew
+  them. Both renewal paths now resolve the contact the same way issuance does.
+
 ## [2.31.1] - 2026-07-25
 
 ### Security

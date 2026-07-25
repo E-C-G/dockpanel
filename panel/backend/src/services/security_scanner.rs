@@ -252,9 +252,22 @@ async fn auto_fix_safe_findings(
                 .await
                 .unwrap_or(None);
 
-                let Some(email) = email else {
+                let Some(owner_email) = email else {
                     tracing::warn!("Auto-fix: cannot renew SSL for {domain} — owner email not found");
                     continue;
+                };
+
+                // Resolve through the SAME path issuance uses. Without this the
+                // panel-wide `acme_contact_email` rescue applies only when a human
+                // clicks, so a box whose owner address cannot be an ACME contact
+                // (reserved TLD, typo) issues fine and then silently fails to renew
+                // ~60 days later.
+                let email = match crate::routes::ssl::resolve_acme_contact(pool, &owner_email).await {
+                    Ok(addr) => addr,
+                    Err(reason) => {
+                        tracing::warn!("Auto-fix: cannot renew SSL for {domain} — {reason}");
+                        continue;
+                    }
                 };
 
                 tracing::info!("Auto-fix: renewing expiring SSL certificate for {domain}");

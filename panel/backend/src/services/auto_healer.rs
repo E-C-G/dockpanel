@@ -541,7 +541,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
         let (site_id, domain, user_id, runtime, proxy_port, php_version, root_path,
              ssl_expiry, ssl_renewal_at_initial, ssl_renewal_checked_at, ssl_profile) = row;
         let mut ssl_renewal_at = *ssl_renewal_at_initial;
-        let email: String = match sqlx::query_scalar(
+        let owner_email: String = match sqlx::query_scalar(
             "SELECT email FROM users WHERE id = $1",
         )
         .bind(user_id)
@@ -551,6 +551,17 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             Ok(Some(e)) => e,
             _ => {
                 tracing::warn!("Auto-heal: cannot renew SSL for {domain} — owner email not found");
+                continue;
+            }
+        };
+        // Resolve through the SAME path issuance uses, so the panel-wide
+        // `acme_contact_email` rescue is not limited to human-triggered issuance.
+        // Otherwise a cert that was only issuable thanks to that fallback stops
+        // renewing the moment nobody is clicking.
+        let email: String = match crate::routes::ssl::resolve_acme_contact(pool, &owner_email).await {
+            Ok(addr) => addr,
+            Err(reason) => {
+                tracing::warn!("Auto-heal: cannot renew SSL for {domain} — {reason}");
                 continue;
             }
         };

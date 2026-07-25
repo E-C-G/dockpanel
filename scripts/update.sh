@@ -435,8 +435,29 @@ fi
 # the listener options consistent across vhosts (otherwise nginx errors with
 # "duplicate listen options" when sites add their own [::]:443 ssl block).
 NGINX_NEEDS_RELOAD=0
+NGINX_NEEDS_RESTART=0
 for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
     [ -f "$conf" ] || continue
+    # certbot --nginx writes a WILDCARD `listen 443 ssl;`, while agent-generated
+    # site vhosts bind `<ip>:443 ssl`. nginx treats those as different listen
+    # sockets, the explicit-IP one wins every connection to that address, and the
+    # panel's server_name is never consulted — so on a domain install the first
+    # site to get a certificate silently takes over the panel's own hostname.
+    # The IPv6 pairing step below cannot repair this shape: its rewrite needs a
+    # colon before the port, so it slides straight past a wildcard `listen 443
+    # ssl;`. (Its grep does fire — but on the [::]:443 line — which is why the
+    # wildcard survived unnoticed.)
+    if grep -qE '^[[:space:]]*listen 443 ssl;' "$conf"; then
+        PANEL_BIND_IP=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+        if [ -n "$PANEL_BIND_IP" ]; then
+            sed -i -E "s|^([[:space:]]*)listen 443 ssl;|\1listen ${PANEL_BIND_IP}:443 ssl;|" "$conf"
+            log "Pinned panel :443 listen to ${PANEL_BIND_IP} in $conf (was wildcard; site vhosts could shadow the panel)"
+            # A reload cannot move an already-bound 0.0.0.0:443 listener to a
+            # specific address — nginx inherits the old socket and the rewrite
+            # silently no-ops. This one needs a restart.
+            NGINX_NEEDS_RESTART=1
+        fi
+    fi
     if ! grep -qE 'listen \[::\]:80' "$conf"; then
         sed -i -E '0,/^([[:space:]]*)listen ([^;]*):80;[[:space:]]*$/{s||\1listen \2:80;\n\1listen [::]:80;|}' "$conf"
         sed -i -E '0,/^([[:space:]]*)listen 80;[[:space:]]*$/{s||\1listen 80;\n\1listen [::]:80;|}' "$conf"
@@ -508,9 +529,18 @@ for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dock
     fi
 done
 
-if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
+if [ "$NGINX_NEEDS_RELOAD" = "1" ] || [ "$NGINX_NEEDS_RESTART" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
-        nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen + panel-locations migration"
+        if [ "$NGINX_NEEDS_RESTART" = "1" ]; then
+            systemctl restart nginx > /dev/null 2>&1 && log "Nginx restarted after panel :443 listen migration"
+            # Verify the socket actually moved — the whole point of restarting.
+            if command -v ss > /dev/null 2>&1 && [ -n "${PANEL_BIND_IP:-}" ] \
+               && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -q "${PANEL_BIND_IP}:443"; then
+                log "WARN: panel is still not listening on ${PANEL_BIND_IP}:443 — a site vhost may shadow it"
+            fi
+        else
+            nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen + panel-locations migration"
+        fi
     else
         log "WARN: nginx -t failed after IPv6 listen + panel-locations migration; not reloading. Check sites-enabled/."
     fi
@@ -556,8 +586,14 @@ EOF
     fi
 fi
 
-# Ensure BASE_URL is set in api.env for CORS
-if [ -f /etc/dockpanel/api.env ] && ! grep -q "BASE_URL" /etc/dockpanel/api.env; then
+# Ensure BASE_URL is set in api.env for CORS.
+# The test MUST stay anchored to the start of the line. An unanchored substring
+# search also hits the DATABASE_URL= line that setup.sh writes first into every
+# api.env (that key ends with the same eight characters), so before v2.31.2 this
+# repair was skipped on every install that has ever existed. Require a real key
+# with a non-empty value — setup.sh writes a bare, valueless key on domainless
+# installs, and that counts as unset here.
+if [ -f /etc/dockpanel/api.env ] && ! grep -qE '^BASE_URL=.+' /etc/dockpanel/api.env; then
     # Detect panel URL from nginx config
     PANEL_DOMAIN=""
     for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
@@ -567,8 +603,17 @@ if [ -f /etc/dockpanel/api.env ] && ! grep -q "BASE_URL" /etc/dockpanel/api.env;
         fi
     done
     if [ -n "$PANEL_DOMAIN" ] && [ "$PANEL_DOMAIN" != "_" ]; then
-        echo "BASE_URL=https://${PANEL_DOMAIN}" >> /etc/dockpanel/api.env
-        log "Added BASE_URL=https://${PANEL_DOMAIN} to api.env"
+        if grep -qE '^BASE_URL=' /etc/dockpanel/api.env; then
+            # A bare `BASE_URL=` is already there (domainless install later moved
+            # onto a domain). Rewrite it in place — appending a second key would
+            # leave two BASE_URL lines and make the effective value depend on
+            # which one the env parser happens to keep.
+            sed -i -E "s|^BASE_URL=.*|BASE_URL=https://${PANEL_DOMAIN}|" /etc/dockpanel/api.env
+            log "Set empty BASE_URL to https://${PANEL_DOMAIN} in api.env"
+        else
+            echo "BASE_URL=https://${PANEL_DOMAIN}" >> /etc/dockpanel/api.env
+            log "Added BASE_URL=https://${PANEL_DOMAIN} to api.env"
+        fi
     fi
 fi
 

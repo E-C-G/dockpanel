@@ -1337,6 +1337,48 @@ F2BEOF
     fi
 }
 
+# Bind the panel's TLS listener the same way its neighbours are bound.
+#
+# certbot --nginx writes a WILDCARD `listen 443 ssl;` onto the vhost it
+# manages, but agent-generated site vhosts bind `<ip>:443 ssl`
+# (agent/src/templates/nginx/https.conf). nginx treats those as two different
+# listen sockets and the explicit-IP one wins every connection to that
+# address, so the panel's server_name is never consulted: the FIRST site to
+# get a certificate becomes the de-facto server for the panel's own domain and
+# the panel goes dark from outside. configure_nginx already avoids exactly
+# this on :80 by pinning it to the interface IP — certbot then reintroduces it
+# on :443, which is why the guard there was not enough.
+normalize_panel_listen() {
+    local conf="$NGINX_CONF"
+    [ -f "$conf" ] || return 0
+
+    local bind_ip
+    bind_ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+    # No default route: every vhost falls back to wildcard, so they already agree.
+    [ -n "$bind_ip" ] || return 0
+
+    sed -i -E "s|^([[:space:]]*)listen 443 ssl;|\1listen ${bind_ip}:443 ssl;|" "$conf"
+    # Site vhosts declare a plain `[::]:443 ssl`; nginx rejects mixing
+    # ipv6only=on with it on the same socket.
+    sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl ipv6only=on;|\1listen [::]:443 ssl;|' "$conf"
+
+    if ! nginx -t > /dev/null 2>&1; then
+        warn "nginx config test failed after adjusting the panel listen directives"
+        return 0
+    fi
+
+    # A RELOAD cannot move an already-bound listener from 0.0.0.0:443 to
+    # <ip>:443 — nginx inherits the old socket and the change silently
+    # no-ops, leaving a config on disk that disagrees with what is running.
+    # Only a restart rebinds.
+    systemctl restart nginx > /dev/null 2>&1 || true
+
+    # Trust the socket, not the restart's exit code.
+    if command -v ss > /dev/null 2>&1 && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -q "${bind_ip}:443"; then
+        warn "panel is not listening on ${bind_ip}:443 — a site vhost may shadow it"
+    fi
+}
+
 provision_panel_ssl() {
     if [ -z "$PANEL_DOMAIN" ]; then
         if [ "$PANEL_SELF_SIGNED" = "1" ]; then
@@ -1358,6 +1400,7 @@ provision_panel_ssl() {
     if run "Provisioning Let's Encrypt certificate for ${PANEL_DOMAIN}" \
         certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then
         log "SSL certificate provisioned for $PANEL_DOMAIN"
+        normalize_panel_listen
     else
         warn "SSL provisioning failed — the panel still works over HTTP"
         info "Retry manually: certbot --nginx -d $PANEL_DOMAIN"
