@@ -154,6 +154,42 @@ fn panel_host_from_base_url(base: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// [`is_reserved_domain`] plus the host THIS request arrived on.
+///
+/// **`BASE_URL` is not a reliable statement of the panel's hostname.** It is
+/// routinely empty on a box whose panel nginx serves a real domain — observed on
+/// demo.dockpanel.dev and on a fresh install, because `setup.sh` only writes it
+/// when `PANEL_DOMAIN` was supplied. s256 shipped a guard that trusted it alone,
+/// and on the demo box that made this check inert: creating a site for the
+/// panel's own domain wrote a vhost that took over its `server_name`, and the
+/// panel started answering 404. That is exactly the squat s241 closed.
+///
+/// The `Host` header is always right, because it is the address the operator is
+/// driving the panel on at this very moment. It is attacker-controlled in
+/// general, which is fine here: it can only ever reserve MORE, never less, so
+/// forging it costs the forger a domain they cannot register anyway.
+///
+/// Use this on every path that introduces a domain and can see request headers;
+/// [`is_reserved_domain`] remains for the paths that cannot.
+pub fn is_reserved_domain_for(domain: &str, headers: &HeaderMap) -> bool {
+    if is_reserved_domain(domain) {
+        return true;
+    }
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    // Reuse the BASE_URL parser: it strips an optional scheme, a path and a
+    // port, and lowercases — a bare `demo.example.com:8443` is exactly that
+    // shape minus the scheme.
+    match panel_host_from_base_url(host) {
+        Some(h) => reserved_match(domain, Some(&h), &[]),
+        None => false,
+    }
+}
+
 /// The pure decision, split out so it is testable without touching process env
 /// (a `OnceLock` initialised from env can only ever be observed once per test
 /// binary, so the branches below would otherwise be unreachable from a test).
@@ -474,6 +510,42 @@ mod tests {
         assert!(reserved_match("vpn.internal.corp", None, &zones));
         assert!(!reserved_match("internal.corp.evil.com", None, &zones));
         assert!(!reserved_match("notinternal.corp", None, &zones));
+    }
+
+    /// The regression that shipped in v2.31.0 and took demo.dockpanel.dev down.
+    ///
+    /// `BASE_URL` is empty on a box whose panel nginx serves a real domain, so a
+    /// guard that trusts it alone reserves nothing and a tenant can claim the
+    /// panel's own `server_name`. The request's Host is the signal that is
+    /// always right. (Env is empty in the test binary, so `is_reserved_domain`
+    /// contributes nothing here and this isolates the Host behaviour.)
+    #[test]
+    fn the_host_the_panel_is_being_driven_on_is_reserved() {
+        let host_hdr = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::HOST, v.parse().unwrap());
+            h
+        };
+
+        // The exact case: the operator is on the panel's own host and tries to
+        // create a site for it. Before the fix this returned false and the new
+        // vhost took over the panel's server_name, and the panel answered 404.
+        let h = host_hdr("panel.example.com");
+        assert!(is_reserved_domain_for("panel.example.com", &h));
+        assert!(is_reserved_domain_for("PANEL.EXAMPLE.COM", &h));
+
+        // A Host carrying a port (the domainless install, panel on :8443).
+        let h_port = host_hdr("192.168.1.50:8443");
+        assert!(is_reserved_domain_for("192.168.1.50", &h_port));
+
+        // Exact host only — subdomains of the panel host stay available, and
+        // unrelated domains are unaffected.
+        assert!(!is_reserved_domain_for("blog.panel.example.com", &h));
+        assert!(!is_reserved_domain_for("example.com", &h));
+        assert!(!is_reserved_domain_for("notpanel.example.com", &h));
+
+        // No Host header at all must not panic and must not reserve anything.
+        assert!(!is_reserved_domain_for("example.com", &HeaderMap::new()));
     }
 
     #[test]

@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.31.1] - 2026-07-25
+
+### Security
+
+- **The reserved control-plane domain guard shipped inert in 2.31.0 — upgrade.** 2.31.0 replaced a
+  hardcoded list of vendor domains with the panel's own hostname, derived from `BASE_URL`. That
+  turned out to be the wrong source: `BASE_URL` is only written when the installer was given a
+  `PANEL_DOMAIN`, so on a box whose nginx serves the panel on a real domain it is routinely empty —
+  and an empty value reserved nothing at all. A tenant could then create a site for the panel's own
+  domain, whose vhost takes over that `server_name`, leaving the panel itself answering 404. This is
+  the squat closed in 2.18.0, briefly reopened.
+
+  The guard now also reserves **the host the request arrived on**, which is by definition the address
+  the panel is being used at, and needs no configuration to be correct. It is only ever used to
+  reserve *more*, so a forged `Host` cannot weaken it. Wired into every domain-introducing path that
+  can see request headers: site create, domain rename, alias add and clone. `BASE_URL` and
+  `RESERVED_DOMAINS` continue to apply.
+
+  Found by driving the running panel rather than by the test suite — the unit tests passed against
+  the same wrong assumption that produced the bug.
+
 ## [2.31.0] - 2026-07-25
 
 The first ten minutes with DockPanel. Everything here is something a new operator meets before they

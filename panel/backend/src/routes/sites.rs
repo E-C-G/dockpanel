@@ -245,7 +245,7 @@ pub async fn create(
     }
 
     // Block reserved panel domains (shared guard — see clone/rename/add_alias).
-    if crate::routes::is_reserved_domain(&body.domain) {
+    if crate::routes::is_reserved_domain_for(&body.domain, &headers) {
         return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
     }
 
@@ -1860,6 +1860,7 @@ pub async fn add_alias(
     AuthUser(claims): AuthUser,
     ServerScope(server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<AddAliasBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !is_valid_domain(&body.alias) {
@@ -1873,7 +1874,7 @@ pub async fn add_alias(
     // live domain as an alias and hijack its traffic / intercept its ACME
     // HTTP-01 challenge. Reject reserved domains and any domain already served
     // by a site or git deployment on this server.
-    ensure_domain_available(&state, &body.alias, server_id).await?;
+    ensure_domain_available(&state, &body.alias, server_id, &headers).await?;
 
     let result = agent
         .post(
@@ -2136,6 +2137,7 @@ pub async fn clone_site(
     AuthUser(claims): AuthUser,
     ServerScope(server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let target_domain = body.get("domain").and_then(|v| v.as_str())
@@ -2177,7 +2179,7 @@ pub async fn clone_site(
                 &format!("Site creation rate limit: max {max_sites} sites per hour")));
         }
     }
-    ensure_domain_available(&state, target_domain, server_id).await?;
+    ensure_domain_available(&state, target_domain, server_id, &headers).await?;
     // Atomically reserve the reseller site-quota slot AFTER the (fallible) domain checks
     // so a rejected clone cannot leak a quota slot; this mirrors create(), where the
     // reserve is the last pre-check before the mutation. Release it if the INSERT fails;
@@ -2422,6 +2424,7 @@ pub async fn rename_domain(
     AuthUser(claims): AuthUser,
     ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Get current site
@@ -2448,7 +2451,7 @@ pub async fn rename_domain(
     // Same reserved-domain block create() enforces — otherwise a tenant could
     // rename a site they own onto a panel control-plane domain (dockpanel.dev /
     // docs.dockpanel.dev) and shadow the panel's own vhost for phishing.
-    if crate::routes::is_reserved_domain(&new_domain) {
+    if crate::routes::is_reserved_domain_for(&new_domain, &headers) {
         return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
     }
 
@@ -3009,8 +3012,9 @@ async fn ensure_domain_available(
     state: &AppState,
     domain: &str,
     server_id: Uuid,
+    headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    if crate::routes::is_reserved_domain(domain) {
+    if crate::routes::is_reserved_domain_for(domain, headers) {
         return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
     }
     let existing: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM sites WHERE domain = $1")
