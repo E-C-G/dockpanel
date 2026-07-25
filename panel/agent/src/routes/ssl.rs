@@ -90,7 +90,7 @@ async fn provision(
         bot_protection: None,
     };
 
-    ssl::enable_ssl_for_site(&state.templates, &domain, &site_config)
+    let canonical = ssl::enable_ssl_for_site(&state.templates, &domain, &site_config)
         .await
         .map_err(|e| {
             (
@@ -106,6 +106,9 @@ async fn provision(
         "key_path": cert_info.key_path,
         "expiry": cert_info.expiry,
         "profile": cert_info.profile,
+        // Reported so the panel can say so out loud rather than leaving the
+        // operator with a site that serves HTTPS and advertises HTTP.
+        "canonical_url": canonical,
     })))
 }
 
@@ -212,7 +215,7 @@ async fn upload_cert(
         bot_protection: None,
     };
 
-    ssl::enable_ssl_for_site(&state.templates, &body.domain, &site_config)
+    let canonical = ssl::enable_ssl_for_site(&state.templates, &body.domain, &site_config)
         .await
         .map_err(|e| (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -220,7 +223,12 @@ async fn upload_cert(
         ))?;
 
     tracing::info!("Custom SSL certificate uploaded for {}", body.domain);
-    Ok(Json(serde_json::json!({ "ok": true, "cert_path": cert_path, "key_path": key_path })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "cert_path": cert_path,
+        "key_path": key_path,
+        "canonical_url": canonical,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -317,8 +325,10 @@ async fn renew(
         permissions_policy: None,
         bot_protection: None,
     };
-    if let Err(e) = ssl::enable_ssl_for_site(&state.templates, &domain, &site_config).await {
-        tracing::warn!("Nginx reload after renewal failed for {domain}: {e}");
+    let mut canonical = None;
+    match ssl::enable_ssl_for_site(&state.templates, &domain, &site_config).await {
+        Ok(outcome) => canonical = Some(outcome),
+        Err(e) => tracing::warn!("Nginx reload after renewal failed for {domain}: {e}"),
     }
 
     tracing::info!("SSL certificate renewed for {domain}");
@@ -327,6 +337,7 @@ async fn renew(
         "domain": domain,
         "expiry": cert_info.expiry,
         "profile": cert_info.profile,
+        "canonical_url": canonical,
     })))
 }
 
@@ -473,6 +484,7 @@ async fn provision_dns01(
 
     // If NOT wildcard, enable SSL in nginx for this domain
     // (wildcard certs are applied per-site by the backend)
+    let mut canonical = None;
     if !body.wildcard {
         let site_conf = format!("/etc/nginx/sites-enabled/{domain}.conf");
         if std::path::Path::new(&site_conf).exists() {
@@ -497,11 +509,13 @@ async fn provision_dns01(
                 csp_policy: None, permissions_policy: None, bot_protection: None,
             };
 
-            ssl::enable_ssl_for_site(&state.templates, &domain, &site_config)
-                .await
-                .map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })))
-                })?;
+            canonical = Some(
+                ssl::enable_ssl_for_site(&state.templates, &domain, &site_config)
+                    .await
+                    .map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })))
+                    })?,
+            );
         }
     }
 
@@ -513,6 +527,7 @@ async fn provision_dns01(
         "key_path": cert_info.key_path,
         "expiry": cert_info.expiry,
         "profile": cert_info.profile,
+        "canonical_url": canonical,
     })))
 }
 

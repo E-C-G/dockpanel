@@ -918,9 +918,18 @@ pub async fn create(
                     let mut install_ok = true;
                     emit_step(&cms_logs, site_id, "install", &format!("Installing {cms_label}"), "in_progress", None);
 
+                    // Install at the scheme the site can actually serve RIGHT NOW.
+                    //
+                    // Auto-SSL is still running in a task beside this one and may
+                    // yet fail — DNS not pointed at the box is the ordinary first
+                    // site. Committing WordPress to the secure URL regardless used
+                    // to leave it 302ing to a scheme with no certificate, i.e.
+                    // dead on both, while the panel called it active. Plain HTTP
+                    // always works; the promotion below moves it across the moment
+                    // there is a certificate to move it to.
                     let install_result = if cms_name == "wordpress" {
                         cms_agent.post(&format!("/wordpress/{cms_domain}/install"), Some(serde_json::json!({
-                            "url": format!("https://{cms_domain}"),
+                            "url": format!("http://{cms_domain}"),
                             "title": cms_title,
                             "admin_user": cms_user,
                             "admin_pass": cms_pass,
@@ -1049,7 +1058,43 @@ pub async fn create(
                     if install_ok {
                         match ssl_outcome {
                             Ok(Ok(true)) => {
-                                emit_step(&cms_logs, site_id, "complete", "Site ready", "done", None);
+                                // The certificate can land while the install is
+                                // still running, and at that moment there is no
+                                // WordPress whose URL the agent could move. Ask
+                                // again now that there is; it is a no-op if the
+                                // agent already did it during provisioning.
+                                let promoted = if cms_name == "wordpress" {
+                                    cms_agent
+                                        .post(&format!("/wordpress/{cms_domain}/promote-https"), None)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                } else {
+                                    Ok(serde_json::Value::Null)
+                                };
+                                match promoted {
+                                    Ok(_) => {
+                                        emit_step(&cms_logs, site_id, "complete", "Site ready", "done", None);
+                                    }
+                                    // HTTPS is live and nginx redirects to it, but
+                                    // the site's own links still say HTTP. Saying
+                                    // "ready" here would be the same false claim
+                                    // this step was rebuilt to stop making.
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Canonical URL promotion failed for {cms_domain}: {e}"
+                                        );
+                                        emit_step(
+                                            &cms_logs, site_id, "complete",
+                                            &format!("{cms_label} installed — HTTPS live, site still set to HTTP"),
+                                            "error",
+                                            Some(format!(
+                                                "The certificate is installed, but the site's address \
+                                                 could not be switched to HTTPS: {e}. Update the site \
+                                                 address in {cms_label} settings."
+                                            )),
+                                        );
+                                    }
+                                }
                             }
                             Ok(Ok(false)) => {
                                 emit_step(

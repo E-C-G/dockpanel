@@ -546,11 +546,20 @@ pub async fn get_cert_status(domain: &str) -> CertStatus {
 }
 
 /// Regenerate nginx config with SSL enabled and reload.
+/// Switch a site's vhost to the HTTPS template and, if it is a WordPress site
+/// still advertising plain HTTP, move its canonical URL across with it.
+///
+/// The two halves belong together. The HTTPS template redirects `:80` to `:443`,
+/// so from the moment this returns, the stored URL is the only thing deciding
+/// what the site tells visitors to use. Every path that gives a site a
+/// certificate — first provision, manual retry, DNS-01, an uploaded custom cert,
+/// renewal, git deploys, Docker apps — comes through here, which is why the
+/// promotion lives here and not in any one of them.
 pub async fn enable_ssl_for_site(
     templates: &Tera,
     domain: &str,
     site_config: &SiteConfig,
-) -> Result<(), String> {
+) -> Result<crate::services::wordpress::CanonicalUrlOutcome, String> {
     let ssl_config = SiteConfig {
         runtime: site_config.runtime.clone(),
         root: site_config.root.clone(),
@@ -606,7 +615,22 @@ pub async fn enable_ssl_for_site(
         .map_err(|e| format!("Nginx reload failed: {e}"))?;
 
     tracing::info!("Nginx updated with SSL for {domain}");
-    Ok(())
+
+    // The certificate is live either way — a site whose canonical URL could not
+    // be moved is still served, so this never fails the enable. It is reported
+    // instead, because "serving HTTPS while telling everyone to use HTTP" is a
+    // state somebody has to be told about.
+    let canonical = crate::services::wordpress::promote_site_url_to_https(domain).await;
+    match &canonical {
+        crate::services::wordpress::CanonicalUrlOutcome::Promoted => {
+            tracing::info!("WordPress canonical URL for {domain} moved to HTTPS");
+        }
+        crate::services::wordpress::CanonicalUrlOutcome::Failed(e) => {
+            tracing::warn!("Could not move WordPress canonical URL for {domain} to HTTPS: {e}");
+        }
+        crate::services::wordpress::CanonicalUrlOutcome::Untouched => {}
+    }
+    Ok(canonical)
 }
 
 // ── ACME profile + ARI (RFC 9773) helpers ────────────────────────────────

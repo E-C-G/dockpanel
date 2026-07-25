@@ -189,11 +189,19 @@ jobs:
         with:
           node-version: '20'
 
+      # npm has no ignore mechanism, so one advisory that cannot affect us kept
+      # this whole job red on every commit for six releases — and a job that is
+      # always failing cannot report a NEW failure. The gate below still fails
+      # the build on anything at high/critical; it waives only advisories listed
+      # in scripts/npm-audit-gate.mjs with a written reason, prints that reason,
+      # and flags a waiver that no longer matches anything.
+      # Its own behaviour (both directions) is pinned in
+      # tests/ssl-correctness-pin-e2e.sh.
       - name: Audit Frontend
-        run: cd panel/frontend && npm ci && npm audit --audit-level=high
+        run: cd panel/frontend && npm ci && node ../../scripts/npm-audit-gate.mjs
 
       - name: Audit Marketing Site (client)
-        run: cd website/client && npm ci && npm audit --audit-level=high
+        run: cd website/client && npm ci && node ../../scripts/npm-audit-gate.mjs
 
       - name: Audit Marketing Site (server)
-        run: cd website/server && npm ci && npm audit --audit-level=high
+        run: cd website/server && npm ci && node ../../scripts/npm-audit-gate.mjs

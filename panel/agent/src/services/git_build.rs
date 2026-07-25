@@ -426,7 +426,7 @@ pub async fn deploy_or_update(
         permissions_policy: None,
         bot_protection: None,
                                     };
-                                    if let Ok(()) = crate::services::ssl::enable_ssl_for_site(templates, d, &ssl_config).await {
+                                    if crate::services::ssl::enable_ssl_for_site(templates, d, &ssl_config).await.is_ok() {
                                         tracing::info!("Auto-SSL: certificate provisioned for {d}");
                                     }
                                 }

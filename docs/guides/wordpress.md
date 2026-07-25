@@ -40,6 +40,22 @@ When you create a WordPress site, DockPanel performs these steps in sequence:
 
 You can watch each step complete in real-time from the panel.
 
+### The site's address, before and after the certificate
+
+WordPress stores the address it thinks it lives at, and it redirects visitors to
+that address. So DockPanel installs the site at `http://example.com` — the URL
+the server can serve on the spot, whether or not a certificate has arrived yet.
+
+The moment a certificate is in place, DockPanel moves the stored address to
+`https://example.com` and Nginx starts redirecting HTTP to HTTPS. That happens
+automatically on every path that can produce a certificate: the one issued during
+site creation, a retry from the site's SSL card, a DNS-01 or wildcard
+certificate, and an uploaded custom certificate. You do not have to change the
+WordPress Address or Site Address by hand.
+
+If you had already set a different address (a separate front end, WordPress in a
+subdirectory, a `www.` canonical host), DockPanel leaves it exactly as it is.
+
 ## Post-Install
 
 Once the site is created:
@@ -77,6 +93,10 @@ DockPanel validates that PHP-FPM is available before writing the Nginx config an
 ### SSL provisioning fails
 
 **Symptom**: Site is created but shows HTTP only, or SSL provisioning returns an error.
+
+The site still works over HTTP while you sort this out, and it moves itself to
+HTTPS as soon as a certificate is issued — there is nothing to change inside
+WordPress afterwards.
 
 **Causes and fixes**:
 

@@ -208,6 +208,34 @@ async fn run_scan(pool: &PgPool, agent: &AgentClient) {
     }
 }
 
+/// Raise an alert when a certificate this scanner found to be expiring cannot be
+/// renewed. Deduped per site so the six-hourly scan cannot stack up duplicates
+/// alongside the auto-healer's own alert for the same certificate.
+async fn ssl_renewal_alert(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    site_id: uuid::Uuid,
+    domain: &str,
+    reason: &str,
+) {
+    notifications::fire_alert_deduped(
+        pool,
+        user_id,
+        None,
+        Some(site_id),
+        "ssl_renewal_failure",
+        "critical",
+        &format!("SSL renewal failed: {domain}"),
+        &format!(
+            "The certificate for {domain} is expiring and DockPanel could not renew \
+             it automatically: {reason}. The site will stop loading when the \
+             certificate expires."
+        ),
+        12,
+    )
+    .await;
+}
+
 /// Auto-fix safe findings after a scan completes.
 /// Only fixes things that are SAFE to fix automatically (SSL renewal).
 /// Never auto-fixes malware, open ports, or config changes that could break things.
@@ -229,17 +257,24 @@ async fn auto_fix_safe_findings(
                 }
 
                 // Look up site details from DB (same pattern as auto_healer)
-                let site: Option<(String, Option<i32>, Option<String>, Option<String>, uuid::Uuid)> =
-                    sqlx::query_as(
-                        "SELECT s.runtime, s.proxy_port, s.php_version, s.root_path, s.user_id \
-                         FROM sites s WHERE s.domain = $1 AND s.ssl_enabled = TRUE",
-                    )
-                    .bind(domain)
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap_or(None);
+                let site: Option<(
+                    uuid::Uuid,
+                    String,
+                    Option<i32>,
+                    Option<String>,
+                    Option<String>,
+                    uuid::Uuid,
+                )> = sqlx::query_as(
+                    "SELECT s.id, s.runtime, s.proxy_port, s.php_version, s.root_path, s.user_id \
+                     FROM sites s WHERE s.domain = $1 AND s.ssl_enabled = TRUE",
+                )
+                .bind(domain)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
 
-                let Some((runtime, proxy_port, php_version, root_path, user_id)) = site else {
+                let Some((site_id, runtime, proxy_port, php_version, root_path, user_id)) = site
+                else {
                     continue;
                 };
 
@@ -254,6 +289,14 @@ async fn auto_fix_safe_findings(
 
                 let Some(owner_email) = email else {
                     tracing::warn!("Auto-fix: cannot renew SSL for {domain} — owner email not found");
+                    ssl_renewal_alert(
+                        pool,
+                        user_id,
+                        site_id,
+                        domain,
+                        "the site's owner account has no email address on file",
+                    )
+                    .await;
                     continue;
                 };
 
@@ -266,6 +309,7 @@ async fn auto_fix_safe_findings(
                     Ok(addr) => addr,
                     Err(reason) => {
                         tracing::warn!("Auto-fix: cannot renew SSL for {domain} — {reason}");
+                        ssl_renewal_alert(pool, user_id, site_id, domain, &reason).await;
                         continue;
                     }
                 };
@@ -327,6 +371,11 @@ async fn auto_fix_safe_findings(
                     }
                     Err(e) => {
                         tracing::warn!("Auto-fix: SSL renewal failed for {domain}: {e}");
+                        // The auto-healer alerts when its own renewal fails; this
+                        // path used to end at the log line, so whether a failing
+                        // renewal was visible depended on which loop reached the
+                        // certificate first.
+                        ssl_renewal_alert(pool, user_id, site_id, domain, &e.to_string()).await;
                     }
                 }
             }

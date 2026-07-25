@@ -933,6 +933,46 @@ pub async fn fire_alert(
     let _ = try_fire_alert(pool, user_id, server_id, site_id, alert_type, severity, title, message).await;
 }
 
+/// Fire an alert unless one of the same type already fired for the same site
+/// inside `within_hours`.
+///
+/// The loops that watch certificates run every two minutes. An unconditional
+/// alert from inside one of them is not a warning, it is a flood — and a flood
+/// is how a real alert gets muted. Deduplicating against the alerts table keeps
+/// it to one per site per window without introducing a second piece of state
+/// that can disagree with the first.
+pub async fn fire_alert_deduped(
+    pool: &PgPool,
+    user_id: Uuid,
+    server_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    alert_type: &str,
+    severity: &str,
+    title: &str,
+    message: &str,
+    within_hours: i64,
+) {
+    // within_hours is a typed i64 — safe to interpolate, and it keeps Postgres
+    // from having to infer a parameter type inside an interval expression.
+    let recent: Option<(i64,)> = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM alerts \
+         WHERE alert_type = $1 AND site_id IS NOT DISTINCT FROM $2 \
+         AND created_at > NOW() - INTERVAL '{within_hours} hours'",
+    ))
+    .bind(alert_type)
+    .bind(site_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    if recent.map(|r| r.0).unwrap_or(0) > 0 {
+        return;
+    }
+
+    fire_alert(pool, user_id, server_id, site_id, alert_type, severity, title, message).await;
+}
+
 /// Fire an alert with Result return for retry support.
 pub async fn try_fire_alert(
     pool: &PgPool,

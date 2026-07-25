@@ -238,7 +238,7 @@ async fn deploy(
         bot_protection: None,
                                     };
                                     match ssl::enable_ssl_for_site(&state.templates, domain, &ssl_site_config).await {
-                                        Ok(()) => {
+                                        Ok(_) => {
                                             response["ssl"] = serde_json::json!(true);
                                             tracing::info!("Auto-SSL: certificate provisioned for {domain}");
                                         }

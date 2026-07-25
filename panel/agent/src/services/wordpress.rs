@@ -298,6 +298,77 @@ pub async fn install(
     Ok("WordPress installed successfully".into())
 }
 
+/// What happened to a site's stored canonical URL when its certificate landed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalUrlOutcome {
+    /// There is no WordPress at this vhost, or its URL is not ours to change.
+    Untouched,
+    /// `siteurl`/`home` moved from plain HTTP to HTTPS.
+    Promoted,
+    /// wp-cli refused. The certificate is live and nginx now redirects to it,
+    /// but the site still tells every visitor to use HTTP.
+    Failed(String),
+}
+
+impl CanonicalUrlOutcome {
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Decide whether a stored canonical URL should be moved to HTTPS.
+///
+/// Returns the replacement only when the stored value is exactly the plain-HTTP
+/// form of this vhost's own domain — the state DockPanel itself creates when it
+/// installs a site before the certificate exists. Any other value (a different
+/// host, a sub-path, an already-secure URL) was chosen by the operator and is
+/// left alone: promoting it would silently repoint someone's site.
+pub fn https_promotion_target(current: &str, domain: &str) -> Option<String> {
+    let current = current.trim().trim_end_matches('/');
+    let plain = format!("http://{domain}");
+    if current.eq_ignore_ascii_case(&plain) {
+        Some(format!("https://{domain}"))
+    } else {
+        None
+    }
+}
+
+/// Move a WordPress site's canonical URL from HTTP to HTTPS.
+///
+/// Called once a certificate is in place. A site installed before its
+/// certificate is reachable and correct on HTTP, but the moment nginx starts
+/// redirecting to HTTPS the stored URL is the thing that decides what every
+/// generated link, redirect and asset reference says — so this is what finishes
+/// the job, not a cosmetic tidy-up.
+pub async fn promote_site_url_to_https(domain: &str) -> CanonicalUrlOutcome {
+    if !detect(domain) {
+        return CanonicalUrlOutcome::Untouched;
+    }
+    let mut changed = false;
+    for option in ["siteurl", "home"] {
+        let current = match wp(domain, &["option", "get", option]).await {
+            Ok(v) => v,
+            Err(e) => return CanonicalUrlOutcome::Failed(format!("read {option}: {e}")),
+        };
+        let Some(target) = https_promotion_target(&current, domain) else {
+            continue;
+        };
+        if let Err(e) = wp(domain, &["option", "update", option, &target]).await {
+            return CanonicalUrlOutcome::Failed(format!("update {option}: {e}"));
+        }
+        changed = true;
+    }
+    if changed {
+        CanonicalUrlOutcome::Promoted
+    } else {
+        CanonicalUrlOutcome::Untouched
+    }
+}
+
 /// Set or remove auto-update cron.
 pub async fn set_auto_update(domain: &str, enabled: bool) -> Result<(), String> {
     let path = site_path(domain)?;
@@ -547,4 +618,61 @@ pub async fn update_with_rollback(domain: &str) -> Result<serde_json::Value, Str
         "snapshot": snapshot,
         "log": log,
     }))
+}
+
+#[cfg(test)]
+mod canonical_url_tests {
+    use super::https_promotion_target;
+
+    #[test]
+    fn promotes_this_vhost_own_plain_http_url() {
+        assert_eq!(
+            https_promotion_target("http://example.com", "example.com").as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn tolerates_a_trailing_slash_and_odd_casing() {
+        // wp-cli prints what is stored, and what is stored has been through
+        // however many admin screens and migrations.
+        assert!(https_promotion_target("http://example.com/", "example.com").is_some());
+        assert!(https_promotion_target("  http://example.com  ", "example.com").is_some());
+        assert!(https_promotion_target("HTTP://EXAMPLE.COM", "example.com").is_some());
+    }
+
+    #[test]
+    fn leaves_an_already_secure_url_alone() {
+        assert_eq!(https_promotion_target("https://example.com", "example.com"), None);
+    }
+
+    #[test]
+    fn never_repoints_a_url_the_operator_chose() {
+        // Each of these is a working configuration somebody set on purpose.
+        // Rewriting any of them would move a live site to an address the
+        // operator never picked — a worse bug than the one being fixed.
+        for stored in [
+            "http://other-domain.com",       // headless / separate front end
+            "http://example.com/blog",       // WordPress in a subdirectory
+            "http://www.example.com",        // canonical host is the www one
+            "http://sub.example.com",        // a different vhost entirely
+            "",                              // nothing stored
+        ] {
+            assert_eq!(
+                https_promotion_target(stored, "example.com"),
+                None,
+                "must not promote {stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_suffix_lookalike_is_not_this_domain() {
+        // The comparison is whole-string, so a domain that merely starts with
+        // ours cannot borrow the promotion.
+        assert_eq!(
+            https_promotion_target("http://example.com.attacker.net", "example.com"),
+            None
+        );
+    }
 }

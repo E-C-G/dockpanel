@@ -39,6 +39,25 @@ async fn rebuild_vhost_after_ssl(
             {
                 tracing::warn!("Full vhost rebuild after SSL op failed for {}: {e}", site.domain);
             }
+
+            // This rebuild is the SECOND way a vhost can turn into an HTTPS one.
+            // The agent promotes a WordPress site's canonical URL inside
+            // `enable_ssl_for_site`, but a WILDCARD certificate never goes
+            // through it — the agent leaves those to be applied per-site from
+            // here. Without this the site would serve HTTPS, redirect to it, and
+            // go on telling every visitor to use HTTP. Idempotent: the agent
+            // reports `untouched` when there is nothing to move.
+            if site.ssl_enabled {
+                if let Err(e) = agent
+                    .post(&format!("/wordpress/{}/promote-https", site.domain), None)
+                    .await
+                {
+                    tracing::warn!(
+                        "Canonical URL promotion after SSL op failed for {}: {e}",
+                        site.domain
+                    );
+                }
+            }
         }
         Err(e) => tracing::warn!("Vhost rebuild after SSL op: could not load site {site_id}: {e}"),
     }

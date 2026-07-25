@@ -512,6 +512,40 @@ async fn auto_clean_disk(pool: &PgPool, agent: &AgentClient) {
 ///
 /// The agent reads the prior cert PEM from disk and passes it as the ARI
 /// `replaces` hint, so the CA sees a continuous issuance chain.
+/// Raise an alert when a certificate cannot even be *attempted*.
+///
+/// This is the failure that hides best. Issuance has a fallback contact address,
+/// so a box whose owner email cannot be an ACME contact gets its certificate and
+/// looks fine — and then, sixty days later, the renewal loop reaches this branch
+/// every two minutes and says nothing anybody reads. The certificate expires on
+/// a working, unattended server. Deduped to one alert per site per twelve hours:
+/// the cause is a configuration problem, not a transient.
+async fn ssl_renewal_blocked(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    site_id: uuid::Uuid,
+    domain: &str,
+    reason: &str,
+) {
+    notifications::fire_alert_deduped(
+        pool,
+        user_id,
+        None,
+        Some(site_id),
+        "ssl_renewal_failure",
+        "critical",
+        &format!("SSL renewal blocked: {domain}"),
+        &format!(
+            "DockPanel cannot renew the certificate for {domain}: {reason}. \
+             Until this is fixed the certificate will expire and the site will \
+             stop loading. Set a contact address under Settings → SSL, or on the \
+             site owner's account."
+        ),
+        12,
+    )
+    .await;
+}
+
 async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
     // Widen the window to 45 days so we pick up short-lived (6-day) and
     // 45-day-profile certs with enough lead time. ARI trims this further.
@@ -551,6 +585,14 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             Ok(Some(e)) => e,
             _ => {
                 tracing::warn!("Auto-heal: cannot renew SSL for {domain} — owner email not found");
+                ssl_renewal_blocked(
+                    pool,
+                    *user_id,
+                    *site_id,
+                    domain,
+                    "the site's owner account has no email address on file",
+                )
+                .await;
                 continue;
             }
         };
@@ -562,6 +604,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             Ok(addr) => addr,
             Err(reason) => {
                 tracing::warn!("Auto-heal: cannot renew SSL for {domain} — {reason}");
+                ssl_renewal_blocked(pool, *user_id, *site_id, domain, &reason).await;
                 continue;
             }
         };
@@ -738,7 +781,11 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             .ok()
             .flatten();
 
-            notifications::fire_alert(
+            // Deduped: the attempt cooldown is one hour for short-lived profiles,
+            // so an unconditional alert here would page two dozen times a day for
+            // a single stuck certificate — and the security scanner alerts on the
+            // same certificate from its own loop.
+            notifications::fire_alert_deduped(
                 pool,
                 *user_id,
                 server.map(|s| s.0),
@@ -750,6 +797,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
                     "Auto-healer failed to renew the SSL certificate for {domain}: {details}. \
                      The certificate may expire soon — check the domain configuration and DNS."
                 ),
+                12,
             )
             .await;
 

@@ -48,6 +48,7 @@ pub fn router() -> Router<AppState> {
         .route("/wordpress/{domain}/plugins", get(plugins))
         .route("/wordpress/{domain}/themes", get(themes))
         .route("/wordpress/{domain}/install", post(install))
+        .route("/wordpress/{domain}/promote-https", post(promote_https))
         .route(
             "/wordpress/{domain}/update/{target}",
             post(update),
@@ -116,6 +117,30 @@ async fn themes(
             Json(serde_json::json!({"error": e})),
         )
     })
+}
+
+/// POST /wordpress/{domain}/promote-https — move `siteurl`/`home` to HTTPS.
+///
+/// `enable_ssl_for_site` already does this for every site that exists when its
+/// certificate arrives. This covers the other order: a certificate that lands
+/// while WordPress is still being installed has nothing to promote yet, so the
+/// panel calls back here once the install finishes.
+///
+/// The target URL is derived from the path domain, never accepted from the
+/// caller — a settable `siteurl` is a site-takeover primitive, since WordPress
+/// loads its own scripts from it.
+async fn promote_https(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    let outcome = wordpress::promote_site_url_to_https(&domain).await;
+    if let Some(err) = outcome.failure() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "canonical_url": outcome })))
 }
 
 async fn install(

@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.32.0] - 2026-07-25
+
+### Fixed
+
+- **A site whose automatic SSL fails is no longer dead on both schemes.** WordPress was
+  installed at `https://<domain>` unconditionally — including when the certificate step had
+  already failed two steps earlier in the same task. WordPress then redirected HTTP to a
+  scheme with no certificate, so a brand-new site answered nothing on either one, while the
+  panel reported it `active` and the final step said it was "served over HTTP". Sites are now
+  installed at the scheme the server can actually serve, and nothing about that claim is a
+  guess.
+- **A site moves itself to HTTPS the moment it has a certificate.** Nothing in the codebase
+  had ever rewritten a WordPress site address, so a site that started on HTTP stayed there
+  even after issuance succeeded. Enabling SSL for a site now moves its stored `siteurl`/`home`
+  across with it, on every path that can produce a certificate: first provision, retry, DNS-01,
+  wildcard, an uploaded custom certificate, git deploys and Docker apps. It only ever replaces
+  the plain-HTTP form of that vhost's own domain, so a site deliberately pointed elsewhere — a
+  separate front end, a subdirectory install, a `www.` canonical host — is left untouched.
+- **A certificate that stops renewing raises an alert instead of a log line.** Both renewal
+  loops bailed out with a `tracing::warn!` when no usable ACME contact could be resolved, and
+  the security scanner never alerted on a failed renewal at all. That is precisely the failure
+  that hides best: issuance succeeds thanks to the panel-wide contact fallback, and sixty days
+  later the certificate expires on an unattended server with nobody watching the log. Both
+  loops now raise a critical alert, deduplicated per site so a two-minute loop cannot turn one
+  stuck certificate into a flood.
+
+### Changed
+
+- **CI's Security Audit job can fail meaningfully again.** It had failed on every commit for
+  six releases over one advisory that cannot affect this build (a React Router RSC-mode CSRF
+  bypass; both frontends are Vite SPAs with no server runtime), and `npm audit` has no ignore
+  mechanism. A gate that is always red reports a new advisory exactly as well as no gate at
+  all. `scripts/npm-audit-gate.mjs` now waives individually reviewed advisories — printing the
+  reason, and flagging a waiver that no longer matches anything — while still failing the
+  build on everything else. Its behaviour is pinned in both directions.
+
 ## [2.31.2] - 2026-07-25
 
 ### Fixed
