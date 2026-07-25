@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.28.1] - 2026-07-25
+
+Two gaps that only a fresh box could show, found by verifying v2.28.0 on one rather than by reading
+the diff.
+
+### Fixed
+
+- **Per-site PHP-FPM pools were created but never used.** v2.28.0 fixed the agent sandbox so the pool
+  config finally gets written, and on a fresh box the pool now exists and runs — but the rendered
+  nginx vhost still pointed `fastcgi_pass` at the *shared* `php8.3-fpm.sock`, so every request bypassed
+  the pool and the per-site "PHP Memory" and "PHP Workers" limits still did nothing. The vhost now
+  points at the site's own socket once that socket actually exists; if it doesn't appear after the
+  FPM reload the site keeps the shared pool, so a failed reload degrades to the old behaviour instead
+  of 502-ing the site.
+- **"Site ready" was still claimed for a CMS site whose HTTPS had failed.** v2.28.0 made the terminal
+  provisioning step honest for non-CMS sites but only reported the *install* outcome for CMS ones —
+  so a WordPress site whose certificate failed still finished on "Site ready". It now reports
+  "WordPress installed — HTTPS not configured" (or "…still in progress" when issuance is genuinely
+  still running).
+
 ## [2.28.0] - 2026-07-25
 
 First slice of the guidance layer, plus the backend-correctness cluster found alongside it. Both come

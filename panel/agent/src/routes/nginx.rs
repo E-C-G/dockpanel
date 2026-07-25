@@ -93,7 +93,7 @@ struct SiteStatusResponse {
 async fn put_site(
     State(state): State<AppState>,
     Path(domain): Path<String>,
-    Json(config): Json<SiteConfig>,
+    Json(mut config): Json<SiteConfig>,
 ) -> Result<Json<NginxResponse>, (StatusCode, Json<NginxResponse>)> {
     // Validate domain format
     if !is_valid_domain(&domain) {
@@ -159,6 +159,7 @@ async fn put_site(
         }
 
         // Write PHP-FPM pool config if PHP site with resource limits
+        let mut per_site_socket: Option<String> = None;
         if let Some(ref socket) = config.php_socket {
             // Extract PHP version from socket path (e.g., "unix:/run/php/php8.4-fpm.sock" → "8.4")
             if let Some(ver) = socket.strip_prefix("unix:/run/php/php").and_then(|s| s.strip_suffix("-fpm.sock")) {
@@ -170,8 +171,40 @@ async fn put_site(
                     // Reload PHP-FPM so the new per-site pool is actually picked up.
                     // Non-fatal: reload_php_fpm already swallows reload failures.
                     let _ = services::nginx::reload_php_fpm(ver).await;
+
+                    // ...and then actually POINT the vhost at that pool. Writing the
+                    // pool was never enough on its own: the rendered config kept the
+                    // SHARED php{ver}-fpm.sock, so every request bypassed the per-site
+                    // pool and the "PHP Memory" / "PHP Workers" limits the UI
+                    // advertises did nothing — the pool just idled beside the site.
+                    // (v2.28.0 fixed the sandbox so the pool gets WRITTEN; the fresh-box
+                    // verification then showed nginx still on the shared socket.)
+                    //
+                    // Fail-safe: only switch once the socket really exists. A reload can
+                    // fail or the pool can be rejected, and pointing nginx at a missing
+                    // socket would 502 the entire site. If it never appears we keep the
+                    // shared socket — degraded exactly as before, rather than broken.
+                    let pool_name = domain.replace('.', "_");
+                    let candidate = format!("/run/php/php{ver}-fpm-{pool_name}.sock");
+                    for _ in 0..15 {
+                        if std::path::Path::new(&candidate).exists() {
+                            per_site_socket = Some(format!("unix:{candidate}"));
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    if per_site_socket.is_none() {
+                        tracing::warn!(
+                            "Per-site PHP-FPM socket {candidate} did not appear after reload; \
+                             {domain} stays on the shared pool (per-site PHP limits inactive)"
+                        );
+                    }
                 }
             }
+        }
+        if let Some(sock) = per_site_socket {
+            tracing::info!("{domain} now uses its own PHP-FPM pool ({sock})");
+            config.php_socket = Some(sock);
         }
     }
 

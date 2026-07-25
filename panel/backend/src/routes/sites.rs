@@ -680,6 +680,12 @@ pub async fn create(
                 });
             }
 
+            // Decided up front because the SSL task's outcome channel below has to
+            // be handed to whichever branch owns the terminal step.
+            let cms_type = body.cms.as_deref().unwrap_or("");
+            let needs_db = matches!(cms_type, "wordpress" | "laravel" | "drupal" | "joomla" | "codeigniter");
+            let needs_install = matches!(cms_type, "wordpress" | "laravel" | "drupal" | "joomla" | "symfony" | "codeigniter");
+
             // Auto-SSL: try to provision Let's Encrypt cert in background.
             //
             // Resolve the ACME contact BEFORE spawning. A contact address in a
@@ -803,10 +809,6 @@ pub async fn create(
             });
 
             // One-click CMS/framework install
-            let cms_type = body.cms.as_deref().unwrap_or("");
-            let needs_db = matches!(cms_type, "wordpress" | "laravel" | "drupal" | "joomla" | "codeigniter");
-            let needs_install = matches!(cms_type, "wordpress" | "laravel" | "drupal" | "joomla" | "symfony" | "codeigniter");
-
             if needs_install {
                 let cms_agent = agent.clone();
                 let cms_domain = body.domain.clone();
@@ -1036,8 +1038,36 @@ pub async fn create(
                     // The terminal step must report what happened. It used to say
                     // "Site ready / done" unconditionally — including for an
                     // install that had just failed on the line above (s252 F2).
+                    //
+                    // It also has to account for SSL, which is the half of F2 that
+                    // bites most often: the CMS installs fine, auto-SSL doesn't, and
+                    // "Site ready" over a site with no HTTPS is the same false claim
+                    // in a different costume. Bounded wait — the site is genuinely
+                    // usable meanwhile, so past the bound we say HTTPS is still in
+                    // progress rather than guessing either way.
+                    let ssl_outcome = tokio::time::timeout(Duration::from_secs(45), ssl_rx).await;
                     if install_ok {
-                        emit_step(&cms_logs, site_id, "complete", "Site ready", "done", None);
+                        match ssl_outcome {
+                            Ok(Ok(true)) => {
+                                emit_step(&cms_logs, site_id, "complete", "Site ready", "done", None);
+                            }
+                            Ok(Ok(false)) => {
+                                emit_step(
+                                    &cms_logs, site_id, "complete",
+                                    &format!("{cms_label} installed — HTTPS not configured"), "error",
+                                    Some("The site is served over HTTP. See the SSL step above for \
+                                          the reason, and retry from the site's SSL section.".into()),
+                                );
+                            }
+                            _ => {
+                                emit_step(
+                                    &cms_logs, site_id, "complete",
+                                    &format!("{cms_label} installed — HTTPS still in progress"), "done",
+                                    Some("DockPanel is still trying to issue a certificate. \
+                                          The site's SSL section shows the result.".into()),
+                                );
+                            }
+                        }
                     } else {
                         emit_step(
                             &cms_logs, site_id, "complete",
