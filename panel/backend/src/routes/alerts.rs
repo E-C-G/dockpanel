@@ -52,7 +52,14 @@ pub async fn list(
 ) -> Result<Json<Vec<AlertRow>>, ApiError> {
     let limit = q.limit.unwrap_or(100).min(500);
 
-    // Build dynamic query — server_id always filtered via ServerScope.
+    // Build dynamic query — scoped to the caller, then to the ServerScope
+    // server. NULL server_id is admitted: backup_failure, cron_failure,
+    // security-scan and ssl_expiry alerts are fired with server_id = None (they
+    // are site- or account-scoped), and a bare `server_id = $2` predicate hid
+    // that entire class from the list and the summary permanently — including
+    // criticals — while the bell, external channels and the escalation engine
+    // all still paged for them. Deleting a server also NULLs the column
+    // (ON DELETE SET NULL), which used to make its alert history vanish.
     // LEFT JOIN users resolves acknowledged_by → email for the UI without
     // forcing N+1 fetches from the frontend.
     let mut sql = String::from(
@@ -62,7 +69,7 @@ pub async fn list(
                 a.acknowledged_comment, a.escalation_step_index, a.created_at \
          FROM alerts a \
          LEFT JOIN users u ON u.id = a.acknowledged_by \
-         WHERE a.user_id = $1 AND a.server_id = $2",
+         WHERE a.user_id = $1 AND (a.server_id = $2 OR a.server_id IS NULL)",
     );
     let mut param_idx = 3;
 
@@ -103,8 +110,11 @@ pub async fn summary(
     AuthUser(claims): AuthUser,
     ServerScope(server_id, _agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Same NULL-server_id admission as list() — the two must agree or the badge
+    // count contradicts the rows underneath it.
     let counts: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM alerts WHERE user_id = $1 AND server_id = $2 \
+        "SELECT status, COUNT(*) FROM alerts \
+         WHERE user_id = $1 AND (server_id = $2 OR server_id IS NULL) \
          AND created_at > NOW() - INTERVAL '30 days' \
          GROUP BY status",
     )

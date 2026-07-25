@@ -291,25 +291,179 @@ pub async fn update_schedule(
 
 /// DELETE /api/on-call/schedules/{id} — Admin: remove a rotation.
 ///
-/// Escalation-policy step routes referencing this schedule's UUID are NOT
-/// auto-rewritten — the foreign reference is opaque to the FK system. The
-/// orphan-route sweep (alert_engine) detects and rewrites them on its next
-/// hourly tick.
+/// Escalation-policy steps routing to this schedule (`on_call_schedule:<uuid>`)
+/// are rewritten to `all_channels` in the same transaction as the delete. The
+/// reference lives inside a JSONB blob, so no FK can do it for us, and a
+/// dangling route is not inert: `route_to_user_ids` resolves it to zero users
+/// and the page is dropped — including the *initial* page, because
+/// `try_fire_alert` dispatches step 0 and returns. Every alert bound to the
+/// policy would stop reaching email/Slack/PagerDuty entirely.
+///
+/// (An earlier version of this comment claimed an hourly `alert_engine`
+/// orphan-route sweep repaired these. No such sweep exists — the engine's only
+/// hourly task is the resolved-alert purge.)
 pub async fn delete_schedule(
     State(state): State<AppState>,
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| internal_error("delete schedule", e))?;
+
+    // Delete first so a request for a schedule that does not exist fails fast,
+    // without taking a table-wide lock on escalation_policies and rolling it
+    // back (an admin-UI double-submit would otherwise lock every policy row
+    // twice). Same transaction either way: if the rewrite below fails, the
+    // schedule is not deleted.
     let result = sqlx::query("DELETE FROM on_call_schedules WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| internal_error("delete schedule", e))?;
 
     if result.rows_affected() == 0 {
+        // Dropping `tx` rolls back — nothing was touched.
         return Err(err(StatusCode::NOT_FOUND, "Schedule not found"));
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+
+    let orphan_route = format!("on_call_schedule:{id}");
+    let policies: Vec<(Uuid, serde_json::Value)> =
+        sqlx::query_as("SELECT id, steps FROM escalation_policies FOR UPDATE")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| internal_error("delete schedule", e))?;
+
+    let mut rewritten = 0usize;
+    for (policy_id, steps_json) in policies {
+        let Ok(mut steps) =
+            serde_json::from_value::<Vec<crate::models::EscalationStep>>(steps_json)
+        else {
+            // Undecodable steps are already inert for dispatch; leave them alone
+            // rather than rewriting a blob we can't round-trip.
+            continue;
+        };
+
+        let mut changed = false;
+        for step in steps.iter_mut() {
+            if step.route == orphan_route {
+                step.route = "all_channels".to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+
+        let new_steps = serde_json::to_value(&steps)
+            .map_err(|e| internal_error("delete schedule", e))?;
+        sqlx::query("UPDATE escalation_policies SET steps = $1, updated_at = NOW() WHERE id = $2")
+            .bind(new_steps)
+            .bind(policy_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal_error("delete schedule", e))?;
+        rewritten += 1;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| internal_error("delete schedule", e))?;
+
+    if rewritten > 0 {
+        tracing::info!(
+            "Deleted on-call schedule {id}; rewrote routed steps in {rewritten} escalation \
+             polic{} to all_channels",
+            if rewritten == 1 { "y" } else { "ies" }
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "policies_rewritten": rewritten,
+    })))
+}
+
+/// Remove a deleted user from every on-call rota and rewrite any escalation
+/// step routed directly at them.
+///
+/// Called from the user-delete path. Neither reference can be a foreign key —
+/// `on_call_schedules.members` is a `UUID[]` and `escalation_policies.steps` is
+/// JSONB — so nothing else cleans them up, and a dangling reference is not
+/// inert: the rotation still hands out the dead UUID and the page goes nowhere.
+///
+/// Best-effort and non-fatal: a failure here must not block the delete, since
+/// the stale reference is strictly less harmful than a half-deleted user. Any
+/// route that ends up unroutable still degrades to the alert owner in
+/// `dispatch_escalation_step`.
+pub async fn scrub_deleted_user(db: &sqlx::PgPool, user_id: Uuid) {
+    match sqlx::query(
+        "UPDATE on_call_schedules SET members = array_remove(members, $1), updated_at = NOW() \
+         WHERE $1 = ANY(members)",
+    )
+    .bind(user_id)
+    .execute(db)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(
+                "Removed deleted user {user_id} from {} on-call schedule(s)",
+                r.rows_affected()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Could not scrub deleted user {user_id} from on-call rotas: {e}"),
+    }
+
+    let dead_route = format!("user:{user_id}");
+    let policies: Vec<(Uuid, serde_json::Value)> =
+        match sqlx::query_as("SELECT id, steps FROM escalation_policies")
+            .fetch_all(db)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Could not scan escalation policies for deleted user {user_id}: {e}");
+                return;
+            }
+        };
+
+    for (policy_id, steps_json) in policies {
+        let Ok(mut steps) = serde_json::from_value::<Vec<crate::models::EscalationStep>>(steps_json)
+        else {
+            continue;
+        };
+
+        let mut changed = false;
+        for step in steps.iter_mut() {
+            if step.route == dead_route {
+                step.route = "all_channels".to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+
+        let Ok(new_steps) = serde_json::to_value(&steps) else {
+            continue;
+        };
+        if let Err(e) =
+            sqlx::query("UPDATE escalation_policies SET steps = $1, updated_at = NOW() WHERE id = $2")
+                .bind(new_steps)
+                .bind(policy_id)
+                .execute(db)
+                .await
+        {
+            tracing::warn!("Could not rewrite policy {policy_id} for deleted user {user_id}: {e}");
+        } else {
+            tracing::info!(
+                "Rewrote escalation policy {policy_id} step routed at deleted user {user_id}"
+            );
+        }
+    }
 }
 
 /// GET /api/on-call/whoami — Any authenticated user: am I currently on-call?

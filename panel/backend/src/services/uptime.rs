@@ -24,6 +24,7 @@ struct MonitorRow {
 /// Background task: checks all enabled monitors periodically.
 pub async fn run(pool: PgPool, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
     tracing::info!("Uptime monitor started");
+    crate::services::status_notices::start_worker(pool.clone());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         // Follow up to 5 redirects (http->https etc.) but NEVER to an internal address —
@@ -223,7 +224,7 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
         let _ = create_auto_incident(pool, monitor, cause).await;
 
         // GAP 19: Notify status page subscribers
-        notify_status_subscribers(pool, &monitor.name, "investigating", &format!("{} is experiencing issues: {cause}", monitor.name)).await;
+        notify_status_subscribers(&monitor.name, "investigating", &format!("{} is experiencing issues: {cause}", monitor.name));
     } else if new_status == "up" && monitor.status == "down" {
         // Just recovered — resolve incident
         if let Err(e) = sqlx::query(
@@ -240,7 +241,7 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
         let _ = resolve_auto_incident(pool, monitor).await;
 
         // GAP 19: Notify subscribers of recovery
-        notify_status_subscribers(pool, &monitor.name, "resolved", &format!("{} is back online", monitor.name)).await;
+        notify_status_subscribers(&monitor.name, "resolved", &format!("{} is back online", monitor.name));
 
         tracing::info!("Monitor {} ({}) is back UP", monitor.name, monitor.url);
         send_alerts(pool, monitor, &format!("{} is back up ({}ms)", monitor.name, response_time)).await;
@@ -526,11 +527,17 @@ async fn create_auto_incident(pool: &PgPool, monitor: &MonitorRow, cause: &str) 
 
 /// GAP 3: Auto-resolve managed incident when monitor recovers.
 async fn resolve_auto_incident(pool: &PgPool, monitor: &MonitorRow) -> Result<(), String> {
-    // Find unresolved managed incidents with matching title pattern
+    // Find unresolved managed incidents with matching title pattern, scoped to
+    // the monitor's owner. Monitor names are per-tenant and unremarkable ("api",
+    // "website"), so matching on title alone let one tenant's monitor recovering
+    // resolve another tenant's still-open incident and post a "recovered
+    // automatically" update onto their public status page.
     let incidents: Vec<(uuid::Uuid,)> = sqlx::query_as(
-        "SELECT id FROM managed_incidents WHERE title = $1 AND status != 'resolved' AND status != 'postmortem'"
+        "SELECT id FROM managed_incidents \
+         WHERE title = $1 AND user_id = $2 AND status != 'resolved' AND status != 'postmortem'"
     )
     .bind(format!("{} is down", monitor.name))
+    .bind(monitor.user_id)
     .fetch_all(pool).await.unwrap_or_default();
 
     for (incident_id,) in &incidents {
@@ -557,32 +564,14 @@ async fn resolve_auto_incident(pool: &PgPool, monitor: &MonitorRow) -> Result<()
 }
 
 /// GAP 19: Notify status page subscribers of monitor events.
-async fn notify_status_subscribers(pool: &PgPool, monitor_name: &str, status: &str, message: &str) {
-    let emails: Vec<(String,)> = sqlx::query_as(
-        "SELECT email FROM status_page_subscribers WHERE verified = TRUE AND notify_incidents = TRUE"
-    )
-    .fetch_all(pool).await.unwrap_or_default();
-
-    if emails.is_empty() {
-        return;
-    }
-
-    let subject = format!("[Status Update] {} — {}", monitor_name, status);
-
-    for (email,) in &emails {
-        crate::services::notifications::send_notification(
-            pool,
-            &crate::services::notifications::NotifyChannels {
-                email: Some(email.clone()),
-                slack_url: None,
-                discord_url: None,
-                pagerduty_key: None,
-                webhook_url: None,
-                muted_types: String::new(),
-            },
-            &subject,
-            message,
-            message,
-        ).await;
-    }
+///
+/// Hands off to the shared status-notice worker — see
+/// `services::status_notices` for why this must not run inline in the monitor
+/// check and must not be a detached per-event spawn.
+fn notify_status_subscribers(monitor_name: &str, status: &str, message: &str) {
+    crate::services::status_notices::enqueue(
+        monitor_name,
+        format!("[Status Update] {} — {}", monitor_name, status),
+        message.to_string(),
+    );
 }

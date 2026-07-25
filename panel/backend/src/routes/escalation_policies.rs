@@ -126,6 +126,43 @@ async fn validate_webhook_routes(input: &PolicyInput) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Reject `on_call_schedule:<uuid>` routes pointing at a schedule that does not
+/// exist. `validate_route` only parses the UUID, so a policy could be saved with
+/// a dangling rota reference — either by typo, or by the editor's
+/// read-modify-write racing a concurrent schedule delete and writing the stale
+/// steps back after `delete_schedule` had already rewritten them. A dangling
+/// route is not inert: it resolves to zero users, which is why
+/// `dispatch_escalation_step` now degrades to the alert owner's channels rather
+/// than dropping the page. This keeps it from being stored in the first place.
+async fn validate_schedule_routes(
+    db: &sqlx::PgPool,
+    input: &PolicyInput,
+) -> Result<(), ApiError> {
+    for (i, step) in input.steps.iter().enumerate() {
+        let Some(uuid_str) = step.route.strip_prefix("on_call_schedule:") else {
+            continue;
+        };
+        let Ok(schedule_id) = Uuid::parse_str(uuid_str) else {
+            continue; // shape already rejected by validate_route
+        };
+
+        let exists: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM on_call_schedules WHERE id = $1")
+                .bind(schedule_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| internal_error("validate schedule routes", e))?;
+
+        if exists.is_none() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!("step {i}: on-call schedule {schedule_id} does not exist"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// GET /api/escalation-policies — Admin: list all policies.
 pub async fn list_policies(
     State(state): State<AppState>,
@@ -171,6 +208,7 @@ pub async fn create_policy(
 ) -> Result<Json<PolicyDto>, ApiError> {
     validate_input(&input)?;
     validate_webhook_routes(&input).await?;
+    validate_schedule_routes(&state.db, &input).await?;
 
     let steps_json = serde_json::to_value(&input.steps)
         .map_err(|e| internal_error("serialize policy steps", e))?;
@@ -197,6 +235,7 @@ pub async fn update_policy(
 ) -> Result<Json<PolicyDto>, ApiError> {
     validate_input(&input)?;
     validate_webhook_routes(&input).await?;
+    validate_schedule_routes(&state.db, &input).await?;
 
     let steps_json = serde_json::to_value(&input.steps)
         .map_err(|e| internal_error("serialize policy steps", e))?;

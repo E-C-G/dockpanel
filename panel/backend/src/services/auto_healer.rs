@@ -90,6 +90,17 @@ async fn auto_restart_services(pool: &PgPool, agent: &AgentClient) {
     ).fetch_all(pool).await.unwrap_or_default();
 
     if !exhausted_services.is_empty() {
+        // The local server, resolved the same way check_service_health resolves
+        // it — its owner and name are what the alert engine stamped onto the
+        // incident title we are about to resolve.
+        let local_server: Option<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT user_id, name FROM servers ORDER BY created_at ASC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
         if let Ok(health_result) = agent.get("/services/health").await {
             if let Some(services_arr) = health_result.as_array() {
                 for (service_name,) in &exhausted_services {
@@ -105,11 +116,29 @@ async fn auto_restart_services(pool: &PgPool, agent: &AgentClient) {
                         ).bind(service_name).execute(pool).await;
                         tracing::info!("Auto-healer: {service_name} recovered, cleared exhausted state");
 
-                        // Resolve the associated incident
-                        let _ = sqlx::query(
-                            "UPDATE managed_incidents SET status = 'resolved', updated_at = NOW() \
-                             WHERE title LIKE $1 AND status NOT IN ('resolved', 'postmortem')"
-                        ).bind(format!("%{}%", service_name)).execute(pool).await;
+                        // Resolve the associated incident — the one the alert
+                        // engine opened for THIS service on THIS box, matched by
+                        // its exact generated title and scoped to the owner.
+                        //
+                        // This used to be `title LIKE '%<service>%'` with no
+                        // user_id: a tenant incident whose title merely contained
+                        // a system-service substring ("nginx-edge is down",
+                        // "postgres migration") was silently flipped to resolved
+                        // when the panel's own service recovered — turning their
+                        // status page green mid-outage with no incident update to
+                        // show for it. Same unscoped-title-match class as the
+                        // incidents.rs and uptime.rs resolves.
+                        if let Some((owner_id, ref server_name)) = local_server {
+                            let _ = sqlx::query(
+                                "UPDATE managed_incidents SET status = 'resolved', updated_at = NOW() \
+                                 WHERE user_id = $1 AND title IN ($2, $3) \
+                                 AND status NOT IN ('resolved', 'postmortem')"
+                            )
+                            .bind(owner_id)
+                            .bind(format!("Service {service_name} is stopped on {server_name}"))
+                            .bind(format!("Service {service_name} is failed on {server_name}"))
+                            .execute(pool).await;
+                        }
 
                         notifications::notify_panel(pool, None,
                             &format!("Service recovered: {}", service_name),

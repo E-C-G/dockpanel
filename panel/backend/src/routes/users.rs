@@ -400,6 +400,21 @@ pub async fn remove(
         .await
         .map_err(|e| internal_error("remove users", e))?;
 
+    // Scrub the on-call references no foreign key can reach: rota membership is
+    // a UUID[] and escalation routes are opaque strings inside a JSONB blob.
+    // Leaving them dangling silently drops pages — `resolve_on_call_user` indexes
+    // straight into `members` and hands back the deleted UUID, so the rotation
+    // "pages" a principal that no longer exists. The write path already refuses
+    // nonexistent members (on_call::validate_members_exist); this makes the
+    // delete path reciprocate.
+    //
+    // Strictly AFTER the delete: several FKs to `users` are NO ACTION (maintenance
+    // windows, deploy approvals), so the DELETE can legitimately fail — and this
+    // scrub is irreversible. Running it first would strip a still-existing user
+    // from every rotation and then return 500, leaving the operator with an
+    // "internal error" and a silently gutted on-call schedule.
+    crate::routes::on_call::scrub_deleted_user(&state.db, id).await;
+
     tracing::info!("User deleted by {}: {}", claims.email, user.email);
     let ip = crate::routes::client_ip(&headers);
     activity::log_activity(

@@ -327,6 +327,12 @@ async fn main() {
         });
     }
 
+    // Status-page subscriber fan-out worker. Started here rather than from a
+    // service's run loop because BOTH producers feed it — the uptime monitor and
+    // the incidents HTTP handlers — and a request can arrive before any
+    // background task has had a chance to run. Idempotent.
+    services::status_notices::start_worker(state.db.clone());
+
     // Spawn supervised background tasks
     let (s_db, s_agent) = (state.db.clone(), state.agent.clone());
     spawn_supervised("backup_scheduler", &shutdown_tx, move |rx| services::backup_scheduler::run(s_db.clone(), s_agent.clone(), rx));

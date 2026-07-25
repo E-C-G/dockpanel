@@ -164,7 +164,7 @@ pub async fn create(
     .await;
 
     // Notify subscribers
-    notify_subscribers(&state.db, &incident.title, status, req.description.as_deref().unwrap_or("")).await;
+    notify_subscribers(&incident.title, status, req.description.as_deref().unwrap_or(""));
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "incident.create",
@@ -330,7 +330,7 @@ pub async fn update(
         .execute(&state.db).await;
 
         // Notify subscribers of update
-        notify_subscribers(&state.db, &incident.title, update_status, message).await;
+        notify_subscribers(&incident.title, update_status, message);
     }
 
     // Re-fetch after postmortem auto-populate to return the complete record
@@ -393,10 +393,17 @@ pub async fn post_update(
             .bind(id).fetch_optional(&state.db).await
             .map_err(|e| internal_error("incident auto-resolve title lookup", e))?;
         if let Some((ref title,)) = incident_title {
+            // Scoped to the incident owner. alerts.title is auto-generated from
+            // the server/service name ("Server vps is offline"), so a title-only
+            // match reached across the whole table: resolving your own incident
+            // silently resolved every other tenant's identically-titled firing
+            // alert, clearing it from their dashboard and stopping escalation on
+            // a live outage. Ownership was verified on the incident (above) but
+            // never carried into this UPDATE.
             let _ = sqlx::query(
                 "UPDATE alerts SET status = 'resolved', resolved_at = NOW() \
-                 WHERE title = $1 AND status IN ('firing', 'acknowledged')"
-            ).bind(title).execute(&state.db).await;
+                 WHERE title = $1 AND user_id = $2 AND status IN ('firing', 'acknowledged')"
+            ).bind(title).bind(claims.sub).execute(&state.db).await;
         }
 
         // Clear status_override on linked components
@@ -428,7 +435,7 @@ pub async fn post_update(
         .bind(id).fetch_optional(&state.db).await
         .map_err(|e| internal_error("incident notify title lookup", e))?;
     if let Some((title,)) = title {
-        notify_subscribers(&state.db, &title, &req.status, &req.message).await;
+        notify_subscribers(&title, &req.status, &req.message);
     }
 
     Ok((StatusCode::CREATED, Json(update)))
@@ -862,52 +869,19 @@ pub async fn public_status_page(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn notify_subscribers(db: &sqlx::PgPool, title: &str, status: &str, message: &str) {
-    let emails: Vec<(String,)> = sqlx::query_as(
-        "SELECT email FROM status_page_subscribers WHERE verified = TRUE AND notify_incidents = TRUE"
-    )
-    .fetch_all(db).await
-    .unwrap_or_default();
-
-    if emails.is_empty() {
-        return;
-    }
-
-    let subject = format!("[Status Update] {title} — {status}");
-    let body = format!("{title}\nStatus: {status}\n\n{message}");
-
-    // Get SMTP settings for sending
-    let smtp_host: Option<(String,)> = match sqlx::query_as(
-        "SELECT value FROM settings WHERE key = 'smtp_host'"
-    ).fetch_optional(db).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("DB error fetching SMTP settings for subscriber notification: {e}");
-            return;
-        }
-    };
-
-    if smtp_host.is_none() {
-        tracing::debug!("No SMTP configured — skipping subscriber notifications for {title}");
-        return;
-    }
-
-    for (email,) in &emails {
-        tracing::info!("Notifying subscriber {email} about incident update: {title}");
-        // Use the existing email notification system
-        crate::services::notifications::send_notification(
-            db,
-            &crate::services::notifications::NotifyChannels {
-                email: Some(email.clone()),
-                slack_url: None,
-                discord_url: None,
-                pagerduty_key: None,
-                webhook_url: None,
-                muted_types: String::new(),
-            },
-            &subject,
-            &body,
-            &body,
-        ).await;
-    }
+/// Notify status-page subscribers of an incident update.
+///
+/// Hands off to the shared status-notice worker. This used to walk an unbounded
+/// subscriber list serially over SMTP while awaited INSIDE the HTTP handler, so
+/// one incident update blocked the operator's request — holding a DB pool slot —
+/// until every subscriber had been mailed or the proxy gave up. The public
+/// subscribe endpoint is unauthenticated and unthrottled, so that list is
+/// attacker-grown. See `services::status_notices` for the ordering and
+/// backpressure guarantees; it also applies the fan-out cap.
+fn notify_subscribers(title: &str, status: &str, message: &str) {
+    crate::services::status_notices::enqueue(
+        title,
+        format!("[Status Update] {title} — {status}"),
+        format!("{title}\nStatus: {status}\n\n{message}"),
+    );
 }

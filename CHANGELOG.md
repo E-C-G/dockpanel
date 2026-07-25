@@ -6,6 +6,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.27.0] - 2026-07-25
+
+Alert-engine reliability and cross-tenant isolation — Tag 2 of the monitoring/alerting/incidents audit
+that produced v2.26.0. Where v2.26.0 closed the outbound-request (SSRF) cluster, this closes the
+notification-storm, never-resolve, and tenant-boundary cluster: alerts that fired once per minute
+forever, alert rows that no code path could ever resolve, and resolves that matched rows by free-text
+title across every tenant on the box.
+
+### Fixed — notification storms and alerts that never resolved
+
+- **An expired SSL certificate paged once per minute, indefinitely.** The expired branch fired on every
+  60-second tick with no dedup — roughly 1440 pages per day per lapsed certificate to every configured
+  channel, one never-purged `alerts` row per minute, and a fresh auto-created incident every 5 minutes.
+  It now pages once, and resolves when the certificate is renewed.
+- **`memory_leak` (and `disk_forecast`) fired on every tick for as long as the condition held.** Both
+  now go through a cooldown gate claimed atomically in `alert_state`, and both resolve when the
+  condition clears. The gate is time-based rather than transition-based, so a metric sitting on its
+  threshold and flapping with ordinary jitter cannot re-arm the cooldown every tick.
+- **`memory_leak`, `disk_forecast` and `ssl_expiry` alerts had no path to `resolved` at all.** They
+  stayed `firing` permanently: re-escalated to on-call every 30 minutes forever, and never collected by
+  the purge, which only deletes resolved rows.
+- **The SSL warning ladder only ever fired its first rung.** It scanned the configured warning days in
+  stored order and stopped at the first match, so with the shipped default `30,14,7,3,1` it always
+  selected 30 and the dedup test then suppressed every tighter rung — one warning per certificate
+  instead of the configured escalation. It now selects the tightest rung crossed.
+- **A certificate that lapsed less than 24 hours ago was not treated as expired.** Expiry was derived
+  from a day count that truncates toward zero, so a just-lapsed certificate read as "0 days left" and
+  fell through to the ordinary rungs — which were already spent. Browsers showed a security warning for
+  a full day with no notification on any channel. Expiry is now taken from the signed duration.
+- **A failed alert send still advanced the dedup stamp**, permanently silencing that certificate: the
+  stamp recorded "already paged" while nothing had been delivered and no row existed to escalate from.
+  The stamp is now written only when the send succeeded.
+- **User-configured `ssl_warning_days` was ignored.** The threshold lookup returned defaults for every
+  site-scoped (non-server) request, which is every SSL check, so custom warning ladders never applied.
+
+### Fixed — cross-tenant isolation
+
+- **Resolving an incident resolved other tenants' alerts.** The auto-resolve matched `alerts` by title
+  alone, and titles are generated from the server or service name ("Server vps is offline"), so
+  resolving your own incident silently resolved every identically-titled firing alert on the box —
+  clearing it from another tenant's dashboard and stopping escalation on a live outage. Now scoped to
+  the verified incident owner.
+- **The same unscoped-title-match is fixed in three more places**: monitor recovery auto-resolving
+  managed incidents, the auto-healer resolving incidents by a `LIKE` substring on a service name (which
+  could resolve any tenant's incident whose title merely contained `nginx`, `redis`, `postgres`, …),
+  and the alert engine attaching an auto-created incident's first update by title lookup.
+- **On-call schedule deletion silently dropped every page routed through it.** Escalation steps
+  reference a schedule by UUID inside a JSONB blob, so no foreign key covers them; the code claimed an
+  hourly sweep repaired these, and no such sweep exists. Because the initial page also dispatches
+  through step 0, every alert bound to that policy stopped reaching email/Slack/PagerDuty entirely.
+  Deletion now rewrites the affected steps in the same transaction, deleting a user scrubs their rota
+  membership and routes, and escalation policies reject routes to schedules that do not exist.
+- **A page is never silently dropped.** If an escalation route resolves to no one — or to users who
+  have no notification channels configured at all, which is the common case for a rota member who never
+  opened alert settings — delivery now degrades to the alert owner's channels instead of returning
+  silently. A deliberate mute is still honoured.
+
+### Fixed — visibility
+
+- **Account-scoped alerts were permanently invisible.** Backup failures, cron failures, security-scan
+  findings and SSL alerts are stored with no `server_id`, and the alerts list and its badge both
+  filtered on `server_id = <current server>` — so an entire class of alerts, including criticals, never
+  appeared in the UI, while still paging on every external channel. The dashboard's firing count,
+  acknowledged count, top-issues widget and recent-events feed had the same gap and are aligned with it.
+
+### Fixed — background-loop load
+
+- **The escalation sweep was unbounded and did 3–5 database round-trips per firing alert per minute**,
+  before any eligibility check — so accumulating alerts turned it into self-amplifying load on the
+  shared pool. It is now bounded, ordered least-recently-paged first so no backlog can starve a live
+  alert out of the window, memoises per-tick lookups, and does the expensive work only for rows that
+  actually page. Supported by a new partial index.
+- **Status-page subscriber emails no longer block the work that triggers them.** Monitor transitions
+  fanned out to an unbounded subscriber list serially over SMTP inside the monitor check — stalling all
+  monitoring for the duration — and incident updates did the same inside the HTTP handler, holding the
+  operator's request open. Both now hand off to one shared worker draining a bounded queue, which
+  preserves ordering (so a recovery notice cannot overtake the outage notice that preceded it), caps
+  the fan-out, and skips the work entirely when no mail transport is configured.
+
 ## [2.26.0] - 2026-07-24
 
 Monitoring & alerting outbound-request hardening — a security audit of the monitoring, alerting, and

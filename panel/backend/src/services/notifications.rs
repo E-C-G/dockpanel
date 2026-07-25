@@ -638,15 +638,58 @@ pub async fn dispatch_escalation_step(
     // on_call_schedule:<uuid> or user:<uuid> → routes resolve to user IDs.
     let users = crate::services::on_call::route_to_user_ids(pool, route).await;
     if users.is_empty() {
-        tracing::debug!(
-            "dispatch_escalation_step: route {route} resolved to no users (schedule empty? unknown shape?) — skipping page"
+        // Fail OPEN to the alert's owner rather than dropping the page. An
+        // unresolvable route (deleted schedule, emptied members, deleted routed
+        // user, malformed shape) used to silently swallow the notification —
+        // and since try_fire_alert dispatches step 0 and returns, that swallowed
+        // the *initial* page for a critical alert too. A page to the owner
+        // instead of the rota is a degraded delivery; no page at all is a
+        // missed outage.
+        tracing::warn!(
+            "dispatch_escalation_step: route {route} resolved to no users — falling back to the alert owner's channels"
         );
-        return;
-    }
-    for uid in users {
         fanout_to_user(
             pool,
+            alert_owner_id,
+            alert_owner_server_id,
+            alert_type,
+            subject,
+            message,
+            body_html,
+            runbook_excerpt,
+            runbook_url,
+        )
+        .await;
+        return;
+    }
+    let mut delivered = false;
+    for uid in users {
+        delivered |= fanout_to_user(
+            pool,
             uid,
+            alert_owner_server_id,
+            alert_type,
+            subject,
+            message,
+            body_html,
+            runbook_excerpt,
+            runbook_url,
+        )
+        .await;
+    }
+
+    if !delivered {
+        // The route resolved to real user IDs, but none of them has any
+        // notification configuration — a rota member who never opened alert
+        // settings, or a `user:<uuid>` route to a since-deleted account. That is
+        // indistinguishable from an unresolvable route in effect: nobody is
+        // paged. Degrade to the owner for the same reason.
+        tracing::warn!(
+            "dispatch_escalation_step: no routed user for {route} has notification channels — falling back to the alert owner"
+        );
+        fanout_to_user(
+            pool,
+            alert_owner_id,
             alert_owner_server_id,
             alert_type,
             subject,
@@ -662,6 +705,11 @@ pub async fn dispatch_escalation_step(
 /// Phase 4 W3: send to one user's channels with that user's own mute
 /// preference applied. Used by `dispatch_escalation_step` to honour the
 /// routed user's per-type mute even when escalation routes them in.
+///
+/// Returns whether this user was a SERVICEABLE destination. A deliberate mute
+/// counts as serviceable (the operator chose silence, and an escalation must not
+/// override it); only "this user has no notification configuration at all"
+/// returns false, so a caller can degrade to someone who does.
 async fn fanout_to_user(
     pool: &PgPool,
     user_id: Uuid,
@@ -672,9 +720,15 @@ async fn fanout_to_user(
     body_html: &str,
     runbook_excerpt: Option<&str>,
     runbook_url: Option<&str>,
-) {
+) -> bool {
     let Some(channels) = get_user_channels(pool, user_id, server_id).await else {
-        return;
+        // `alert_rules` rows are only created when a user opens alert settings,
+        // so a perfectly valid rota member can have none — this is the common
+        // case, not a corrupt one.
+        tracing::warn!(
+            "No notification channels configured for user {user_id} — cannot deliver '{alert_type}' page to them"
+        );
+        return false;
     };
     let is_muted = if !channels.muted_types.is_empty() {
         channels
@@ -689,7 +743,7 @@ async fn fanout_to_user(
         tracing::debug!(
             "Alert type '{alert_type}' muted for routed user {user_id} — skipping external channels"
         );
-        return;
+        return true;
     }
     send_notification_with_runbook(
         pool,
@@ -701,6 +755,7 @@ async fn fanout_to_user(
         runbook_url,
     )
     .await;
+    true
 }
 
 /// Check if an alert type is enabled for a user.
@@ -791,22 +846,35 @@ pub async fn get_thresholds(
         if specific.is_some() {
             specific
         } else {
-            sqlx::query_as(
-                "SELECT cpu_threshold, cpu_duration, memory_threshold, memory_duration, \
-                 disk_threshold, cooldown_minutes, ssl_warning_days \
-                 FROM alert_rules WHERE user_id = $1 AND server_id IS NULL",
-            )
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
+            global_thresholds(pool, user_id).await
         }
     } else {
-        None
+        // server_id = None means "the user's global rule" — that is exactly what
+        // check_ssl_expiry asks for (SSL is site-scoped, not server-scoped). This
+        // arm used to return None unconditionally, so the SSL ladder silently ran
+        // on the hardcoded defaults and a user's configured ssl_warning_days was
+        // never read.
+        global_thresholds(pool, user_id).await
     };
 
     row.unwrap_or((90, 5, 90, 5, 85, 60, "30,14,7,3,1".to_string()))
+}
+
+/// The user's server-independent `alert_rules` row (`server_id IS NULL`).
+async fn global_thresholds(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Option<(i32, i32, i32, i32, i32, i32, String)> {
+    sqlx::query_as(
+        "SELECT cpu_threshold, cpu_duration, memory_threshold, memory_duration, \
+         disk_threshold, cooldown_minutes, ssl_warning_days \
+         FROM alert_rules WHERE user_id = $1 AND server_id IS NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Get GPU-specific threshold settings for a user/server.
