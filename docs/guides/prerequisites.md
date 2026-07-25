@@ -210,6 +210,12 @@ Prior to, and distinct from, the destination question — a panel with no enable
 
 The quiet tier. These are the explanations under the fields themselves; where a field has a check behind it, the same concern reappears as a callout when it stops being hypothetical.
 
+### Create your admin account
+
+**Password** — At least 8 characters. This signs you in to the panel itself — not to any site you host with it.
+
+This is the panel's first account and a full administrator: it can reach every site, database and container on this server. There is no password-reset email configured yet, so store it somewhere you trust before continuing. You can add two-factor authentication straight afterwards from Settings.
+
 ### Create a site
 
 **Domain** — Your site's public domain name (e.g. example.com). It needs to point at this server before HTTPS can be issued — DockPanel checks that for you below.

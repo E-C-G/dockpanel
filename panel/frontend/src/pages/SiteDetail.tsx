@@ -131,6 +131,11 @@ export default function SiteDetail() {
 
   // Custom SSL Upload
   const [showSslUpload, setShowSslUpload] = useState(false);
+  // The three specialist certificate routes stay behind a disclosure. Offering
+  // four flat choices — one of them the bare protocol acronym "DNS-01 (CF)" —
+  // asks the operator to pick between mechanisms at exactly the moment they
+  // cannot know which applies (s252 F12).
+  const [showSslOptions, setShowSslOptions] = useState(false);
   const [sslCert, setSslCert] = useState("");
   const [sslKey, setSslKey] = useState("");
   const [uploadingSsl, setUploadingSsl] = useState(false);
@@ -666,7 +671,7 @@ export default function SiteDetail() {
                 </div>
               ) : (
                 <div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-3 flex-wrap">
                     <span className="text-dark-300">Not configured</span>
                     {site.status === "active" && (
                       <>
@@ -676,33 +681,72 @@ export default function SiteDetail() {
                           title={prereqBlocks(dnsPrereq) ? dnsPrereq?.title : undefined}
                           className="px-3 py-1 bg-rust-500 text-white rounded-md text-xs font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
                         >
-                          {provisioning ? "Provisioning..." : "Let's Encrypt"}
+                          {provisioning ? "Securing..." : "Secure this site"}
                         </button>
                         <button
-                          onClick={() => handleProvisionDns01(false)}
-                          disabled={dns01Loading || provisioning}
-                          className="px-3 py-1 bg-accent-500/20 text-accent-400 rounded-md text-xs font-medium hover:bg-accent-500/30 disabled:opacity-50 transition-colors"
-                          title="Uses Cloudflare DNS-01 challenge — works behind CDN or when port 80 is blocked"
+                          type="button"
+                          onClick={() => {
+                            const next = !showSslOptions;
+                            setShowSslOptions(next);
+                            // Collapsing the section must also close the upload
+                            // form it opened, or the textareas stay on screen
+                            // with nothing visible explaining them.
+                            if (!next) setShowSslUpload(false);
+                          }}
+                          aria-expanded={showSslOptions}
+                          className="text-xs text-dark-300 hover:text-dark-100 underline decoration-dotted underline-offset-2 transition-colors"
                         >
-                          {dns01Loading ? "Provisioning..." : "DNS-01 (CF)"}
-                        </button>
-                        <button
-                          onClick={() => handleProvisionDns01(true)}
-                          disabled={dns01Loading || provisioning}
-                          className="px-3 py-1 bg-accent-500/10 text-accent-300 rounded-md text-xs font-medium hover:bg-accent-500/20 disabled:opacity-50 transition-colors"
-                          title="Wildcard SSL (*.domain) via Cloudflare DNS-01 — covers all subdomains"
-                        >
-                          {dns01Loading ? "..." : "Wildcard SSL"}
-                        </button>
-                        <button
-                          onClick={() => setShowSslUpload(!showSslUpload)}
-                          className="px-3 py-1 bg-dark-700 text-dark-100 rounded-md text-xs font-medium hover:bg-dark-600 transition-colors"
-                        >
-                          Upload Custom
+                          Other options
                         </button>
                       </>
                     )}
                   </div>
+                  {site.status === "active" && !showSslOptions && (
+                    <p className="mt-1.5 text-xs text-dark-400">
+                      Issues a free Let&apos;s Encrypt certificate and renews it automatically.
+                    </p>
+                  )}
+                  {site.status === "active" && showSslOptions && (
+                    <div className="mt-3 space-y-2 border-l-2 border-dark-600 pl-3">
+                      <div>
+                        <button
+                          onClick={() => handleProvisionDns01(false)}
+                          disabled={dns01Loading || provisioning}
+                          className="px-3 py-1 bg-accent-500/20 text-accent-400 rounded-md text-xs font-medium hover:bg-accent-500/30 disabled:opacity-50 transition-colors"
+                        >
+                          {dns01Loading ? "Provisioning..." : "Verify via Cloudflare DNS"}
+                        </button>
+                        <p className="mt-1 text-xs text-dark-400">
+                          For when port 80 cannot be reached from the internet. Needs a Cloudflare
+                          API token (DNS-01 challenge).
+                        </p>
+                      </div>
+                      <div>
+                        <button
+                          onClick={() => handleProvisionDns01(true)}
+                          disabled={dns01Loading || provisioning}
+                          className="px-3 py-1 bg-accent-500/10 text-accent-300 rounded-md text-xs font-medium hover:bg-accent-500/20 disabled:opacity-50 transition-colors"
+                        >
+                          {dns01Loading ? "..." : "Wildcard certificate"}
+                        </button>
+                        <p className="mt-1 text-xs text-dark-400">
+                          Covers every subdomain (<span className="font-mono">*.{site.domain}</span>).
+                          Also via Cloudflare DNS.
+                        </p>
+                      </div>
+                      <div>
+                        <button
+                          onClick={() => setShowSslUpload(!showSslUpload)}
+                          className="px-3 py-1 bg-dark-700 text-dark-100 rounded-md text-xs font-medium hover:bg-dark-600 transition-colors"
+                        >
+                          Upload my own certificate
+                        </button>
+                        <p className="mt-1 text-xs text-dark-400">
+                          Paste a certificate and private key you already hold. You renew it yourself.
+                        </p>
+                      </div>
+                    </div>
+                  )}
                   {showSslUpload && (
                     <div className="mt-3 space-y-3">
                       <textarea value={sslCert} onChange={e => setSslCert(e.target.value)}

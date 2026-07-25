@@ -6,6 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.31.0] - 2026-07-25
+
+The first ten minutes with DockPanel. Everything here is something a new operator meets before they
+have any way to know what the product expects of them — the account-creation screen, the checklist,
+the certificate buttons, the dashboard on a box with nothing on it yet.
+
+The headline is a security fix: on the install path the README advertises, the panel used to serve
+the create-your-admin-password form over plain HTTP.
+
+### Security
+
+- **The panel no longer asks for a new admin password over an unencrypted connection.** Installing
+  without a domain left nginx serving the panel on `:8443` as plain HTTP, and the very first screen
+  is the one that asks the operator to choose an administrator password. There is no Let's Encrypt
+  certificate to be had without a domain, so the installer now generates a self-signed one and
+  terminates TLS anyway. The browser warns once, which is a thing an operator can reason about; a
+  credential travelling in the clear is not. As a consequence the session cookie now also gains its
+  `Secure` flag on that path, since the flag follows the connection scheme nginx reports.
+
+### Added
+
+- Visible password guidance on the account-creation screen. The 8-character minimum was previously
+  enforced only by the browser's native validation, which rejects the form without ever explaining
+  the rule. The text comes from the copy registry, so it is in the generated manual too.
+- "Point your domain here" in the Getting Started checklist — the prerequisite that gates HTTPS and
+  every guide that follows, and the one step the list never mentioned.
+
+### Changed
+
+- Creating the first admin account now signs you in, instead of redirecting to the login screen to
+  retype the password you just chose.
+- The site SSL section leads with a single **Secure this site** action. Cloudflare DNS validation,
+  wildcard certificates and custom uploads moved behind "Other options", each with a sentence saying
+  when it applies — replacing four flat buttons, one of which was the bare acronym "DNS-01 (CF)".
+- Restart Nginx / Restart PHP / Reboot no longer appear in the dashboard header on a box with no
+  sites and no apps. The two restarts remain on Diagnostics; Reboot returns whenever the system
+  reports one is actually required.
+- Reserved control-plane domains are now derived from this install's own panel host (`BASE_URL`),
+  plus anything in a new `RESERVED_DOMAINS` variable. The list used to be the hardcoded triple
+  `dockpanel.dev`, `docs.dockpanel.dev`, `panel.example.com` — our marketing domains and a
+  documentation placeholder, compiled into every customer's build, protecting nothing of theirs.
+  Matching is on the exact host, so a panel at an apex no longer blocks its own subdomains.
+
+### Fixed
+
+- The Getting Started checklist counted a step nobody had performed: "Run diagnostics" was hardcoded
+  to complete, so a brand-new box reported 1/5 done with nothing done.
+- `docs/troubleshooting.md` documented removed behaviour, telling operators that the login cookie's
+  `Secure` flag follows `BASE_URL` and that editing it fixes a failed login. That has not been true
+  since the flag was tied to the connection scheme (#71); the advice did nothing.
+- `docs/getting-started.md` sent operators with a domain to `https://your-domain.com:8443`, though a
+  domain install moves the panel to the standard HTTPS port.
+
 ## [2.30.0] - 2026-07-25
 
 The guidance layer stops being four verticals that share a type and becomes one content system. Its

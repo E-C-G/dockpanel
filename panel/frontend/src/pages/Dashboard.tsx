@@ -541,17 +541,30 @@ export default function Dashboard() {
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75a4.5 4.5 0 01-4.884 4.484c-1.076-.091-2.264.071-2.95.904l-7.152 8.684a2.548 2.548 0 11-3.586-3.586l8.684-7.152c.833-.686.995-1.874.904-2.95a4.5 4.5 0 016.336-4.486l-3.276 3.276a3.004 3.004 0 002.25 2.25l3.276-3.276c.256.565.398 1.192.398 1.852z" /></svg>
             Diagnostics
           </Link>
-          {/* Feature #4: Quick Server Actions — hidden on mobile */}
-          <div className="h-4 w-px bg-dark-600 hidden sm:block" />
-          <button onClick={() => setConfirmAction("nginx")} className="hidden sm:inline-block px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
-            Restart Nginx
-          </button>
-          <button onClick={() => setConfirmAction("php")} className="hidden sm:inline-block px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
-            Restart PHP
-          </button>
-          <button onClick={() => setConfirmAction("reboot")} className="hidden sm:inline-block px-2.5 py-1.5 bg-danger-500/10 border border-danger-500/20 rounded-lg text-xs text-danger-400 hover:bg-danger-500/20">
-            Reboot
-          </button>
+          {/* Feature #4: Quick Server Actions — hidden on mobile.
+              Shown only once there is something to restart. On a brand-new box
+              these sat next to "Add Site" as the first thing an operator met,
+              three server-level destructive verbs offered before a single site
+              existed. Restart Nginx / Restart PHP remain available any time from
+              Diagnostics (they post the same restart-service fix); Reboot has no
+              other home, so it also appears whenever the system reports one is
+              actually required. */}
+          {(sites.total > 0 || appCount > 0) && (
+            <>
+              <div className="h-4 w-px bg-dark-600 hidden sm:block" />
+              <button onClick={() => setConfirmAction("nginx")} className="hidden sm:inline-block px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
+                Restart Nginx
+              </button>
+              <button onClick={() => setConfirmAction("php")} className="hidden sm:inline-block px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
+                Restart PHP
+              </button>
+            </>
+          )}
+          {(rebootRequired || sites.total > 0 || appCount > 0) && (
+            <button onClick={() => setConfirmAction("reboot")} className="hidden sm:inline-block px-2.5 py-1.5 bg-danger-500/10 border border-danger-500/20 rounded-lg text-xs text-danger-400 hover:bg-danger-500/20">
+              {rebootRequired ? "Reboot required" : "Reboot"}
+            </button>
+          )}
         </div>
       </div>
 
@@ -675,12 +688,19 @@ export default function Dashboard() {
 
       {/* Getting Started */}
       {isVisible("onboarding") && !dismissed && system && (() => {
+        // Every check must be able to come back FALSE. "Run diagnostics" used to
+        // sit here with `check: () => true`, so a box where nothing had been done
+        // still reported 1/5 — a checklist that counts a step nobody performed
+        // teaches the operator not to trust the other four.
         const steps: OnboardingStep[] = [
           { id: "site", label: "Create your first site", description: "Set up a website with Nginx, PHP, or reverse proxy", link: "/sites", check: () => sites.total > 0 },
+          // The prerequisite that gates everything else, and the one the list
+          // never mentioned. A live certificate is the proof: HTTPS cannot be
+          // issued until the domain actually resolves to this server.
+          { id: "dns", label: "Point your domain here", description: "HTTPS is issued once your domain resolves to this server", link: "/sites", check: () => (intel?.ssl_countdowns.length ?? 0) > 0 },
           { id: "app", label: "Deploy a Docker app", description: "One-click deploy from 151 templates", link: "/apps", check: () => appCount > 0 },
           { id: "2fa", label: "Enable 2FA", description: "Protect your panel with two-factor authentication", link: "/settings", check: () => twoFaEnabled },
           { id: "backup", label: "Set up backups", description: "Schedule recurring backups or run one manually", link: "/backup-orchestrator", check: () => backupSetup.has_schedule || backupSetup.has_backup },
-          { id: "diagnostics", label: "Run diagnostics", description: "Check your server health and fix issues", link: "/diagnostics", check: () => true },
         ];
         const completed = steps.filter(s => s.check()).length;
         const isCollapsed = onboardingCollapsed || (completed >= 3 && localStorage.getItem('dp-onboarding-collapsed') !== '0');

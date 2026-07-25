@@ -32,6 +32,10 @@ DB_PORT=5450
 DB_CONTAINER="dockpanel-postgres"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="ovexro/dockpanel"
+# Set to 1 by configure_nginx when the panel is served over a self-signed
+# certificate (no domain → no Let's Encrypt). print_summary reads it to print
+# the right scheme and explain the browser warning before it happens.
+PANEL_SELF_SIGNED=0
 
 # ── Resolve repo root ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -864,6 +868,65 @@ EOF
     fi
 }
 
+# ── Panel TLS ────────────────────────────────────────────────────────────
+# The panel's very first screen asks the operator to CREATE an admin password.
+# Without a domain there is no Let's Encrypt certificate, and the panel used to
+# serve that screen over plain HTTP — putting the credential on the wire in
+# cleartext on the exact path the README advertises. A self-signed certificate
+# is not a trusted certificate, but a browser warning the operator can reason
+# about beats a password nobody can see leaving the machine.
+detect_server_ip() {
+    curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
+    hostname -I 2>/dev/null | awk '{print $1}' || \
+    echo ""
+}
+
+generate_self_signed_panel_cert() {
+    local ip="$1"
+    local dir="${CONFIG_DIR}/ssl"
+
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+
+    # Idempotent — never clobber a certificate the operator may have replaced
+    # with their own, and never regenerate on a re-run (that would invalidate
+    # the fingerprint anyone has already accepted in their browser).
+    if [ -s "$dir/panel.crt" ] && [ -s "$dir/panel.key" ]; then
+        return 0
+    fi
+
+    # Name every address the panel can actually be reached on, not just the
+    # public one: on a NAT'd or LAN box the operator types the local address,
+    # and a certificate that doesn't name it adds a second, avoidable warning
+    # on top of the untrusted-issuer one.
+    local san="DNS:localhost,IP:127.0.0.1"
+    [ -n "$ip" ] && san="${san},IP:${ip}"
+    local local_ip
+    for local_ip in $(hostname -I 2>/dev/null || true); do
+        # IPv4/IPv6 literals only, and never repeat one already listed.
+        case ",${san}," in
+            *",IP:${local_ip},"*) continue ;;
+        esac
+        san="${san},IP:${local_ip}"
+    done
+
+    # -addext needs OpenSSL 1.1.1+. Every distro we support ships 3.x, but fall
+    # back to a SAN-less certificate rather than dropping to plain HTTP.
+    if openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -subj "/CN=${ip:-dockpanel}" -addext "subjectAltName=${san}" \
+            -keyout "$dir/panel.key" -out "$dir/panel.crt" > /dev/null 2>&1 ||
+       openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -subj "/CN=${ip:-dockpanel}" \
+            -keyout "$dir/panel.key" -out "$dir/panel.crt" > /dev/null 2>&1; then
+        chmod 600 "$dir/panel.key"
+        chmod 644 "$dir/panel.crt"
+        return 0
+    fi
+
+    rm -f "$dir/panel.key" "$dir/panel.crt"
+    return 1
+}
+
 # ── Nginx for Panel ──────────────────────────────────────────────────────
 configure_nginx() {
     header "Configuring Nginx"
@@ -906,6 +969,7 @@ configure_nginx() {
 
     local SERVER_NAME="_"
     local LISTEN_DIRECTIVE="listen ${PANEL_PORT};"
+    local PANEL_TLS_BLOCK=""
     if [ -n "$PANEL_DOMAIN" ]; then
         SERVER_NAME="$PANEL_DOMAIN"
         # Use interface IP to match agent-generated site configs (prevents nginx routing conflicts).
@@ -922,6 +986,28 @@ configure_nginx() {
             LISTEN_DIRECTIVE="listen 80;
     listen [::]:80;"
         fi
+    else
+        # No domain → certbot can't issue. Terminate TLS anyway with a
+        # self-signed certificate so first-boot credentials are encrypted.
+        local IP_FOR_CERT
+        IP_FOR_CERT=$(detect_server_ip)
+        if generate_self_signed_panel_cert "$IP_FOR_CERT"; then
+            PANEL_SELF_SIGNED=1
+            # Same binding as before, now with TLS. Deliberately NOT adding an
+            # [::] listen here: this is the default install path, and a box with
+            # IPv6 disabled would fail to bind and come up with no panel at all.
+            LISTEN_DIRECTIVE="listen ${PANEL_PORT} ssl;"
+            PANEL_TLS_BLOCK="
+    ssl_certificate ${CONFIG_DIR}/ssl/panel.crt;
+    ssl_certificate_key ${CONFIG_DIR}/ssl/panel.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:PanelSSL:1m;
+    ssl_session_timeout 10m;
+"
+        else
+            warn "Could not generate a self-signed certificate — the panel will serve plain HTTP on ${PANEL_PORT}"
+            info "The admin password you create will NOT be encrypted in transit; prefer PANEL_DOMAIN=..."
+        fi
     fi
 
     # Drop-in dir for path-mounted tool reverse-proxies (webmail in v2.8.22+, etc.)
@@ -933,7 +1019,7 @@ configure_nginx() {
 server {
     ${LISTEN_DIRECTIVE}
     server_name ${SERVER_NAME};
-
+${PANEL_TLS_BLOCK}
     client_max_body_size 100M;
 
     # API
@@ -1253,7 +1339,12 @@ F2BEOF
 
 provision_panel_ssl() {
     if [ -z "$PANEL_DOMAIN" ]; then
-        log "No domain set — skipping SSL (access via IP:${PANEL_PORT})"
+        if [ "$PANEL_SELF_SIGNED" = "1" ]; then
+            log "No domain set — serving HTTPS on IP:${PANEL_PORT} with a self-signed certificate"
+            info "Let's Encrypt needs a domain; re-run with PANEL_DOMAIN=... for a trusted certificate"
+        else
+            log "No domain set — panel on IP:${PANEL_PORT} (plain HTTP)"
+        fi
         return
     fi
 
@@ -1278,9 +1369,8 @@ print_summary() {
     INSTALL_DONE=1
 
     local SERVER_IP
-    SERVER_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
-                hostname -I 2>/dev/null | awk '{print $1}' || \
-                echo "YOUR_SERVER_IP")
+    SERVER_IP=$(detect_server_ip)
+    SERVER_IP="${SERVER_IP:-YOUR_SERVER_IP}"
 
     local elapsed_total=$(( $(date +%s) - SETUP_START ))
     local mins=$((elapsed_total / 60))
@@ -1298,11 +1388,21 @@ print_summary() {
     fi
     if [ -n "$PANEL_DOMAIN" ]; then
         echo -e "  ${BOLD}Panel URL:${NC}      https://${PANEL_DOMAIN}"
+    elif [ "$PANEL_SELF_SIGNED" = "1" ]; then
+        echo -e "  ${BOLD}Panel URL:${NC}      https://${SERVER_IP}:${PANEL_PORT}"
     else
         echo -e "  ${BOLD}Panel URL:${NC}      http://${SERVER_IP}:${PANEL_PORT}"
     fi
     echo ""
     echo -e "  ${BOLD}First step:${NC}     Open the URL and create your admin account"
+    if [ "$PANEL_SELF_SIGNED" = "1" ]; then
+        echo ""
+        echo -e "  ${DIM}Your browser will warn once about the certificate — that is expected${NC}"
+        echo -e "  ${DIM}for an IP address. It is self-signed, and it is there so the admin${NC}"
+        echo -e "  ${DIM}password you are about to create is encrypted on the way to the server.${NC}"
+        echo -e "  ${DIM}For a trusted certificate: point a domain here, then re-run with${NC}"
+        echo -e "  ${DIM}PANEL_DOMAIN=your.domain bash /opt/dockpanel/scripts/setup.sh${NC}"
+    fi
     echo ""
     echo -e "  ${BOLD}CLI:${NC}            dockpanel status"
     echo -e "                  dockpanel diagnose"
@@ -1429,7 +1529,7 @@ main() {
     if [ -z "$PANEL_DOMAIN" ]; then
         echo ""
         echo -e "${BOLD}Enter your panel domain (e.g. panel.example.com)${NC}"
-        echo -e "Leave blank to access via IP:${PANEL_PORT} instead"
+        echo -e "Leave blank to use IP:${PANEL_PORT} with a self-signed certificate instead"
         echo -e "${BOLD}Tip:${NC} set PANEL_DOMAIN=... in the environment to skip this prompt"
         echo -n "> "
         if [ -t 0 ]; then

@@ -17,6 +17,13 @@ export interface FieldGuidance {
 }
 
 export const FIELD_GUIDANCE = {
+  "setup.admin_password": {
+    surface: "Create your admin account",
+    label: "Password",
+    help: "At least 8 characters. This signs you in to the panel itself — not to any site you host with it.",
+    more: "This is the panel's first account and a full administrator: it can reach every site, database and container on this server. There is no password-reset email configured yet, so store it somewhere you trust before continuing. You can add two-factor authentication straight afterwards from Settings.",
+    escalatesTo: "",
+  },
   "sites.create.domain": {
     surface: "Create a site",
     label: "Domain",

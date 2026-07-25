@@ -94,15 +94,75 @@ pub fn is_valid_domain(domain: &str) -> bool {
     }) && domain.contains('.')
 }
 
-/// Reserved panel/control-plane domains that a tenant must never be able to
-/// claim, alias onto, clone onto, or rename onto. Mirrors the list `create()`
-/// enforces (routes/sites.rs) — factored out so every domain-introducing path
-/// (create / clone / rename / add_alias) shares ONE guard and cannot drift.
-/// Matches an exact domain or any subdomain of a reserved zone.
+/// Reserved control-plane domains that a tenant must never be able to claim,
+/// alias onto, clone onto, or rename onto. Factored out so every
+/// domain-introducing path (create / clone / rename / add_alias) shares ONE
+/// guard and cannot drift.
+///
+/// The list is derived from THIS install, not from the vendor. Until v2.31.0 it
+/// was the hardcoded triple `["dockpanel.dev","panel.example.com",
+/// "docs.dockpanel.dev"]` — our own marketing domains plus a documentation
+/// placeholder, compiled into every customer's build, where they protect
+/// nothing and merely refuse three arbitrary names (s252 F9).
+///
+/// What actually needs protecting is the host the panel itself is served on:
+/// that is the vhost a tenant site would collide with, letting them take over
+/// the panel's `server_name` and phish the admin login (the s241 squat).
+///
+/// **Exact host only, deliberately.** The panel session cookie is host-scoped
+/// (no `Domain=` attribute — see `auth::cookie_secure_flag`'s neighbours), so a
+/// subdomain cannot read it and does not collide with the panel's server_name.
+/// Reserving subdomains here would instead break the ordinary case of a panel
+/// at an apex: an operator running the panel on `example.com` must still be
+/// able to host `blog.example.com`.
+///
+/// `RESERVED_DOMAINS` (comma-separated) lets an operator reserve additional
+/// zones; those DO match subdomains, because naming a zone means the zone.
 pub fn is_reserved_domain(domain: &str) -> bool {
-    const RESERVED: [&str; 3] = ["dockpanel.dev", "panel.example.com", "docs.dockpanel.dev"];
+    static RESERVED: std::sync::OnceLock<(Option<String>, Vec<String>)> = std::sync::OnceLock::new();
+    let (panel_host, zones) = RESERVED.get_or_init(|| {
+        let panel_host = panel_host_from_base_url(&std::env::var("BASE_URL").unwrap_or_default());
+        let zones = std::env::var("RESERVED_DOMAINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (panel_host, zones)
+    });
+
+    reserved_match(domain, panel_host.as_deref(), zones)
+}
+
+/// Extract the bare host from `BASE_URL` as setup.sh writes it
+/// (`https://panel.example.com`, or empty on a domainless install). Only the
+/// host is read — never the scheme, which does not describe how the vhost is
+/// actually served (see the warning above `auth::cookie_secure_flag`).
+fn panel_host_from_base_url(base: &str) -> Option<String> {
+    let b = base.trim().to_lowercase();
+    let hostport = b
+        .strip_prefix("https://")
+        .or_else(|| b.strip_prefix("http://"))
+        .unwrap_or(&b);
+    let host = hostport.split('/').next().unwrap_or("");
+    // Strip a :port, but never mangle a bare IPv6 literal.
+    let host = if host.starts_with('[') {
+        host.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The pure decision, split out so it is testable without touching process env
+/// (a `OnceLock` initialised from env can only ever be observed once per test
+/// binary, so the branches below would otherwise be unreachable from a test).
+fn reserved_match(domain: &str, panel_host: Option<&str>, zones: &[String]) -> bool {
     let d = domain.trim().to_lowercase();
-    RESERVED
+    if panel_host.is_some_and(|h| h == d) {
+        return true;
+    }
+    zones
         .iter()
         .any(|r| d == *r || d.ends_with(&format!(".{r}")))
 }
@@ -384,15 +444,65 @@ mod tests {
 
     #[test]
     fn reserved_domains_rejected() {
-        assert!(is_reserved_domain("dockpanel.dev"));
-        assert!(is_reserved_domain("docs.dockpanel.dev"));
-        assert!(is_reserved_domain("anything.dockpanel.dev")); // subdomain
-        assert!(is_reserved_domain("DOCKPANEL.DEV")); // case-insensitive
-        assert!(is_reserved_domain("panel.example.com"));
+        let panel = Some("panel.example.com");
+        let none: &[String] = &[];
+
+        // The squat s241 closed: a tenant claiming the panel's own vhost.
+        assert!(reserved_match("panel.example.com", panel, none));
+        assert!(reserved_match("PANEL.EXAMPLE.COM", panel, none)); // case-insensitive
+        assert!(reserved_match("  panel.example.com  ", panel, none)); // trimmed
+
         // Legitimate tenant domains are allowed.
-        assert!(!is_reserved_domain("example.com"));
-        assert!(!is_reserved_domain("dockpanel.dev.evil.com")); // not a suffix match
-        assert!(!is_reserved_domain("notdockpanel.dev")); // no leading dot
+        assert!(!reserved_match("example.com", panel, none));
+        assert!(!reserved_match("panel.example.com.evil.com", panel, none)); // not a suffix match
+        assert!(!reserved_match("notpanel.example.com", panel, none));
+
+        // Exact host only: an operator whose panel is at the apex must still be
+        // able to host ordinary subdomains. The session cookie is host-scoped,
+        // so a subdomain neither collides nor inherits the session.
+        let apex = Some("example.com");
+        assert!(reserved_match("example.com", apex, none));
+        assert!(!reserved_match("blog.example.com", apex, none));
+
+        // A domainless install (BASE_URL empty) reserves nothing — the panel is
+        // on its own port, so no site vhost can collide with it.
+        assert!(!reserved_match("anything.example.com", None, none));
+
+        // Operator-declared zones DO match subdomains: naming a zone means the zone.
+        let zones = vec!["internal.corp".to_string()];
+        assert!(reserved_match("internal.corp", None, &zones));
+        assert!(reserved_match("vpn.internal.corp", None, &zones));
+        assert!(!reserved_match("internal.corp.evil.com", None, &zones));
+        assert!(!reserved_match("notinternal.corp", None, &zones));
+    }
+
+    #[test]
+    fn panel_host_parsed_from_every_base_url_shape() {
+        // The shapes setup.sh and the settings UI actually produce.
+        assert_eq!(
+            panel_host_from_base_url("https://panel.example.com").as_deref(),
+            Some("panel.example.com")
+        );
+        assert_eq!(
+            panel_host_from_base_url("http://192.168.1.1:8443").as_deref(),
+            Some("192.168.1.1")
+        );
+        assert_eq!(
+            panel_host_from_base_url("https://panel.example.com:8443/").as_deref(),
+            Some("panel.example.com")
+        );
+        assert_eq!(
+            panel_host_from_base_url("HTTPS://Panel.Example.COM").as_deref(),
+            Some("panel.example.com")
+        );
+        assert_eq!(
+            panel_host_from_base_url("https://[2001:db8::1]:8443").as_deref(),
+            Some("2001:db8::1")
+        );
+        // A domainless install writes BASE_URL= (empty) — must yield no host,
+        // NOT an empty string that would then match a trimmed empty domain.
+        assert_eq!(panel_host_from_base_url(""), None);
+        assert_eq!(panel_host_from_base_url("   "), None);
     }
 
     // ── add_header value validation — s241 C1 ───────────────────────────

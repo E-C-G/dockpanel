@@ -1,9 +1,12 @@
 import { useState, FormEvent } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { api, ApiError } from "../api";
+import { useAuth } from "../context/AuthContext";
+import { FieldHelp } from "../components/FieldHelp";
 
 export default function Setup() {
   const navigate = useNavigate();
+  const { login } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -26,13 +29,29 @@ export default function Setup() {
     setSubmitting(true);
     try {
       await api.post("/auth/setup", { email, password });
-      navigate("/login");
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) {
         setError("Setup already completed. Please log in.");
       } else {
         setError(err instanceof Error ? err.message : "Setup failed");
       }
+      setSubmitting(false);
+      return;
+    }
+
+    // The account exists. Sign in with the credentials already in hand rather
+    // than bouncing to /login to retype what was just chosen — going through
+    // the ordinary `login` path means the session cookie and the auth context
+    // are established exactly as they are everywhere else.
+    try {
+      const challenge = await login(email, password);
+      // A brand-new account cannot have 2FA yet, but never assume a branch is
+      // unreachable: hand it to the login screen, which knows how to finish.
+      navigate(challenge ? "/login" : "/");
+    } catch {
+      // The account was created — that part succeeded and must not be reported
+      // as a failure. Only the convenience step didn't.
+      navigate("/login");
     } finally {
       setSubmitting(false);
     }
@@ -85,6 +104,7 @@ export default function Setup() {
               minLength={8}
               className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none transition-shadow text-sm"
             />
+            <FieldHelp id="setup.admin_password" />
           </div>
 
           <div>

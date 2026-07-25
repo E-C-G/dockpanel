@@ -30,7 +30,10 @@
 curl -sL https://dockpanel.dev/install.sh | sudo bash
 ```
 
-Open `http://YOUR_SERVER_IP:8443`, create your admin account, done.
+Open `https://YOUR_SERVER_IP:8443`, create your admin account, done. Without a domain the
+panel serves a self-signed certificate, so your browser warns once — it is there so the
+admin password you create is encrypted on the way to the server. Point a domain at the box
+and pass `PANEL_DOMAIN=your.domain` to get a trusted Let's Encrypt certificate instead.
 
 Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, Fedora 39+, Amazon Linux 2023. x86_64 and ARM64.
 

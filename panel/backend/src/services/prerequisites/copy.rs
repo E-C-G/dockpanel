@@ -942,6 +942,21 @@ pub static PREREQS: &[&Prereq] = &[
 /// which is the same test that decides whether something deserves a check.
 pub static FIELDS: &[Field] = &[
     Field {
+        id: "setup.admin_password",
+        surface: "Create your admin account",
+        label: "Password",
+        // The very first field a new operator ever types into. The 8-character
+        // rule was previously enforced only by the browser's native minLength,
+        // which rejects the form before any of our own text can explain why.
+        help: "At least 8 characters. This signs you in to the panel itself — not to any site \
+               you host with it.",
+        more: "This is the panel's first account and a full administrator: it can reach every \
+               site, database and container on this server. There is no password-reset email \
+               configured yet, so store it somewhere you trust before continuing. You can add \
+               two-factor authentication straight afterwards from Settings.",
+        escalates_to: "",
+    },
+    Field {
         id: "sites.create.domain",
         surface: "Create a site",
         label: "Domain",

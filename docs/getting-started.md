@@ -50,12 +50,16 @@ sudo bash scripts/setup.sh
 
 ## First Login
 
-1. Open your browser and go to `http://YOUR_SERVER_IP:8443`
-2. You will see the account creation screen
-3. Enter your email and password to create the admin account
-4. You are now logged in to the DockPanel dashboard
+1. Open your browser and go to `https://YOUR_SERVER_IP:8443`
+2. Your browser warns about the certificate — expected, and safe to continue. Without a
+   domain there is no way to obtain a trusted certificate, so the installer generates a
+   self-signed one rather than serving the account-creation form over plain HTTP
+3. You will see the account creation screen
+4. Enter your email and password to create the admin account
+5. You are signed in to the DockPanel dashboard
 
-If you have a domain pointed to your server, you can access the panel at `https://your-domain.com:8443` after SSL is configured.
+If you installed with `PANEL_DOMAIN=your-domain.com`, the panel is at `https://your-domain.com`
+on the standard HTTPS port with a trusted Let's Encrypt certificate, and none of the above applies.
 
 ## First Steps
 

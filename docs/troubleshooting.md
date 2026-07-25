@@ -79,21 +79,24 @@ journalctl -u dockpanel-api -n 50 --no-pager
 
 ### Can't login from browser (cookie not set)
 
-**Cause**: The panel is accessed over HTTP, but the login cookie has the `Secure` flag set (only sent over HTTPS).
+**Cause**: The login cookie carries the `Secure` flag, which browsers only return over HTTPS, while the panel is being served over plain HTTP.
 
-**Fix**: Set the `BASE_URL` in the API configuration to match how you access the panel:
+**Fix**: serve the panel over HTTPS — `BASE_URL` has nothing to do with it.
 
-```bash
-# Edit /etc/dockpanel/api.env
-BASE_URL=http://YOUR_SERVER_IP:8443
+The `Secure` flag is decided by the scheme nginx reports for the actual connection
+(`X-Forwarded-Proto`), not by any setting. Keying it off `BASE_URL` was the cause of issue
+#71 and was removed: `BASE_URL` is `https://<domain>` as soon as a domain is configured,
+which forced a `Secure` cookie the browser then dropped whenever the vhost was still
+answering over HTTP. Editing `BASE_URL` will not change the cookie.
 
-# Restart the API
-systemctl restart dockpanel-api
-```
+Installs from v2.31.0 onward do not hit this: with a domain the panel gets a Let's Encrypt
+certificate, and without one it gets a self-signed certificate, so the panel is served over
+HTTPS either way. If you are on an older install serving plain HTTP, either re-run the
+installer with `PANEL_DOMAIN=your.domain`, or put a certificate in front of the panel vhost
+(`/etc/nginx/sites-available/dockpanel-panel`).
 
-If you access the panel via HTTPS, set `BASE_URL=https://panel.example.com:8443`.
-
-The cookie's `Secure` flag is automatically set based on the `BASE_URL` scheme. If `BASE_URL` starts with `http://`, the `Secure` flag is omitted, allowing login over plain HTTP.
+`BASE_URL` is still worth setting correctly — it is what the panel uses to build links in
+outgoing notifications and runbooks — it simply is not what gates the cookie.
 
 ---
 
