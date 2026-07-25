@@ -6,6 +6,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.28.0] - 2026-07-25
+
+First slice of the guidance layer, plus the backend-correctness cluster found alongside it. Both come
+from a behavioural audit that installed v2.27.0 on a genuinely fresh box with the public one-liner and
+drove the real flows, rather than reading the source.
+
+The theme is silence. In every case below, DockPanel already knew what was wrong — and said nothing
+where the user was looking.
+
+### Added — the prerequisite layer
+
+- **A shared prerequisite checker** (`services/prerequisites.rs`). Features declare what must already
+  be true; the checker returns structured results — state, severity, what was expected, what was
+  observed, and the exact record to fix it — instead of a prose sentence at one call site. Severity is
+  chosen by consequence: *blocking* only when the action genuinely cannot succeed, *warning* when it
+  probably won't, *info* otherwise.
+- **`GET /api/preflight/dns`** and **`GET /api/sites/{id}/preflight`** expose it.
+- **A three-tier renderer** (`components/Prerequisite.tsx`) — passive helper text, a reactive callout
+  carrying detected-vs-expected plus "Check again", or a blocking gate — and a DNS record card that
+  shows the record to create with its values filled in and every field copyable, rather than describing
+  one. It re-checks in the background while a prerequisite is unmet, so a gate opens by itself once DNS
+  propagates instead of leaving the user to guess when to retry.
+- **The create-site form now checks the domain as it is typed.** It never blocks creation — a site is
+  legitimately created before its DNS exists — but the prerequisite is stated up front instead of
+  surfacing later as an unexplained missing certificate.
+
+### Fixed — the silence
+
+- **Clicking "Let's Encrypt" on a domain that doesn't resolve appeared to do nothing at all.** The
+  server returned a precise 412 naming the domain, the client received it and stored it correctly — and
+  then rendered it at the very bottom of the page, roughly 1,400 lines of markup below the button that
+  had been pressed. The message now renders beside the button, with the prerequisite callout under it.
+- **"Provisioning complete" was reported for provisioning that had failed.** The terminal step was
+  emitted unconditionally: after a CMS install that errored on the line above, and for non-CMS sites on
+  a flat 12-second timer while auto-SSL was still retrying behind it at 30s, 120s and 300s. The terminal
+  step now reports the real outcome, including "Site created — HTTPS not configured" and why.
+- **The auto-generated WordPress admin password was generated, used, and discarded.** The field offers
+  "Auto-generated if blank", so a user who took that at its word could not log into the site they had
+  just created — while the vault auto-created for that site sat empty. Generated credentials are now
+  stored in that vault (encrypted with the key the Secrets Manager reads), and a password DockPanel
+  generated is shown once at creation with the rest of the provisioning output.
+- **The Let's Encrypt account contact was silently the operator's panel login address, unvalidated.**
+  Registering the panel as, say, `admin@box.test` made the CA reject the contact, so every certificate
+  failed — with no reason in the UI and none in `journalctl` either, after four silent retries. The
+  address is now validated against what the CA actually accepts, a panel-wide **ACME Contact** setting
+  can supply a usable address without changing anyone's login, and the reason is stated in Settings and
+  in the provisioning output.
+- **Certificate expiry was never recorded, on any code path.** The agent reports expiry via the `time`
+  crate's formatting (`2026-10-23 09:41:07.0 +00:00:00`); all five panel-side parsers expected a literal
+  `UTC` suffix, so every parse failed silently and `sites.ssl_expiry` stayed NULL forever. That starved
+  the dashboard SSL countdown, the ARI renewal bookkeeping, and — because its query is
+  `WHERE ssl_enabled = TRUE AND ssl_expiry IS NOT NULL` — the entire SSL-expiry alert ladder, which
+  therefore had never fired for any site. All five now share one tolerant parser, pinned by tests.
+- **Per-site PHP-FPM pools were never created on a fresh install.** The agent unit runs
+  `ProtectSystem=strict` and `/etc/php` was missing from its `ReadWritePaths`, while three code paths
+  write pool configs there. Every site silently shared the stock `www` pool, voiding the per-site "PHP
+  Memory" and "PHP Workers" limits the UI advertises with an Apply Limits button, and the per-site
+  process isolation with them. Sites still served traffic, so nothing surfaced it.
+
+### Changed
+
+- **The SSL DNS guard now refuses only what will actually fail.** It previously refused whenever a
+  domain did not resolve to this exact address — which includes every Cloudflare-proxied domain. The
+  audit drove a proxied domain end to end and issuance *succeeded*, because Cloudflare forwards the
+  ACME challenge to the origin. That case is now a warning the user can proceed past; a domain that
+  resolves to nothing at all is still refused.
+
 ## [2.27.0] - 2026-07-25
 
 Alert-engine reliability and cross-tenant isolation — Tag 2 of the monitoring/alerting/incidents audit

@@ -97,43 +97,36 @@ pub async fn provision(
         ));
     }
 
-    // DNS pre-flight: verify domain resolves to this server before ACME HTTP-01
-    let server_ip = crate::helpers::detect_public_ip().await;
-    if !server_ip.is_empty() {
-        let lookup_host = format!("{}:80", site.domain);
-        match tokio::net::lookup_host(&lookup_host).await {
-            Ok(addrs) => {
-                let resolved_ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-                if !resolved_ips.iter().any(|ip| ip == &server_ip) {
-                    return Err(err(
-                        StatusCode::PRECONDITION_FAILED,
-                        &format!(
-                            "Domain {} does not resolve to this server ({}). DNS points to: {}. \
-                             Fix DNS before provisioning SSL.",
-                            site.domain, server_ip, resolved_ips.join(", ")
-                        ),
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(err(
-                    StatusCode::PRECONDITION_FAILED,
-                    &format!(
-                        "Domain {} could not be resolved. Ensure DNS is configured before provisioning SSL.",
-                        site.domain
-                    ),
-                ));
-            }
-        }
+    // DNS pre-flight, via the shared prerequisite checker — the SAME call the
+    // create-site form and the SSL panel use to render their guidance, so what we
+    // enforce here and what we advised there can never drift apart.
+    //
+    // Only a *blocking* verdict refuses. That is a deliberate narrowing of the
+    // pre-v2.28.0 guard, which refused whenever the domain didn't resolve to this
+    // exact IP: the s252 audit drove a Cloudflare-proxied domain end to end and
+    // issuance SUCCEEDED, because Cloudflare forwards the ACME challenge to the
+    // origin. Such a domain resolves to Cloudflare's addresses, so the old guard
+    // would have refused a configuration that demonstrably works. It now warns
+    // (rendered as a callout) and lets the order proceed; only a domain that
+    // resolves to nothing at all — where HTTP-01 cannot possibly complete — is
+    // still refused.
+    let dns = crate::services::prerequisites::check_dns_points_here(&site.domain).await;
+    if dns.blocks() {
+        return Err(err(StatusCode::PRECONDITION_FAILED, &dns.detail));
     }
 
-    // Get admin email for ACME registration
+    // Get admin email for ACME registration. Validated first — an address in a
+    // reserved TLD makes the CA refuse the account contact, and that failure is
+    // invisible everywhere downstream (s252 F4).
     let (email,): (String,) =
         sqlx::query_as("SELECT email FROM users WHERE id = $1")
             .bind(claims.sub)
             .fetch_one(&state.db)
             .await
             .map_err(|e| internal_error("provision", e))?;
+    let email = resolve_acme_contact(&state.db, &email)
+        .await
+        .map_err(|e| err(StatusCode::PRECONDITION_FAILED, &e))?;
 
     let profile = resolve_profile(&state.db, q.profile.as_deref()).await;
 
@@ -167,8 +160,7 @@ pub async fn provision(
     let ssl_expiry = result
         .get("expiry")
         .and_then(|v| v.as_str())
-        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f UTC").ok())
-        .map(|dt| dt.and_utc());
+        .and_then(crate::helpers::parse_agent_cert_expiry);
 
     if ssl_expiry.is_none() {
         tracing::warn!(
@@ -304,6 +296,9 @@ pub async fn provision_dns01(
         .fetch_one(&state.db)
         .await
         .map_err(|e| internal_error("dns01 email", e))?;
+    let email = resolve_acme_contact(&state.db, &email)
+        .await
+        .map_err(|e| err(StatusCode::PRECONDITION_FAILED, &e))?;
 
     // For wildcard, provision against the zone domain
     // For single domain, provision against the site domain
@@ -339,8 +334,7 @@ pub async fn provision_dns01(
     let ssl_expiry = result
         .get("expiry")
         .and_then(|v| v.as_str())
-        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f UTC").ok())
-        .map(|dt| dt.and_utc());
+        .and_then(crate::helpers::parse_agent_cert_expiry);
 
     let cert_path = result.get("cert_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let key_path = result.get("key_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -377,6 +371,51 @@ pub async fn provision_dns01(
         "wildcard": wildcard,
         "ssl_enabled": true,
         "expiry": ssl_expiry,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PreflightQuery {
+    pub domain: String,
+}
+
+/// GET /api/preflight/dns?domain=… — Evaluate the DNS prerequisite for a domain.
+///
+/// The create-site form calls this before the user commits, and the SSL panel
+/// calls it to explain a gated button. Same checker the provision guard below
+/// uses, so the advice and the enforcement cannot disagree.
+pub async fn preflight_dns(
+    _auth: AuthUser,
+    Query(q): Query<PreflightQuery>,
+) -> Json<crate::services::prerequisites::PrereqResult> {
+    Json(crate::services::prerequisites::check_dns_points_here(&q.domain).await)
+}
+
+/// GET /api/sites/{id}/preflight — Evaluate an existing site's prerequisites.
+pub async fn preflight_site(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain,): (String,) =
+        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(claims.sub)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("site preflight", e))?
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    let dns = crate::services::prerequisites::check_dns_points_here(&domain).await;
+    // The ACME contact is a prerequisite for issuance too, and it is the one the
+    // user cannot discover by looking at their DNS.
+    let contact = resolve_acme_contact(&state.db, &claims.email).await;
+
+    Ok(Json(serde_json::json!({
+        "domain": domain,
+        "dns": dns,
+        "acme_contact_ok": contact.is_ok(),
+        "acme_contact_problem": contact.as_ref().err(),
     })))
 }
 
@@ -433,6 +472,9 @@ pub async fn renew(
         .fetch_one(&state.db)
         .await
         .map_err(|e| internal_error("ssl renew email", e))?;
+    let email = resolve_acme_contact(&state.db, &email)
+        .await
+        .map_err(|e| err(StatusCode::PRECONDITION_FAILED, &e))?;
 
     let mut agent_body = serde_json::json!({
         "email": email,
@@ -460,8 +502,7 @@ pub async fn renew(
     // Update expiry from the renew response and clear stale ARI hints so
     // the next auto-heal cycle refetches them.
     if let Some(expiry_str) = result.get("expiry").and_then(|v| v.as_str()) {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(expiry_str, "%Y-%m-%d %H:%M:%S%.f UTC") {
-            let expiry = dt.and_utc();
+        if let Some(expiry) = crate::helpers::parse_agent_cert_expiry(expiry_str) {
             let _ = sqlx::query(
                 "UPDATE sites SET ssl_expiry = $1, ssl_renewal_at = NULL, \
                  ssl_renewal_checked_at = NULL, updated_at = NOW() WHERE id = $2",
@@ -557,10 +598,102 @@ pub async fn profiles(
     .await
     .map_err(|e| internal_error("read default profile", e))?;
 
+    let contact_email = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'acme_contact_email'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("read acme contact", e))?;
+
+    // Tell the operator, up front, which address will actually reach the CA and
+    // whether their own is usable — the whole point of F4 is that this was
+    // invisible until every certificate had already failed.
+    let effective = resolve_acme_contact(&state.db, &claims.email).await;
+
     Ok(Json(serde_json::json!({
         "profiles": list,
         "default": default,
+        "contact_email": contact_email,
+        "login_email": claims.email,
+        "login_email_usable": validate_acme_contact(&claims.email).is_ok(),
+        "effective_contact": effective.as_ref().ok(),
+        "contact_problem": effective.as_ref().err(),
     })))
+}
+
+/// GET /api/ssl/contact-email — Report the ACME contact situation.
+///
+/// Deliberately does NOT touch the agent, unlike `profiles` above. The whole
+/// point of this surface is to be readable when issuance is broken, and a bad
+/// contact is one of the reasons the agent's ACME directory call fails — putting
+/// it behind that call would hide it exactly when it is needed.
+pub async fn get_contact_email(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let contact_email = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'acme_contact_email'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("read acme contact", e))?;
+
+    let effective = resolve_acme_contact(&state.db, &claims.email).await;
+
+    Ok(Json(serde_json::json!({
+        "contact_email": contact_email,
+        "login_email": claims.email,
+        "login_email_usable": validate_acme_contact(&claims.email).is_ok(),
+        "effective_contact": effective.as_ref().ok(),
+        "contact_problem": effective.as_ref().err(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct ContactEmailReq {
+    pub email: Option<String>,
+}
+
+/// POST /api/ssl/contact-email — Set the panel-wide fallback ACME contact.
+///
+/// Used when the operator's own login address cannot be a Let's Encrypt contact
+/// (a reserved TLD, a typo). Pass `{"email": null}` to clear it.
+pub async fn set_contact_email(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    Json(body): Json<ContactEmailReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match body.email.as_deref().map(str::trim) {
+        Some(e) if !e.is_empty() => {
+            // Validate before storing: a rescue address that is itself invalid
+            // would just move the silent failure one level down.
+            validate_acme_contact(e)
+                .map_err(|msg| err(StatusCode::BAD_REQUEST, &msg))?;
+            sqlx::query(
+                "INSERT INTO settings (key, value) VALUES ('acme_contact_email', $1) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+            )
+            .bind(e)
+            .execute(&state.db)
+            .await
+            .map_err(|e| internal_error("set acme contact", e))?;
+        }
+        _ => {
+            sqlx::query("DELETE FROM settings WHERE key = 'acme_contact_email'")
+                .execute(&state.db)
+                .await
+                .map_err(|e| internal_error("clear acme contact", e))?;
+        }
+    }
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "ssl.contact_email",
+        None, None,
+        Some(&format!("email={:?}", body.email)),
+        None,
+    ).await;
+
+    Ok(Json(serde_json::json!({ "ok": true, "contact_email": body.email })))
 }
 
 #[derive(Deserialize)]
@@ -605,6 +738,151 @@ pub async fn set_default_profile(
         "ok": true,
         "default": body.profile,
     })))
+}
+
+/// Top-level labels reserved by RFC 2606 / RFC 6761 / RFC 8375, plus the
+/// conventional private-network ones. None of these appear on the Public Suffix
+/// List, so Let's Encrypt refuses an account contact in any of them with
+/// `contact email has invalid domain: Domain name does not end with a valid
+/// public suffix`.
+const NON_PUBLIC_TLDS: &[&str] = &[
+    "test", "local", "localhost", "internal", "invalid", "example",
+    "localdomain", "lan", "home", "corp", "intranet", "private", "arpa", "onion",
+];
+
+/// Check that an address is usable as an ACME account contact.
+///
+/// This is deliberately not a general-purpose email validator — it only rejects
+/// what Let's Encrypt itself rejects, so we never refuse an address the CA would
+/// have accepted.
+pub(crate) fn validate_acme_contact(email: &str) -> Result<(), String> {
+    let email = email.trim();
+    if email.is_empty() {
+        return Err("no contact address is set".to_string());
+    }
+
+    let mut parts = email.split('@');
+    let local = parts.next().unwrap_or("");
+    let domain = parts.next().unwrap_or("");
+    if local.is_empty() || domain.is_empty() || parts.next().is_some() {
+        return Err(format!("\"{email}\" is not a valid email address"));
+    }
+
+    if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
+        return Err(format!(
+            "\"{email}\" has no valid public domain — Let's Encrypt will reject it as a contact address"
+        ));
+    }
+
+    let tld = domain.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(format!(
+            "\"{email}\" has no valid public domain — Let's Encrypt will reject it as a contact address"
+        ));
+    }
+    if NON_PUBLIC_TLDS.contains(&tld.as_str()) {
+        return Err(format!(
+            "\"{email}\" uses the reserved .{tld} domain, which Let's Encrypt rejects as a contact address"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Resolve the Let's Encrypt account contact for an issuance.
+///
+/// The panel used to hand `claims.email` straight to the agent, unvalidated. An
+/// operator who registered the panel with e.g. `admin@dockpanel.test` therefore
+/// had EVERY certificate fail at the CA with a contact-validation error that
+/// surfaced neither in the UI nor in `journalctl` — four silent retries, then a
+/// permanent give-up (s252 F4).
+///
+/// Order: the user's own address when it is usable, otherwise the panel-wide
+/// `acme_contact_email` setting as a rescue. Keeping the user's address first
+/// means installs that already work are completely unaffected.
+pub(crate) async fn resolve_acme_contact(
+    pool: &sqlx::PgPool,
+    user_email: &str,
+) -> Result<String, String> {
+    let user_err = match validate_acme_contact(user_email) {
+        Ok(()) => return Ok(user_email.trim().to_string()),
+        Err(e) => e,
+    };
+
+    let fallback = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'acme_contact_email'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty());
+
+    match fallback {
+        Some(addr) if validate_acme_contact(&addr).is_ok() => Ok(addr.trim().to_string()),
+        _ => Err(format!(
+            "Cannot request a certificate: {user_err}. \
+             Set a valid contact address under Settings → SSL (ACME contact email), \
+             or sign in with an account whose email uses a real domain."
+        )),
+    }
+}
+
+#[cfg(test)]
+mod acme_contact_tests {
+    use super::validate_acme_contact;
+
+    /// The exact address that broke every issuance on the s252 audit box.
+    #[test]
+    fn rejects_the_address_that_broke_the_audit_box() {
+        let e = validate_acme_contact("admin@dockpanel.test").unwrap_err();
+        assert!(e.contains(".test"), "error must name the offending TLD: {e}");
+    }
+
+    #[test]
+    fn rejects_the_other_reserved_tlds() {
+        for addr in [
+            "a@box.local",
+            "a@box.internal",
+            "a@box.localhost",
+            "a@box.invalid",
+            "a@host.example",
+            "a@box.lan",
+            "a@box.home",
+            "a@box.corp",
+        ] {
+            assert!(validate_acme_contact(addr).is_err(), "{addr} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_addresses() {
+        for addr in ["", "   ", "admin", "admin@", "@example.com", "a@b@c.com", "admin@localhost"] {
+            assert!(validate_acme_contact(addr).is_err(), "{addr:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_a_bare_or_numeric_tld() {
+        assert!(validate_acme_contact("admin@example.c").is_err());
+        assert!(validate_acme_contact("admin@example.123").is_err());
+        assert!(validate_acme_contact("admin@.com").is_err());
+        assert!(validate_acme_contact("admin@example.").is_err());
+    }
+
+    /// The guard must not be stricter than the CA — these all issue fine today.
+    #[test]
+    fn accepts_real_addresses() {
+        for addr in [
+            "admin@example.com",
+            "admin@example.dev",
+            "someone+le@example.co.uk",
+            "a.b-c_d@sub.domain.io",
+            "  spaced@example.com  ",
+        ] {
+            assert!(validate_acme_contact(addr).is_ok(), "{addr} must be accepted");
+        }
+    }
 }
 
 /// Resolve the profile to use for an operation: explicit override > stored

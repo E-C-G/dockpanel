@@ -677,8 +677,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
                 let new_expiry = resp
                     .get("expiry")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f UTC").ok())
-                    .map(|dt| dt.and_utc());
+                    .and_then(crate::helpers::parse_agent_cert_expiry);
 
                 if let Some(expiry) = new_expiry {
                     // Clear ssl_renewal_at so the next auto-heal cycle

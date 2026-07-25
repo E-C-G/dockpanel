@@ -3,6 +3,7 @@ import { useParams, useNavigate, Link } from "react-router-dom";
 import { api } from "../api";
 import { formatDate } from "../utils/format";
 import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constants";
+import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequisite";
 
 interface Site {
   id: string;
@@ -50,6 +51,15 @@ export default function SiteDetail() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [sslMessage, setSslMessage] = useState("");
+  const [sslMessageIsError, setSslMessageIsError] = useState(false);
+  // Only run the DNS prerequisite while SSL is still unconfigured; a live cert
+  // is proof enough that the domain resolves here. autoPoll covers propagation:
+  // a blocking gate opens by itself once the record goes live.
+  const {
+    prereq: dnsPrereq,
+    checking: dnsChecking,
+    recheck: recheckDns,
+  } = useDnsPrereq(site && !site.ssl_enabled ? site.domain : "", { autoPoll: true, debounceMs: 0 });
   const [switchingPhp, setSwitchingPhp] = useState(false);
   const [phpMessage, setPhpMessage] = useState("");
   const [savingLimits, setSavingLimits] = useState(false);
@@ -321,10 +331,15 @@ export default function SiteDetail() {
       const updated = await api.get<Site>(`/sites/${id}`);
       setSite(updated);
       setSslMessage("SSL certificate provisioned successfully!");
+      setSslMessageIsError(false);
     } catch (err) {
       setSslMessage(
         err instanceof Error ? err.message : "SSL provisioning failed"
       );
+      setSslMessageIsError(true);
+      // The server may have refused on a prerequisite (a 412 naming the DNS
+      // problem). Refresh it so the callout beside the button reflects why.
+      recheckDns();
     } finally {
       setProvisioning(false);
     }
@@ -344,8 +359,10 @@ export default function SiteDetail() {
         ? "Wildcard SSL certificate provisioned via DNS-01!"
         : "SSL certificate provisioned via DNS-01!"
       );
+      setSslMessageIsError(false);
     } catch (err) {
       setSslMessage(err instanceof Error ? err.message : "DNS-01 provisioning failed");
+      setSslMessageIsError(true);
     } finally {
       setDns01Loading(false);
     }
@@ -655,7 +672,8 @@ export default function SiteDetail() {
                       <>
                         <button
                           onClick={handleProvisionSSL}
-                          disabled={provisioning}
+                          disabled={provisioning || prereqBlocks(dnsPrereq)}
+                          title={prereqBlocks(dnsPrereq) ? dnsPrereq?.title : undefined}
                           className="px-3 py-1 bg-rust-500 text-white rounded-md text-xs font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
                         >
                           {provisioning ? "Provisioning..." : "Let's Encrypt"}
@@ -699,15 +717,49 @@ export default function SiteDetail() {
                         try {
                           await api.post(`/sites/${id}/ssl/upload`, { certificate: sslCert, private_key: sslKey });
                           setSslMessage("Custom SSL certificate installed successfully!");
+                          setSslMessageIsError(false);
                           setSslCert(""); setSslKey(""); setShowSslUpload(false);
                           const updated = await api.get<Site>(`/sites/${id}`);
                           setSite(updated);
-                        } catch (e) { setSslMessage(e instanceof Error ? e.message : "Upload failed"); }
+                        } catch (e) {
+                          setSslMessage(e instanceof Error ? e.message : "Upload failed");
+                          setSslMessageIsError(true);
+                        }
                         finally { setUploadingSsl(false); }
                       }} className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50">
                         {uploadingSsl ? "Installing..." : "Install Certificate"}
                       </button>
                     </div>
+                  )}
+
+                  {/* The result of the button the user just pressed, BESIDE that
+                      button. This used to render ~1400 lines further down the
+                      page, at the very bottom of the document — so a perfectly
+                      good 412 explaining the DNS problem was on screen but
+                      nowhere the user would ever look, and clicking "Let's
+                      Encrypt" appeared to do nothing at all (s252 F1). */}
+                  {sslMessage && (
+                    <div
+                      role="alert"
+                      className={`mt-3 px-3 py-2 rounded text-xs ${
+                        sslMessageIsError
+                          ? "bg-danger-500/10 text-danger-400 border border-danger-500/20"
+                          : "bg-rust-500/10 text-rust-400 border border-rust-500/20"
+                      }`}
+                    >
+                      {sslMessage}
+                    </div>
+                  )}
+
+                  {/* The prerequisite itself: what is wrong, what we expected,
+                      what we saw, and the exact record to create. */}
+                  {site.status === "active" && (
+                    <PrereqCallout
+                      prereq={dnsPrereq}
+                      onRecheck={recheckDns}
+                      checking={dnsChecking}
+                      className="mt-3"
+                    />
                   )}
                 </div>
               )}
@@ -2125,16 +2177,9 @@ export default function SiteDetail() {
         )}
       </div>
 
-      {/* SSL message */}
-      {sslMessage && (
-        <div className={`mt-4 px-4 py-3 rounded-lg text-sm ${
-          sslMessage.includes("success")
-            ? "bg-rust-500/10 text-rust-400 border border-rust-500/20"
-            : "bg-danger-500/10 text-danger-400 border border-danger-500/20"
-        }`}>
-          {sslMessage}
-        </div>
-      )}
+      {/* The SSL message used to render here — at the bottom of the whole page,
+          far below the SSL card whose buttons produce it. It now renders inside
+          that card instead (see the "SSL" row above). */}
     </div>
   );
 }

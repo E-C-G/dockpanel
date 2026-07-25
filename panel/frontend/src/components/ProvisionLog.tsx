@@ -56,11 +56,20 @@ export default function ProvisionLog({ siteId, sseUrl, onComplete }: Props) {
     return () => es.close();
   }, [url]);
 
-  // Don't render the "complete" pseudo-step
+  // The "complete" pseudo-step isn't rendered in the list — it drives the header.
   const visibleSteps = steps.filter((s) => s.step !== "complete");
+  const completeStep = steps.find((s) => s.step === "complete");
 
-  const hasError = steps.some((s) => s.step === "complete" && s.status === "error");
+  const hasError = completeStep?.status === "error";
   const isComplete = done && !hasError;
+
+  // The terminal step now carries a real verdict ("Site created — HTTPS not
+  // configured", and why). Previously it was always "Site ready / done" and the
+  // header said "Provisioning complete" over a provisioning that had failed
+  // (s252 F2), so prefer whatever the server actually reported.
+  const headline = !done
+    ? "Provisioning..."
+    : completeStep?.label ?? (isComplete ? "Provisioning complete" : "Provisioning failed");
 
   return (
     <div className="bg-dark-800 rounded-lg border border-dark-500 p-5 mb-6 animate-fade-up">
@@ -80,9 +89,15 @@ export default function ProvisionLog({ siteId, sseUrl, onComplete }: Props) {
           </svg>
         )}
         <span className="text-sm font-medium text-dark-50 font-mono tracking-wide">
-          {!done ? "Provisioning..." : isComplete ? "Provisioning complete" : "Provisioning failed"}
+          {headline}
         </span>
       </div>
+
+      {done && completeStep?.message && (
+        <p className={`text-xs mb-3 ${hasError ? "text-danger-400" : "text-dark-300"}`}>
+          {completeStep.message}
+        </p>
+      )}
 
       <div className="space-y-1">
         {visibleSteps.map((step) => (
@@ -118,7 +133,10 @@ export default function ProvisionLog({ siteId, sseUrl, onComplete }: Props) {
                 {step.label}
               </span>
               {step.message && (
-                <p className="text-xs text-dark-300 mt-0.5 truncate">{step.message}</p>
+                // NOT truncated: one of these carries the generated admin
+                // password, shown once at creation, and a clipped password is
+                // worse than none.
+                <p className="text-xs text-dark-300 mt-0.5 break-words">{step.message}</p>
               )}
             </div>
           </div>

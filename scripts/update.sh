@@ -322,9 +322,14 @@ mkdir -p /var/lib/dockpanel/git
 # Directories needed by agent ReadWritePaths (created only if missing).
 # v2.8.13 expanded the RWP list — systemd fails the namespace mount on
 # missing entries, so pre-create everything the canonical unit references.
+# v2.28.0 added /etc/php: the agent writes per-site PHP-FPM pools to
+# /etc/php/{ver}/fpm/pool.d, and this loop runs BEFORE the unit is refreshed and
+# reloaded below, so the bind mount is in place by the time the agent restarts.
+# Without the mkdir an existing box that never installed PHP would fail the
+# namespace mount and the agent would not start at all.
 for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx \
          /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt \
-         /var/cache/nginx/fastcgi \
+         /var/cache/nginx/fastcgi /etc/php \
          /etc/ufw /var/lib/ufw; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done

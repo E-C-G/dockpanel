@@ -213,6 +213,170 @@ pub async fn detect_public_ip() -> String {
     }
 }
 
+/// Cache for [`detect_public_ip_cached`]: the resolved address and when it was read.
+static PUBLIC_IP_CACHE: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// How long a detected public IP stays fresh. A box's public address changes
+/// approximately never; five minutes is short enough that a real change is picked
+/// up quickly and long enough that an interactive preflight is effectively free.
+const PUBLIC_IP_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`detect_public_ip`] with a short-lived cache.
+///
+/// The uncached version makes an outbound HTTPS request to api.ipify.org on EVERY
+/// call. That is fine for a once-per-provision check, but the DNS preflight runs
+/// as the user types a domain — uncached, a single create-site form would issue
+/// dozens of external requests and get rate-limited.
+pub async fn detect_public_ip_cached() -> String {
+    if let Ok(guard) = PUBLIC_IP_CACHE.lock() {
+        if let Some((ip, at)) = guard.as_ref() {
+            if at.elapsed() < PUBLIC_IP_TTL && !ip.is_empty() {
+                return ip.clone();
+            }
+        }
+    }
+
+    let ip = detect_public_ip().await;
+
+    // Never cache a failure — a transient network blip would otherwise pin an
+    // empty address for the whole TTL and silently disable every DNS check.
+    if !ip.is_empty() {
+        if let Ok(mut guard) = PUBLIC_IP_CACHE.lock() {
+            *guard = Some((ip.clone(), std::time::Instant::now()));
+        }
+    }
+    ip
+}
+
+/// Parse the certificate expiry string the agent returns for SSL
+/// provision / renew / DNS-01 responses.
+///
+/// The agent builds this with `x509_parser`'s `not_after.to_datetime().to_string()`
+/// (agent `services/ssl.rs::get_cert_expiry`). That is a `time::OffsetDateTime`
+/// `Display`, which renders as `"<date> <time> <offset>"` — e.g.
+/// `2026-10-23 09:41:07.0 +00:00:00`. It never emits a literal `UTC`.
+///
+/// Every panel-side call site used to parse it with `"%Y-%m-%d %H:%M:%S%.f UTC"`,
+/// which cannot match that shape, so the parse always failed and `sites.ssl_expiry`
+/// was left NULL forever. That silently starved three features that read it: the
+/// dashboard SSL countdown, `alert_engine::check_ssl_expiry` (whose query is
+/// `WHERE ssl_enabled = TRUE AND ssl_expiry IS NOT NULL`, so it matched no rows at
+/// all), and the ARI renewal bookkeeping in `auto_healer`.
+///
+/// Tolerant by design — panel and agent are separately-versioned binaries and a
+/// fleet can run a mix, so accept the legacy `UTC` spelling and RFC 3339 too rather
+/// than trade one brittle format for another.
+/// Rewrite a trailing `+HH:MM:00` offset to `+HH:MM` so chrono can consume it.
+/// Returns `None` when the string doesn't end in a zero-seconds offset, leaving the
+/// caller to try its other formats.
+fn strip_zero_offset_seconds(s: &str) -> Option<String> {
+    // "+00:00:00" — 9 bytes, all ASCII, so byte indexing is safe.
+    let tail = s.as_bytes();
+    if tail.len() < 9 {
+        return None;
+    }
+    let t = &tail[tail.len() - 9..];
+    let shaped = matches!(t[0], b'+' | b'-')
+        && t[1].is_ascii_digit()
+        && t[2].is_ascii_digit()
+        && t[3] == b':'
+        && t[4].is_ascii_digit()
+        && t[5].is_ascii_digit()
+        && t[6] == b':'
+        && t[7].is_ascii_digit()
+        && t[8].is_ascii_digit();
+    // Only whole-minute offsets: `:00` seconds carry no information to lose.
+    if shaped && t[7] == b'0' && t[8] == b'0' {
+        Some(s[..s.len() - 3].to_string())
+    } else {
+        None
+    }
+}
+
+pub fn parse_agent_cert_expiry(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // The current agent format. chrono's `%z` family stops after `+HH:MM`, so the
+    // trailing `:SS` the `time` crate always prints would be left unconsumed and the
+    // whole parse rejected. Drop that group first — but only when it is `:00`, so a
+    // genuinely sub-minute offset falls through instead of being silently shifted.
+    let normalised = strip_zero_offset_seconds(s);
+    if let Ok(dt) = chrono::DateTime::parse_from_str(
+        normalised.as_deref().unwrap_or(s),
+        "%Y-%m-%d %H:%M:%S%.f %:z",
+    ) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+
+    // RFC 3339 / ISO 8601, in case the agent ever serialises a chrono type instead.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+
+    // Legacy spelling kept so a newer panel never regresses an older agent.
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f UTC") {
+        return Some(dt.and_utc());
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod cert_expiry_tests {
+    use super::parse_agent_cert_expiry;
+    use chrono::{Datelike, Timelike};
+
+    /// THE regression test. This exact string is what
+    /// `time::OffsetDateTime`'s `Display` produces, which is what the agent
+    /// sends. If this ever fails, `ssl_expiry` is silently NULL again and the
+    /// SSL countdown + expiry alerts go dark with no error anywhere.
+    #[test]
+    fn parses_the_format_the_agent_actually_sends() {
+        let dt = parse_agent_cert_expiry("2026-10-23 09:41:07.0 +00:00:00")
+            .expect("agent's time::OffsetDateTime Display form must parse");
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.month(), 10);
+        assert_eq!(dt.day(), 23);
+        assert_eq!(dt.hour(), 9);
+        assert_eq!(dt.minute(), 41);
+        assert_eq!(dt.second(), 7);
+    }
+
+    #[test]
+    fn parses_without_fractional_seconds() {
+        assert!(parse_agent_cert_expiry("2026-10-23 09:41:07 +00:00:00").is_some());
+    }
+
+    #[test]
+    fn parses_a_non_utc_offset_and_normalises_to_utc() {
+        let dt = parse_agent_cert_expiry("2026-10-23 11:41:07.0 +02:00:00")
+            .expect("offset form must parse");
+        assert_eq!(dt.hour(), 9, "must be converted to UTC, not read as wall time");
+    }
+
+    #[test]
+    fn still_parses_the_legacy_utc_spelling() {
+        assert!(parse_agent_cert_expiry("2026-10-23 09:41:07.0 UTC").is_some());
+    }
+
+    #[test]
+    fn parses_rfc3339() {
+        assert!(parse_agent_cert_expiry("2026-10-23T09:41:07Z").is_some());
+    }
+
+    #[test]
+    fn rejects_junk_instead_of_defaulting() {
+        assert!(parse_agent_cert_expiry("").is_none());
+        assert!(parse_agent_cert_expiry("   ").is_none());
+        assert!(parse_agent_cert_expiry("not a date").is_none());
+        assert!(parse_agent_cert_expiry("2026-10-23").is_none());
+    }
+}
+
 #[cfg(test)]
 mod ssrf_tests {
     use super::{ip_is_internal, v4_is_internal, v6_is_internal};

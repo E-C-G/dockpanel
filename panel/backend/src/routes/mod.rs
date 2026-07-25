@@ -604,7 +604,13 @@ pub fn router() -> Router<AppState> {
         .route("/api/ssl/{id}/renew", post(ssl::renew))
         .route("/api/ssl/{id}", delete(ssl::revoke))
         .route("/api/ssl/profiles", get(ssl::profiles))
+        .route("/api/preflight/dns", get(ssl::preflight_dns))
+        .route("/api/sites/{id}/preflight", get(ssl::preflight_site))
         .route("/api/ssl/default-profile", post(ssl::set_default_profile))
+        .route(
+            "/api/ssl/contact-email",
+            get(ssl::get_contact_email).post(ssl::set_contact_email),
+        )
         // File Manager
         .route("/api/sites/{id}/files", get(files::list_dir).delete(files::delete_entry))
         .route("/api/sites/{id}/files/read", get(files::read_file))

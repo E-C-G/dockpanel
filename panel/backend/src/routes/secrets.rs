@@ -107,7 +107,11 @@ const VALID_TYPES: &[&str] = &["env", "api_key", "password", "certificate", "cus
 
 /// Derive a dedicated encryption key separate from the JWT secret.
 /// Uses SECRETS_ENCRYPTION_KEY env var if set, otherwise derives one via SHA-256.
-fn get_encryption_key(jwt_secret: &str) -> String {
+/// Derive the vault encryption key. `pub(crate)` so provisioning paths that
+/// generate credentials (site creation writing the CMS admin password into the
+/// site's auto-created vault) encrypt with the SAME key the Secrets Manager
+/// decrypts with — a second derivation here would store values the UI can't read.
+pub(crate) fn get_encryption_key(jwt_secret: &str) -> String {
     std::env::var("SECRETS_ENCRYPTION_KEY").unwrap_or_else(|_| {
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();

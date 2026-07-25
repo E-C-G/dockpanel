@@ -4,6 +4,7 @@ import { api } from "../api";
 import { formatDate } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
 import ProvisionLog from "../components/ProvisionLog";
+import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 
 interface Site {
   id: string;
@@ -38,6 +39,14 @@ export default function Sites() {
   const [adminEmail, setAdminEmail] = useState("");
   const [adminUser, setAdminUser] = useState("admin");
   const [adminPassword, setAdminPassword] = useState("");
+
+  // Preflight the domain as it is typed. Nothing here BLOCKS creation — a site
+  // is perfectly valid before its DNS exists, and the brief is explicit that a
+  // not-yet-propagated record must not be presented as an error. The point is
+  // that the user learns about the prerequisite here, rather than discovering it
+  // later when SSL silently fails to appear.
+  const { prereq: dnsPrereq, checking: dnsChecking, recheck: recheckDns } =
+    useDnsPrereq(showForm ? domain : "");
 
   const fetchSites = () => {
     api
@@ -178,7 +187,17 @@ export default function Sites() {
                 placeholder="example.com"
                 className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm"
               />
-              <p className="text-xs text-dark-400 mt-1.5">Your site's public domain name (e.g., example.com)</p>
+              <p className="text-xs text-dark-400 mt-1.5">
+                Your site's public domain name (e.g., example.com). It needs to point at this
+                server before HTTPS can be issued — DockPanel checks that for you below.
+              </p>
+              <PrereqCallout
+                prereq={dnsPrereq}
+                onRecheck={recheckDns}
+                checking={dnsChecking}
+                showSatisfied
+                className="mt-2"
+              />
             </div>
             {!cms ? (
               <div>

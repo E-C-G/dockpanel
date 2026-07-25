@@ -104,6 +104,58 @@ fn emit_step(
     }
 }
 
+/// Store a credential DockPanel generated on the user's behalf into the site's
+/// auto-created vault.
+///
+/// Encrypts with `secrets::get_encryption_key` — the same derivation the Secrets
+/// Manager decrypts with, so the value is actually retrievable in the UI rather
+/// than merely written somewhere.
+///
+/// Best-effort by design: provisioning must not fail because bookkeeping did.
+/// But every failure is logged at error level, because the failure mode this
+/// exists to kill (s252 F3) was a password generated, handed to wp-cli, and
+/// dropped on the floor beside an empty vault — with nothing said anywhere.
+async fn store_site_secret(
+    pool: &sqlx::PgPool,
+    jwt_secret: &str,
+    vault_id: Uuid,
+    key: &str,
+    value: &str,
+    description: &str,
+) -> bool {
+    let enc_key = crate::routes::secrets::get_encryption_key(jwt_secret);
+    let encrypted = match crate::services::secrets_crypto::encrypt(value, &enc_key) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Auto-vault: could not encrypt '{key}': {e}");
+            return false;
+        }
+    };
+
+    match sqlx::query(
+        "INSERT INTO secrets (vault_id, key, encrypted_value, description, secret_type, updated_by) \
+         VALUES ($1, $2, $3, $4, 'password', 'dockpanel') \
+         ON CONFLICT (vault_id, key) DO UPDATE SET \
+           encrypted_value = EXCLUDED.encrypted_value, \
+           description = EXCLUDED.description, \
+           version = secrets.version + 1, \
+           updated_at = NOW()",
+    )
+    .bind(vault_id)
+    .bind(key)
+    .bind(&encrypted)
+    .bind(description)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!("Auto-vault: could not store '{key}': {e}");
+            false
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct ListQuery {
     pub limit: Option<i64>,
@@ -494,24 +546,28 @@ pub async fn create(
                 });
             }
 
-            // GAP 6: Auto-create secrets vault for the site
-            {
-                let vault_db = state.db.clone();
-                let vault_site_id = site.id;
-                let vault_user_id = claims.sub;
-                let vault_domain = body.domain.clone();
-                tokio::spawn(async move {
-                    let _ = sqlx::query(
-                        "INSERT INTO secret_vaults (user_id, name, description, site_id) \
-                         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
-                    )
-                    .bind(vault_user_id)
-                    .bind(format!("{vault_domain} secrets"))
-                    .bind(format!("Auto-created vault for {vault_domain}"))
-                    .bind(vault_site_id)
-                    .execute(&vault_db).await;
-                    tracing::info!("Auto-vault: created for {vault_domain}");
-                });
+            // GAP 6: Auto-create secrets vault for the site.
+            //
+            // Created INLINE (not in a spawned task) so its id is available to the
+            // CMS installer below. Until v2.28.0 this was fire-and-forget, and the
+            // CMS task raced it — which is part of why the auto-generated admin
+            // password was never stored anywhere and the vault sat empty (F3).
+            let site_vault_id: Option<Uuid> = sqlx::query_scalar(
+                "INSERT INTO secret_vaults (user_id, name, description, site_id) \
+                 VALUES ($1, $2, $3, $4) RETURNING id"
+            )
+            .bind(claims.sub)
+            .bind(format!("{} secrets", body.domain))
+            .bind(format!("Auto-created vault for {}", body.domain))
+            .bind(site.id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Auto-vault: could not create vault for {}: {e}", body.domain);
+                None
+            });
+            if site_vault_id.is_some() {
+                tracing::info!("Auto-vault: created for {}", body.domain);
             }
 
             // GAP 15: Auto-create paused uptime monitor (activates after SSL provisioning)
@@ -624,18 +680,47 @@ pub async fn create(
                 });
             }
 
-            // Auto-SSL: try to provision Let's Encrypt cert in background
+            // Auto-SSL: try to provision Let's Encrypt cert in background.
+            //
+            // Resolve the ACME contact BEFORE spawning. A contact address in a
+            // reserved TLD (the operator registered the panel as e.g.
+            // admin@box.test) makes Let's Encrypt refuse the account, so every
+            // order fails — and before s253 that failed four times in total
+            // silence: nothing in the UI, nothing in journalctl, then a permanent
+            // give-up. Resolving here lets the real reason become a visible step.
+            let acme_contact =
+                crate::routes::ssl::resolve_acme_contact(&state.db, &claims.email).await;
             let ssl_agent = agent.clone();
             let ssl_db = state.db.clone();
             let ssl_domain = body.domain.clone();
-            let ssl_email = claims.email.clone();
+            let ssl_email = match acme_contact {
+                Ok(addr) => addr,
+                Err(reason) => {
+                    tracing::warn!("Auto-SSL skipped for {}: {reason}", body.domain);
+                    emit_step(&logs, site_id, "ssl", "SSL certificate", "error", Some(reason));
+                    String::new()
+                }
+            };
             let ssl_runtime = runtime.to_string();
             let ssl_php_socket = body.php_version.as_ref().map(|v| format!("unix:/run/php/php{v}-fpm.sock"));
             let ssl_proxy_port = body.proxy_port;
             let ssl_php_preset = body.php_preset.clone();
             let ssl_root_path: Option<String> = None; // default root
             let ssl_logs = logs.clone();
+            // Lets the terminal step below report what actually happened instead
+            // of asserting success on a timer (s252 F2).
+            let (ssl_tx, ssl_rx) = tokio::sync::oneshot::channel::<bool>();
+            let mut ssl_tx = Some(ssl_tx);
             tokio::spawn(async move {
+                // Empty means the contact could not be resolved above; the reason
+                // has already been emitted as a step, so don't burn four retries
+                // against an order the CA is certain to refuse.
+                if ssl_email.is_empty() {
+                    if let Some(tx) = ssl_tx.take() {
+                        let _ = tx.send(false);
+                    }
+                    return;
+                }
                 // Retry SSL with backoff: 3s, 30s, 2m, 5m
                 let delays = [3u64, 30, 120, 300];
                 for (i, delay) in delays.iter().enumerate() {
@@ -662,8 +747,7 @@ pub async fn create(
                             let ssl_expiry = result
                                 .get("expiry")
                                 .and_then(|v| v.as_str())
-                                .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f UTC").ok())
-                                .map(|dt| dt.and_utc());
+                                .and_then(crate::helpers::parse_agent_cert_expiry);
                             let cert_path = result.get("cert_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
                             let key_path = result.get("key_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -687,14 +771,26 @@ pub async fn create(
                             .execute(&ssl_db)
                             .await;
 
+                            if let Some(tx) = ssl_tx.take() {
+                                let _ = tx.send(true);
+                            }
                             return; // Success, stop retrying
                         }
                         Err(e) => {
                             if i == delays.len() - 1 {
-                                // Last attempt failed
+                                // Last attempt failed. Say WHY — this used to read
+                                // "Skipped", which described neither the four
+                                // attempts that had just happened nor their cause.
                                 tracing::info!("Auto-SSL failed for {ssl_domain} after {} attempts: {e}", i + 1);
                                 emit_step(&ssl_logs, site_id, "ssl", "SSL certificate", "error",
-                                    Some("Skipped — can be provisioned manually from site settings".into()));
+                                    Some(format!(
+                                        "Could not issue a certificate after {} attempts: {e}. \
+                                         The site is served over HTTP; open the site's SSL section to retry.",
+                                        i + 1
+                                    )));
+                                if let Some(tx) = ssl_tx.take() {
+                                    let _ = tx.send(false);
+                                }
                             } else {
                                 tracing::info!("Auto-SSL attempt {} for {ssl_domain} failed, retrying in {}s", i + 1, delays[i + 1]);
                             }
@@ -728,11 +824,16 @@ pub async fn create(
                 let cms_title = body.site_title.clone().unwrap_or_else(|| body.domain.clone());
                 let cms_email = body.admin_email.clone().unwrap_or_else(|| "admin@example.com".to_string());
                 let cms_user = body.admin_user.clone().unwrap_or_else(|| "admin".to_string());
+                // Whether WE generated this password decides whether the user has
+                // any other copy of it. If they typed one, don't echo it back.
+                let cms_pass_generated = body.admin_password.is_none();
                 let cms_pass = body.admin_password.clone().unwrap_or_else(|| {
                     use rand::Rng;
                     let mut rng = rand::rng();
                     (0..16).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
                 });
+                let cms_admin_user = cms_user.clone();
+                let cms_vault_id = site_vault_id;
                 let cms_logs = logs.clone();
                 let cms_jwt_secret = state.config.jwt_secret.clone();
 
@@ -812,6 +913,7 @@ pub async fn create(
                     }
 
                     // 2. Install CMS/framework
+                    let mut install_ok = true;
                     emit_step(&cms_logs, site_id, "install", &format!("Installing {cms_label}"), "in_progress", None);
 
                     let install_result = if cms_name == "wordpress" {
@@ -845,6 +947,65 @@ pub async fn create(
                             tracing::info!("{cms_label} installed on {cms_domain}");
                             emit_step(&cms_logs, site_id, "install", &format!("Installing {cms_label}"), "done", None);
 
+                            // Take custody of the credentials we just generated.
+                            // The form says "Auto-generated if blank", so a user who
+                            // takes that at its word has no other copy — before
+                            // v2.28.0 the password went to wp-cli and nowhere else,
+                            // locking them out of the site they had just made.
+                            if let Some(vault_id) = cms_vault_id {
+                                let stored_pass = store_site_secret(
+                                    &cms_db, &cms_jwt_secret, vault_id,
+                                    &format!("{cms_name}_admin_password"),
+                                    &cms_pass,
+                                    &format!("{cms_label} admin password for {cms_domain}"),
+                                ).await;
+                                store_site_secret(
+                                    &cms_db, &cms_jwt_secret, vault_id,
+                                    &format!("{cms_name}_admin_user"),
+                                    &cms_admin_user,
+                                    &format!("{cms_label} admin username for {cms_domain}"),
+                                ).await;
+                                if needs_db {
+                                    store_site_secret(
+                                        &cms_db, &cms_jwt_secret, vault_id,
+                                        "database_password", &db_password,
+                                        &format!("Database password for {db_name}"),
+                                    ).await;
+                                }
+
+                                // Reveal a password we generated exactly once, at
+                                // the moment it is created. It is also in the vault,
+                                // so this is convenience, not the system of record —
+                                // and the provisioning stream is owner-scoped
+                                // (provision_log checks user_id).
+                                if stored_pass && cms_pass_generated {
+                                    emit_step(
+                                        &cms_logs, site_id, "credentials",
+                                        &format!("{cms_label} admin credentials"), "done",
+                                        Some(format!(
+                                            "Username {cms_admin_user} · password {cms_pass} — \
+                                             saved to the \"{cms_domain} secrets\" vault. \
+                                             Copy it now; this is the only time it is shown here."
+                                        )),
+                                    );
+                                } else if stored_pass {
+                                    emit_step(
+                                        &cms_logs, site_id, "credentials",
+                                        &format!("{cms_label} admin credentials"), "done",
+                                        Some(format!(
+                                            "Saved to the \"{cms_domain} secrets\" vault."
+                                        )),
+                                    );
+                                } else {
+                                    emit_step(
+                                        &cms_logs, site_id, "credentials",
+                                        &format!("{cms_label} admin credentials"), "error",
+                                        Some("Could not be saved to the site vault — \
+                                              reset the admin password from the site's tools.".into()),
+                                    );
+                                }
+                            }
+
                             // Auto-create WordPress system cron
                             if cms_name == "wordpress" {
                                 let cron_db = cms_db.clone();
@@ -866,22 +1027,63 @@ pub async fn create(
                         }
                         Err(e) => {
                             tracing::error!("{cms_label} install failed for {cms_domain}: {e}");
+                            install_ok = false;
                             emit_step(&cms_logs, site_id, "install", &format!("Installing {cms_label}"), "error",
                                 Some(format!("{cms_label} install failed: {e}")));
                         }
                     }
 
-                    emit_step(&cms_logs, site_id, "complete", "Site ready", "done", None);
+                    // The terminal step must report what happened. It used to say
+                    // "Site ready / done" unconditionally — including for an
+                    // install that had just failed on the line above (s252 F2).
+                    if install_ok {
+                        emit_step(&cms_logs, site_id, "complete", "Site ready", "done", None);
+                    } else {
+                        emit_step(
+                            &cms_logs, site_id, "complete",
+                            &format!("Site created — {cms_label} install failed"), "error",
+                            Some("The site and its database exist, but the application was not \
+                                  installed. See the failed step above.".into()),
+                        );
+                    }
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     cms_logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&site_id);
                 });
             } else {
-                // Non-CMS site: emit complete after SSL (spawned separately)
+                // Non-CMS site: the terminal step reports the SSL outcome rather
+                // than assuming it. This used to sleep a flat 12s and declare
+                // "Site ready / done" — while Auto-SSL was still retrying at 30s,
+                // 120s and 300s behind that success claim, and often never
+                // succeeded at all (s252 F2).
                 let final_logs = logs.clone();
                 tokio::spawn(async move {
-                    // Wait for SSL task to finish (SSL has 3s delay + ~5s provision)
-                    tokio::time::sleep(Duration::from_secs(12)).await;
-                    emit_step(&final_logs, site_id, "complete", "Site ready", "done", None);
+                    // Bound the wait: the full retry ladder runs ~7.5 minutes and
+                    // nobody should watch a spinner that long for a site which is
+                    // already serving. Past the bound we say HTTPS is still in
+                    // progress, which is true, rather than that it is done.
+                    match tokio::time::timeout(Duration::from_secs(75), ssl_rx).await {
+                        Ok(Ok(true)) => {
+                            emit_step(&final_logs, site_id, "complete", "Site ready", "done", None);
+                        }
+                        Ok(Ok(false)) => {
+                            emit_step(
+                                &final_logs, site_id, "complete",
+                                "Site created — HTTPS not configured", "error",
+                                Some("The site is served over HTTP. Open the site's SSL section \
+                                      for the reason and to retry.".into()),
+                            );
+                        }
+                        // Sender dropped, or we ran out of patience: SSL is still
+                        // in flight or its task went away. Either way, unknown.
+                        _ => {
+                            emit_step(
+                                &final_logs, site_id, "complete",
+                                "Site created — HTTPS still in progress", "done",
+                                Some("DockPanel is still trying to issue a certificate. \
+                                      The site's SSL section shows the result.".into()),
+                            );
+                        }
+                    }
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     final_logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&site_id);
                 });

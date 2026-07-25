@@ -14,6 +14,7 @@ pub mod drill_scheduler;
 pub mod email;
 pub mod image_scanner;
 pub mod extensions;
+pub mod prerequisites;
 pub mod preview_cleanup;
 pub mod metrics_collector;
 pub mod prometheus_exporter;
