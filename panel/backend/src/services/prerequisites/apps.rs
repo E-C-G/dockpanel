@@ -501,6 +501,33 @@ mod tests {
         assert!(check_name_available(&intent(), &facts).blocks());
     }
 
+    /// `taken_names` must hold the names the USER types, not the container names
+    /// the agent reports.
+    ///
+    /// The agent lists containers as `dockpanel-app-<name>`; the form submits
+    /// `<name>`. Feeding the prefixed form in here compares two things that can
+    /// never be equal, and the check reports every colliding name as available —
+    /// which is what a fresh box caught v2.29.0 doing. The stripping lives in
+    /// `routes::docker_apps::gather_app_facts`; this pins the contract it must
+    /// satisfy.
+    #[test]
+    fn taken_names_are_user_facing_names_not_container_names() {
+        let prefixed = HostFacts {
+            taken_names: vec!["dockpanel-app-postgres".into()],
+            ..Default::default()
+        };
+        assert!(
+            !check_name_available(&intent(), &prefixed).blocks(),
+            "sanity: a prefixed name cannot match — which is exactly why the caller must strip it"
+        );
+
+        let stripped = HostFacts { taken_names: vec!["postgres".into()], ..Default::default() };
+        assert!(
+            check_name_available(&intent(), &stripped).blocks(),
+            "the caller must pass stripped names, or this check is inert"
+        );
+    }
+
     // ── memory ────────────────────────────────────────────────────────────
 
     #[test]

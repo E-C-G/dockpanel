@@ -467,6 +467,10 @@ pub async fn deploy(
 
 // ── Deploy preflight (the guidance layer's Docker-apps vertical) ────────────
 
+/// The prefix the agent adds when it names an app's container
+/// (`docker_apps::deploy`: `format!("dockpanel-app-{name}")`).
+const CONTAINER_NAME_PREFIX: &str = "dockpanel-app-";
+
 #[derive(serde::Deserialize)]
 pub struct AppPreflightQuery {
     pub template_id: String,
@@ -496,10 +500,18 @@ async fn gather_app_facts(
     let mut facts = HostFacts::default();
 
     // Containers DockPanel manages: their names and published ports.
+    //
+    // The agent reports the CONTAINER name, which carries the `dockpanel-app-`
+    // prefix the deploy adds (`dockpanel-app-pg-ok`), while the user types the
+    // bare app name (`pg-ok`). Comparing the two directly makes the collision
+    // check permanently inert — it was, until a fresh box showed a duplicate name
+    // reported as available. Strip the prefix so both the comparison and the
+    // "taken by" sentence speak the user's names.
     if let Ok(apps) = agent.get("/apps").await {
         if let Some(arr) = apps.as_array() {
             for app in arr {
-                if let Some(name) = app.get("name").and_then(|v| v.as_str()) {
+                if let Some(raw) = app.get("name").and_then(|v| v.as_str()) {
+                    let name = raw.strip_prefix(CONTAINER_NAME_PREFIX).unwrap_or(raw);
                     facts.taken_names.push(name.to_string());
                     if let Some(p) = app.get("port").and_then(|v| v.as_u64()) {
                         facts.used_ports.push(PortHolder {

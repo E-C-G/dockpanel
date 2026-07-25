@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.29.1] - 2026-07-26
+
+One gap only a fresh box could show, found by driving v2.29.0 on one rather than by re-reading the diff.
+
+### Fixed
+
+- **The app name-collision check was inert.** The agent lists containers under the name it actually
+  creates them with (`dockpanel-app-pg-ok`), while the deploy form submits the bare name (`pg-ok`), so
+  the check compared two strings that could never be equal and reported every colliding name as
+  available. Deploying a second app with an existing name still failed — at Docker, after the image
+  pull, which is exactly what the check exists to prevent. The panel now strips the container prefix
+  before comparing, and the "port is taken by" sentence names the app the way the user does. Pinned by
+  a test asserting the contract in both directions.
+
 ## [2.29.0] - 2026-07-26
 
 The prerequisite layer stops being a DNS feature and becomes the systemic one the brief asked for.
