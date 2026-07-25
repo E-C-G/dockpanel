@@ -245,7 +245,7 @@ pub async fn list_all_backups(
     let cte = "WITH unified AS ( \
          SELECT b.id, 'site'::text AS kind, b.site_id AS resource_id, s.domain AS resource_name, \
                 b.filename, b.size_bytes, b.created_at, s.server_id, \
-                FALSE AS encrypted, FALSE AS uploaded, NULL::text AS extra_type \
+                FALSE AS encrypted, b.uploaded, NULL::text AS extra_type \
            FROM backups b JOIN sites s ON s.id = b.site_id \
          UNION ALL \
          SELECT db.id, 'database'::text, db.database_id, db.db_name, \
@@ -298,6 +298,53 @@ pub async fn list_all_backups(
 }
 
 /// GET /api/backup-orchestrator/health — Global backup health dashboard.
+/// GET /api/backup-orchestrator/preflight — Backup prerequisites.
+///
+/// Answers the question the Overview tab could not: will any of this survive
+/// losing the machine? One result per enabled policy, plus the prior question of
+/// whether anything is scheduled at all.
+pub async fn preflight(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::services::prerequisites::backups::{
+        check_any_policy_enabled, check_backup_destination, PolicyDestinationFacts,
+    };
+
+    let db = &state.db;
+
+    let (sites,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sites")
+        .fetch_one(db).await.map_err(|e| internal_error("preflight", e))?;
+    let (destinations,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_destinations")
+        .fetch_one(db).await.map_err(|e| internal_error("preflight", e))?;
+
+    // LEFT JOIN so a policy pointing at a deleted destination is distinguishable
+    // from one that never chose: `destination_id` set with a NULL name.
+    let policies: Vec<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT p.name, p.destination_id, d.name \
+           FROM backup_policies p \
+           LEFT JOIN backup_destinations d ON d.id = p.destination_id \
+          WHERE p.enabled = TRUE ORDER BY p.created_at",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| internal_error("preflight policies", e))?;
+
+    let mut checks = vec![check_any_policy_enabled(policies.len(), sites as usize)];
+
+    for (name, destination_id, destination_name) in policies {
+        checks.push(check_backup_destination(&PolicyDestinationFacts {
+            policy_name: name,
+            destination_exists: destination_id.is_some() && destination_name.is_some(),
+            destination_id,
+            destination_name,
+            destinations_available: destinations as usize,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({ "checks": checks })))
+}
+
 pub async fn health(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,

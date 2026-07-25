@@ -668,6 +668,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/apps/updates", get(docker_apps::check_updates))
         .route("/api/apps/gpu-info", get(docker_apps::gpu_info))
         .route("/api/apps/templates", get(docker_apps::list_templates))
+        .route("/api/apps/preflight", get(docker_apps::preflight))
         .route("/api/apps/deploy", post(docker_apps::deploy))
         .route("/api/apps/deploy/{deploy_id}/log", get(docker_apps::deploy_log))
         .route("/api/apps/compose/validate", post(docker_apps::compose_validate))
@@ -998,6 +999,7 @@ pub fn router() -> Router<AppState> {
         // Backup Orchestrator
         .route("/api/backup-orchestrator/all", get(backup_orchestrator::list_all_backups))
         .route("/api/backup-orchestrator/health", get(backup_orchestrator::health))
+        .route("/api/backup-orchestrator/preflight", get(backup_orchestrator::preflight))
         .route("/api/backup-orchestrator/policies", get(backup_orchestrator::list_policies).post(backup_orchestrator::create_policy))
         .route("/api/backup-orchestrator/policies/protect-all", post(backup_orchestrator::protect_all))
         .route("/api/backup-orchestrator/policies/{id}", put(backup_orchestrator::update_policy).delete(backup_orchestrator::delete_policy))
@@ -1129,6 +1131,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/mail/relay/remove", post(mail::relay_remove))
         // Mail: DNS Verification
         .route("/api/mail/domains/{id}/dns-check", get(mail::dns_check))
+        .route("/api/mail/domains/{id}/preflight", get(mail::preflight))
         // Mail: Logs & Storage
         .route("/api/mail/logs", get(mail::mail_logs))
         .route("/api/mail/storage", get(mail::mail_storage))

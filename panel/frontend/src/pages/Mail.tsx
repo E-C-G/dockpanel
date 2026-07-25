@@ -3,6 +3,7 @@ import { Navigate } from "react-router-dom";
 import { useState, useEffect } from "react";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
+import { PrereqCallout, type PrereqResult } from "../components/Prerequisite";
 
 interface MailDomain {
   id: string;
@@ -167,7 +168,7 @@ export default function Mail() {
   const [backingUp, setBackingUp] = useState<string | null>(null);
 
   // DNS verification
-  const [dnsCheck, setDnsCheck] = useState<{ checks: DnsCheckItem[]; all_pass: boolean } | null>(null);
+  const [dnsCheck, setDnsCheck] = useState<{ checks: DnsCheckItem[]; all_pass: boolean; prereq?: PrereqResult } | null>(null);
   const [checkingDns, setCheckingDns] = useState(false);
 
   // Mail logs
@@ -1119,7 +1120,7 @@ export default function Mail() {
                         if (!selectedDomain) return;
                         setCheckingDns(true);
                         try {
-                          const data = await api.get<{ checks: DnsCheckItem[]; all_pass: boolean }>(`/mail/domains/${selectedDomain.id}/dns-check`);
+                          const data = await api.get<{ checks: DnsCheckItem[]; all_pass: boolean; prereq?: PrereqResult }>(`/mail/domains/${selectedDomain.id}/dns-check`);
                           setDnsCheck(data);
                         } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Check failed", type: "error" }); }
                         finally { setCheckingDns(false); }
@@ -1135,15 +1136,25 @@ export default function Mail() {
                         </p>
                         {dnsCheck.checks.map((c, i) => (
                           <div key={i} className="flex items-center gap-3 text-sm">
-                            <div className={`w-2.5 h-2.5 rounded-full ${c.status === "pass" ? "bg-rust-500" : "bg-danger-400"}`} />
+                            <div className={`w-2.5 h-2.5 rounded-full ${
+                              c.status === "pass" ? "bg-rust-500" : c.status === "unknown" ? "bg-dark-500" : "bg-danger-400"
+                            }`} />
                             <span className="font-mono text-dark-100 w-16">{c.type}</span>
-                            <span className={c.status === "pass" ? "text-dark-200" : "text-danger-400"}>
-                              {c.status === "pass" ? "Verified" : "Not found"}
+                            {/* Three states, not two: a lookup we could not run is
+                                not evidence the record is missing. */}
+                            <span className={
+                              c.status === "pass" ? "text-dark-200" : c.status === "unknown" ? "text-dark-300" : "text-danger-400"
+                            }>
+                              {c.status === "pass" ? "Verified" : c.status === "unknown" ? "Not checked" : "Missing or points elsewhere"}
                             </span>
                           </div>
                         ))}
                       </div>
                     )}
+
+                    {/* The structured verdict: which records are missing, what to
+                        create, and why it matters. */}
+                    <PrereqCallout prereq={dnsCheck?.prereq ?? null} className="mb-4" />
 
                     <p className="text-xs text-dark-200 mb-4">Add these records to your DNS provider for {selectedDomain.domain} to send and receive email properly.</p>
                     {dnsRecords.length === 0 ? (

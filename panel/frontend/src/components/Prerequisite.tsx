@@ -24,7 +24,24 @@ export interface DnsRecordHint {
   record_type: string;
   value: string;
   ttl: string;
+  /** Why this record exists. Present when a set is shown (mail's five records). */
+  purpose?: string | null;
+  /** Whether this particular record was found published. Absent = not checked. */
+  present?: boolean | null;
 }
+
+/**
+ * The concrete fix for an unmet prerequisite, tagged by `kind`.
+ *
+ * A closed set of SHAPES, not prose: every arm is something this renderer can
+ * turn into an action — copy this, fill this in, go here — rather than a sentence
+ * the user has to translate into one.
+ */
+export type Remediation =
+  | { kind: "dns_record"; record: DnsRecordHint }
+  | { kind: "dns_records"; records: DnsRecordHint[] }
+  | { kind: "value"; label: string; value: string; applies_to: string; secret?: boolean }
+  | { kind: "link"; label: string; href: string };
 
 export interface PrereqResult {
   key: string;
@@ -34,12 +51,17 @@ export interface PrereqResult {
   detail: string;
   expected?: string | null;
   observed: string[];
-  remediation?: DnsRecordHint | null;
+  remediation?: Remediation | null;
 }
 
 /** A prerequisite gates a control only when it is BOTH unsatisfied and blocking. */
 export function prereqBlocks(p: PrereqResult | null): boolean {
   return !!p && p.state === "unsatisfied" && p.severity === "blocking";
+}
+
+/** The first result in a set that gates its control, if any. */
+export function firstBlocker(results: PrereqResult[] | null): PrereqResult | null {
+  return results?.find(prereqBlocks) ?? null;
 }
 
 function CopyButton({ value, label }: { value: string; label: string }) {
@@ -83,11 +105,23 @@ export function DnsRecordCard({ record }: { record: DnsRecordHint }) {
     { label: "TTL", value: record.ttl },
   ];
 
+  // When a record's published state was checked, say so on the card itself —
+  // in a set of five, "which one is missing" is the entire question.
+  const checked = record.present === true || record.present === false;
+
   return (
     <div className="mt-3 border border-dark-600 bg-dark-900/60 rounded overflow-hidden">
-      <div className="px-3 py-2 border-b border-dark-600 text-[10px] uppercase font-mono tracking-widest text-dark-300">
-        Create this record
+      <div className="px-3 py-2 border-b border-dark-600 text-[10px] uppercase font-mono tracking-widest text-dark-300 flex items-center justify-between gap-3">
+        <span>{checked ? record.record_type + " · " + record.fqdn : "Create this record"}</span>
+        {checked && (
+          <span className={record.present ? "text-rust-400" : "text-warn-400"}>
+            {record.present ? "published" : "missing"}
+          </span>
+        )}
       </div>
+      {record.purpose && (
+        <p className="px-3 py-2 text-[11px] text-dark-200 border-b border-dark-600">{record.purpose}</p>
+      )}
       <div className="divide-y divide-dark-700">
         {rows.map((r) => (
           <div key={r.label} className="px-3 py-2 flex items-center gap-3">
@@ -107,6 +141,65 @@ export function DnsRecordCard({ record }: { record: DnsRecordHint }) {
   );
 }
 
+/**
+ * Render whichever fix the backend supplied.
+ *
+ * Dispatching on `kind` rather than on the check's `key` is what keeps this
+ * component free of per-vertical knowledge: a new check that reuses an existing
+ * shape needs no change here at all.
+ */
+function RemediationView({
+  remediation,
+  onApply,
+}: {
+  remediation: Remediation;
+  /** Fill a form field with a suggested value, when the caller can. */
+  onApply?: (appliesTo: string, value: string) => void;
+}) {
+  switch (remediation.kind) {
+    case "dns_record":
+      return <DnsRecordCard record={remediation.record} />;
+
+    case "dns_records":
+      return (
+        <div>
+          {remediation.records.map((r) => (
+            <DnsRecordCard key={`${r.record_type}:${r.fqdn}`} record={r} />
+          ))}
+        </div>
+      );
+
+    case "value":
+      return (
+        <div className="mt-3 flex items-center gap-2 flex-wrap">
+          <span className="text-[11px] text-dark-300">{remediation.label}:</span>
+          <span className="text-xs font-mono text-dark-50 break-all">{remediation.value}</span>
+          {onApply ? (
+            <button
+              type="button"
+              onClick={() => onApply(remediation.applies_to, remediation.value)}
+              className="px-2 py-0.5 bg-dark-700 text-dark-100 rounded text-[10px] font-medium hover:bg-dark-600 transition-colors"
+            >
+              Use it
+            </button>
+          ) : (
+            <CopyButton value={remediation.value} label={remediation.label.toLowerCase()} />
+          )}
+        </div>
+      );
+
+    case "link":
+      return (
+        <a
+          href={remediation.href}
+          className="mt-3 inline-block px-3 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors"
+        >
+          {remediation.label}
+        </a>
+      );
+  }
+}
+
 interface CalloutProps {
   prereq: PrereqResult | null;
   /** Re-run the check. Renders a "Check again" button when provided. */
@@ -114,6 +207,8 @@ interface CalloutProps {
   checking?: boolean;
   /** Show a quiet confirmation when the prerequisite is met. Off by default. */
   showSatisfied?: boolean;
+  /** Apply a suggested value to a form field, for `value` remediations. */
+  onApply?: (appliesTo: string, value: string) => void;
   className?: string;
 }
 
@@ -122,6 +217,7 @@ export function PrereqCallout({
   onRecheck,
   checking,
   showSatisfied = false,
+  onApply,
   className = "",
 }: CalloutProps) {
   if (!prereq) return null;
@@ -169,7 +265,9 @@ export function PrereqCallout({
         </dl>
       )}
 
-      {prereq.remediation && <DnsRecordCard record={prereq.remediation} />}
+      {prereq.remediation && (
+        <RemediationView remediation={prereq.remediation} onApply={onApply} />
+      )}
 
       {onRecheck && (
         <button
@@ -237,4 +335,103 @@ export function useDnsPrereq(domain: string, opts?: { debounceMs?: number; autoP
   }, [autoPoll, prereq, domain, run]);
 
   return { prereq, checking, recheck: () => run(domain) };
+}
+
+/**
+ * Run any endpoint that returns `{ checks: PrereqResult[] }`.
+ *
+ * The multi-result sibling of `useDnsPrereq`, with the same two properties that
+ * matter: debounced, because the app deploy form calls it on every keystroke,
+ * and cancel-aware via a request sequence, so a slow lookup for a half-filled
+ * form can never overwrite the verdict for the finished one.
+ *
+ * `path` of `null` disables the hook entirely — what a closed dialog wants.
+ */
+export function usePrereqs(path: string | null, opts?: { debounceMs?: number; autoPoll?: boolean }) {
+  const { debounceMs = 500, autoPoll = false } = opts ?? {};
+  const [checks, setChecks] = useState<PrereqResult[]>([]);
+  const [checking, setChecking] = useState(false);
+  const requestSeq = useRef(0);
+
+  const run = useCallback(async (target: string | null) => {
+    if (!target) {
+      setChecks([]);
+      return;
+    }
+    const seq = ++requestSeq.current;
+    setChecking(true);
+    try {
+      const r = await api.get<{ checks: PrereqResult[] }>(target);
+      if (seq === requestSeq.current) setChecks(r.checks ?? []);
+    } catch {
+      // Same rule as the DNS hook: an unavailable check is not a failed
+      // prerequisite, and must never gate anything.
+      if (seq === requestSeq.current) setChecks([]);
+    } finally {
+      if (seq === requestSeq.current) setChecking(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => run(path), debounceMs);
+    return () => clearTimeout(t);
+  }, [path, debounceMs, run]);
+
+  useEffect(() => {
+    if (!autoPoll || !path || checks.length === 0) return;
+    if (checks.every((c) => c.state === "satisfied")) return;
+    const t = setInterval(() => run(path), 20000);
+    return () => clearInterval(t);
+  }, [autoPoll, path, checks, run]);
+
+  return { checks, checking, blocker: firstBlocker(checks), recheck: () => run(path) };
+}
+
+/**
+ * Render a set of prerequisites, loudest first.
+ *
+ * Only actionable results are shown by default. A surface with four checks would
+ * otherwise print four paragraphs of "this is fine" — which buries the one that
+ * isn't, and is the same mistake as rendering an error 1400 lines from its
+ * button.
+ */
+export function PrereqList({
+  checks,
+  onRecheck,
+  checking,
+  onApply,
+  showSatisfied = false,
+  className = "",
+}: {
+  checks: PrereqResult[];
+  onRecheck?: () => void;
+  checking?: boolean;
+  onApply?: (appliesTo: string, value: string) => void;
+  showSatisfied?: boolean;
+  className?: string;
+}) {
+  const rank = (p: PrereqResult) =>
+    prereqBlocks(p) ? 0 : p.state === "unsatisfied" ? 1 : p.state === "unknown" ? 2 : 3;
+
+  const visible = checks
+    .filter((c) => showSatisfied || c.state === "unsatisfied")
+    .sort((a, b) => rank(a) - rank(b));
+
+  if (visible.length === 0) return null;
+
+  return (
+    <div className={`space-y-2 ${className}`}>
+      {visible.map((c, i) => (
+        <PrereqCallout
+          key={c.key}
+          prereq={c}
+          showSatisfied={showSatisfied}
+          onApply={onApply}
+          // One "Check again" per list, on the most urgent item only.
+          onRecheck={i === 0 ? onRecheck : undefined}
+          checking={checking}
+        />
+      ))}
+    </div>
+  );
 }

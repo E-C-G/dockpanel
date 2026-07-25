@@ -299,12 +299,45 @@ async fn change_hostname(Json(body): Json<serde_json::Value>) -> Result<Json<ser
     Ok(Json(serde_json::json!({ "ok": true, "hostname": hostname })))
 }
 
+/// GET /system/port-check?port=8080 — Is this host port free to publish on?
+///
+/// Answers the one question the deploy preflight cannot answer from the panel's
+/// own records: a port can be held by something DockPanel doesn't manage — the
+/// operator's own service, a stray container, a system daemon — and the only
+/// authority on that is the host itself.
+///
+/// Probes `127.0.0.1` because that is exactly where `docker_apps::deploy`
+/// publishes (`host_ip: 127.0.0.1`), so a successful bind here is evidence about
+/// the same address the container will contend for. Same bind-test idiom as
+/// `routes/database.rs::find_free_port`.
+async fn port_check(
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    let port: u16 = q
+        .get("port")
+        .and_then(|p| p.parse().ok())
+        .filter(|p| *p > 0)
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "port must be 1-65535"})),
+            )
+        })?;
+
+    // Binding and immediately dropping is the only honest test. The listener is
+    // closed at the end of this scope; nothing is left holding the port.
+    let free = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+
+    Ok(Json(serde_json::json!({ "port": port, "free": free })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/system/info", get(system_info))
         .route("/system/processes", get(processes))
         .route("/system/network", get(network))
         .route("/system/disk-io", get(disk_io))
+        .route("/system/port-check", get(port_check))
         .route("/system/cleanup", axum::routing::post(disk_cleanup))
         .route("/system/hostname", axum::routing::post(change_hostname))
 }

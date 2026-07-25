@@ -148,6 +148,34 @@ pub async fn deploy(
         }
     }
 
+    // ── Prerequisite gate ──
+    // The same checks the deploy form ran while it was being filled in. Enforcing
+    // by CALLING the checker (rather than re-deriving the conditions here) is what
+    // keeps the sentence the user was shown and the sentence they are refused with
+    // identical — the drift this layer exists to prevent. Only `blocking` results
+    // refuse; a warning is the operator's call.
+    {
+        use crate::services::prerequisites::apps::{AppDeployIntent, evaluate};
+
+        let intent = AppDeployIntent {
+            template_id: body.template_id.clone(),
+            name: body.name.clone(),
+            port: body.port,
+            env: body.env.clone().unwrap_or_default(),
+            memory_mb: body.memory_mb,
+        };
+        let specs = template_env_specs(&agent, &body.template_id).await;
+        let facts = gather_app_facts(&state.db, &agent, body.port).await;
+
+        let results = evaluate(&intent, &specs, &facts);
+        if let Some(blocker) = crate::services::prerequisites::first_blocker(&results) {
+            return Err(err(
+                StatusCode::PRECONDITION_FAILED,
+                &format!("{} — {}", blocker.title, blocker.detail),
+            ));
+        }
+    }
+
     // Image scan deploy gate (no-op unless admin opted in via Settings)
     crate::routes::image_scans::preflight_gate(&state.db, &agent, &body.template_id).await?;
 
@@ -435,6 +463,174 @@ pub async fn deploy(
         "deploy_id": deploy_id,
         "message": "Deployment started",
     }))))
+}
+
+// ── Deploy preflight (the guidance layer's Docker-apps vertical) ────────────
+
+#[derive(serde::Deserialize)]
+pub struct AppPreflightQuery {
+    pub template_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
+    /// Names of env vars the form currently has a non-empty value for. Only the
+    /// NAMES travel: a preflight that ran as the user typed a database password
+    /// would put that password in a query string, the access log and the browser
+    /// history. The check only needs to know which fields are filled.
+    #[serde(default)]
+    pub filled_env: String,
+}
+
+/// Gather everything the app checks need, in as few agent round-trips as
+/// possible, and never let a missing fact become a refusal.
+async fn gather_app_facts(
+    db: &sqlx::PgPool,
+    agent: &crate::services::agent::AgentHandle,
+    port: u16,
+) -> crate::services::prerequisites::apps::HostFacts {
+    use crate::services::prerequisites::apps::{HostFacts, PortHolder};
+
+    let mut facts = HostFacts::default();
+
+    // Containers DockPanel manages: their names and published ports.
+    if let Ok(apps) = agent.get("/apps").await {
+        if let Some(arr) = apps.as_array() {
+            for app in arr {
+                if let Some(name) = app.get("name").and_then(|v| v.as_str()) {
+                    facts.taken_names.push(name.to_string());
+                    if let Some(p) = app.get("port").and_then(|v| v.as_u64()) {
+                        facts.used_ports.push(PortHolder {
+                            port: p as u16,
+                            description: format!("the app `{name}`"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Sites that proxy to a local port hold one too.
+    let site_ports: Vec<(Option<i32>, String)> = sqlx::query_as(
+        "SELECT proxy_port, domain FROM sites WHERE proxy_port IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for (p, domain) in site_ports {
+        if let Some(p) = p {
+            if p > 0 && p <= u16::MAX as i32 {
+                facts.used_ports.push(PortHolder {
+                    port: p as u16,
+                    description: format!("the site {domain}"),
+                });
+            }
+        }
+    }
+
+    if let Ok(info) = agent.get("/system/info").await {
+        facts.mem_total_mb = info.get("mem_total_mb").and_then(|v| v.as_u64());
+        facts.mem_used_mb = info.get("mem_used_mb").and_then(|v| v.as_u64());
+    }
+
+    // The host's own verdict on the port. An agent older than v2.29.0 has no
+    // such route, so this stays `None` and the check degrades to `unknown` —
+    // a fleet member we can't interrogate must not be a fleet member we refuse.
+    if port > 0 {
+        facts.port_probe_free = agent
+            .get(&format!("/system/port-check?port={port}"))
+            .await
+            .ok()
+            .and_then(|v| v.get("free").and_then(|f| f.as_bool()));
+    }
+
+    facts
+}
+
+/// Read a template's declared env vars from the agent's template catalogue.
+async fn template_env_specs(
+    agent: &crate::services::agent::AgentHandle,
+    template_id: &str,
+) -> Vec<crate::services::prerequisites::apps::AppEnvSpec> {
+    use crate::services::prerequisites::apps::AppEnvSpec;
+
+    let Ok(templates) = agent.get("/apps/templates").await else {
+        return Vec::new();
+    };
+
+    templates
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(template_id))
+        })
+        .and_then(|t| t.get("env_vars"))
+        .and_then(|v| v.as_array())
+        .map(|vars| {
+            vars.iter()
+                .map(|v| {
+                    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let b = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+                    AppEnvSpec {
+                        name: s("name"),
+                        label: {
+                            let l = s("label");
+                            if l.is_empty() { s("name") } else { l }
+                        },
+                        default: s("default"),
+                        required: b("required"),
+                        secret: b("secret"),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the intent the checks evaluate.
+///
+/// `filled_env` carries only the NAMES of fields the form has values for, so
+/// `check_required_env` sees a placeholder rather than the secret itself. The
+/// check only ever tests emptiness.
+fn intent_from_query(q: &AppPreflightQuery) -> crate::services::prerequisites::apps::AppDeployIntent {
+    crate::services::prerequisites::apps::AppDeployIntent {
+        template_id: q.template_id.clone(),
+        name: q.name.clone(),
+        port: q.port,
+        env: q
+            .filled_env
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| (s.to_string(), "set".to_string()))
+            .collect(),
+        memory_mb: q.memory_mb,
+    }
+}
+
+/// GET /api/apps/preflight — Evaluate the prerequisites for an intended deploy.
+///
+/// Called as the deploy form is filled in, so that the conditions which would
+/// otherwise surface as `Deploy failed: …` several minutes into an image pull are
+/// visible while they are still cheap to fix.
+pub async fn preflight(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    ServerScope(_server_id, agent): ServerScope,
+    axum::extract::Query(q): axum::extract::Query<AppPreflightQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
+
+    let intent = intent_from_query(&q);
+    let specs = template_env_specs(&agent, &q.template_id).await;
+    let facts = gather_app_facts(&state.db, &agent, q.port).await;
+
+    let results = crate::services::prerequisites::apps::evaluate(&intent, &specs, &facts);
+    let blocked = crate::services::prerequisites::first_blocker(&results).is_some();
+
+    Ok(Json(serde_json::json!({ "checks": results, "blocked": blocked })))
 }
 
 /// GET /api/apps/deploy/{deploy_id}/log — SSE stream of deploy progress.

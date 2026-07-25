@@ -156,7 +156,7 @@ fn strip_dot(name: &str) -> String {
 /// A DNS name/domain is safe to pass as a POSITIONAL `dig` argument only if dig cannot
 /// parse it as an option: non-empty, no leading '-'/'+', and a conservative charset.
 /// `allow_underscore` covers query names like `_dmarc` / `_acme-challenge`.
-fn is_safe_dig_arg(s: &str, allow_underscore: bool) -> bool {
+pub(crate) fn is_safe_dig_arg(s: &str, allow_underscore: bool) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && !s.starts_with('+')

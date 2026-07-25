@@ -3,6 +3,7 @@ import { Navigate } from "react-router-dom";
 import { useState, useEffect } from "react";
 import { api } from "../api";
 import { formatSize, formatDate, timeAgo } from "../utils/format";
+import { PrereqList, type PrereqResult } from "../components/Prerequisite";
 
 interface ServerSla {
   server_id: string | null;
@@ -182,6 +183,7 @@ export default function BackupOrchestrator() {
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [databases, setDatabases] = useState<Database[]>([]);
   const [servers, setServers] = useState<ServerRow[]>([]);
+  const [prereqs, setPrereqs] = useState<PrereqResult[]>([]);
   const [unified, setUnified] = useState<UnifiedBackupsResponse>({ items: [], total: 0 });
   const [unifiedFilterServer, setUnifiedFilterServer] = useState<string>("");
   const [unifiedFilterKind, setUnifiedFilterKind] = useState<"" | "site" | "database" | "volume">("");
@@ -202,7 +204,7 @@ export default function BackupOrchestrator() {
   const loadAll = async () => {
     setLoading(true);
     try {
-      const [h, p, db, vol, ver, drl, dest, dbs, srv] = await Promise.all([
+      const [h, p, db, vol, ver, drl, dest, dbs, srv, pre] = await Promise.all([
         api.get<BackupHealth>("/backup-orchestrator/health").catch(() => null),
         api.get<BackupPolicy[]>("/backup-orchestrator/policies").catch(() => []),
         api.get<DatabaseBackup[]>("/backup-orchestrator/db-backups").catch(() => []),
@@ -212,6 +214,7 @@ export default function BackupOrchestrator() {
         api.get<Destination[]>("/backup-destinations").catch(() => []),
         api.get<Database[]>("/databases").catch(() => []),
         api.get<ServerRow[]>("/servers").catch(() => []),
+        api.get<{ checks: PrereqResult[] }>("/backup-orchestrator/preflight").catch(() => ({ checks: [] })),
       ]);
       setHealth(h);
       setPolicies(p);
@@ -223,6 +226,7 @@ export default function BackupOrchestrator() {
       setDestinations(dest);
       setDatabases(dbs);
       setServers(srv);
+      setPrereqs(pre.checks ?? []);
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Failed to load", type: "error" });
     } finally {
@@ -375,6 +379,10 @@ export default function BackupOrchestrator() {
       </div>
 
       {/* Tab Content */}
+      {/* Prerequisites lead the Overview: a 98%-verified SLA card above a fleet
+          whose backups never leave the box is a reassuring number about the
+          wrong thing. */}
+      {tab === "overview" && <PrereqList checks={prereqs} className="mb-4" />}
       {tab === "overview" && health && <OverviewTab health={health} />}
       {tab === "all" && (
         <AllBackupsTab

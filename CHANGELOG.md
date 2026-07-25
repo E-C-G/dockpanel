@@ -6,6 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.29.0] - 2026-07-26
+
+The prerequisite layer stops being a DNS feature and becomes the systemic one the brief asked for.
+Three more verticals — Docker apps, mail, backups — and in each of them the check turned out to be the
+smaller half of the work: underneath every one was a surface already telling the operator something
+untrue.
+
+### Added — three more prerequisite verticals
+
+- **Docker apps: a deploy preflight** (`GET /api/apps/preflight`, `services/prerequisites/apps.rs`).
+  Checks the conditions that otherwise surface as `Deploy failed: …` several minutes into an image
+  pull: a required setting with no value, a host port that is already taken, a container name already
+  in use, and a memory limit larger than the server's free — or total — memory. Rendered immediately
+  above the Deploy button, which is gated on the blocking ones. The same checks now enforce the
+  deploy server-side, so the sentence a user is shown and the sentence they are refused with are the
+  same sentence.
+- **Required settings can be generated rather than explained.** 104 of the 153 app templates declare a
+  variable that is required and has no default — the database passwords, `SECRET_KEY_BASE`,
+  `MEILI_MASTER_KEY`. Secret ones now offer a Generate button (CSPRNG, unbiased, no ambiguous glyphs,
+  and working over plain HTTP where `crypto.subtle` would not).
+- **Mail: are these records actually published?** (`GET /api/mail/domains/{id}/preflight`.) Reports
+  per-record state with the exact record to create, and separately flags a domain whose DKIM key never
+  generated.
+- **Backups: will any of this survive losing this machine?**
+  (`GET /api/backup-orchestrator/preflight`.) One result per enabled policy, plus the prior question
+  of whether anything is scheduled at all. Leads the Overview tab, above the SLA card.
+
+### Fixed
+
+- **The Backup Orchestrator ignored the destination you chose.** `backup_policy_executor` selected
+  `destination_id` and never read it, so every policy-driven backup — sites, databases and volumes —
+  stayed on the disk it was insuring, while the policy form offered a Destination dropdown, the schema
+  carried `destination_id` and `uploaded` columns, and the backup list rendered a `remote` badge that
+  could never light for a policy row. Policies now upload with the same retry ladder the per-site
+  scheduler has always used, prune remote site archives to the retention count, and record which
+  destination received the file. An upload that fails degrades the run to `partial` and raises an
+  alert instead of reporting success. A destination that is simply down trips a per-run circuit
+  breaker rather than costing ~50 seconds for every file.
+- **The mail DNS tab published records that could not work.** It read the agent's *hostname* into a
+  variable named `server_ip`, so it told operators to create `A mail.example.com → my-server` and the
+  invalid SPF value `v=spf1 a mx ip4:my-server ~all`. It also disagreed with the auto-DNS writer on
+  the A record's name, the MX target, the SPF policy and the DKIM selector — two different mail
+  topologies from one product. Both paths now derive from one record set.
+- **"All DNS records verified" could be shown for a domain whose mail was being rejected.** The
+  existing mail DNS check tested only that records of the right *kind* existed: any MX passed
+  (including one pointing at another provider), any `v=spf1` passed (including one that explicitly
+  forbids this server), and DKIM passed on `contains("p=")` without ever comparing our key. It now
+  compares against the records we actually publish, while still accepting a stricter SPF, a backup MX
+  and the conventional `mail.<domain>` host — and reports a lookup it could not run as *not checked*
+  rather than as missing.
+- **A refused deploy was invisible.** The Docker apps page rendered deploy errors in a banner ~700
+  lines above the deploy dialog, behind the dialog's own overlay. Same defect class as v2.28.0's F1;
+  errors now render inside the dialog, next to the button.
+- **Site backups could not report being copied off-site.** `backups` never had the `destination_id` /
+  `uploaded` columns its two sibling tables have, so the unified backup list hardcoded `FALSE` for
+  every site row.
+
+### Known gaps
+
+- Remote retention still covers site archives only: the agent's prune is keyed on a site domain, so
+  database and volume copies accumulate at the destination even though their local copies are pruned.
+
 ## [2.28.1] - 2026-07-25
 
 Two gaps that only a fresh box could show, found by verifying v2.28.0 on one rather than by reading

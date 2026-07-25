@@ -3,6 +3,7 @@ import { Navigate } from "react-router-dom";
 import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
+import { PrereqList, usePrereqs } from "../components/Prerequisite";
 import { timeAgo } from "../utils/format";
 
 interface EnvVar {
@@ -328,6 +329,57 @@ export default function Apps() {
   const [gpuSelectedIndices, setGpuSelectedIndices] = useState<number[]>([]);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [message, setMessage] = useState({ text: "", type: "" });
+  /** Deploy refusals, rendered INSIDE the deploy dialog. */
+  const [deployError, setDeployError] = useState("");
+
+  // ── Deploy preflight ──
+  // Only the NAMES of filled env fields travel, never their values: this runs on
+  // every keystroke, and a database password in a query string ends up in the
+  // access log and the browser history.
+  const filledEnv = Object.entries(envValues)
+    .filter(([, v]) => v.trim() !== "")
+    .map(([k]) => k)
+    .join(",");
+  const preflightPath = selected
+    ? `/apps/preflight?template_id=${encodeURIComponent(selected.id)}` +
+      `&name=${encodeURIComponent(appName)}&port=${appPort}` +
+      (memoryMb ? `&memory_mb=${encodeURIComponent(memoryMb)}` : "") +
+      `&filled_env=${encodeURIComponent(filledEnv)}`
+    : null;
+  const { checks: deployChecks, checking: preflightChecking, blocker: deployBlocker, recheck: recheckDeploy } =
+    usePrereqs(preflightPath);
+
+  /** Apply a suggested port or name from a prerequisite's remediation. */
+  const applySuggestion = (appliesTo: string, value: string) => {
+    if (appliesTo === "port") setAppPort(parseInt(value, 10) || appPort);
+    else if (appliesTo === "name") setAppName(value);
+  };
+
+  /**
+   * Fill a required secret with a strong random value.
+   *
+   * `crypto.getRandomValues` — not `crypto.subtle` — because it is available in
+   * insecure contexts too, and the documented install lands the operator on plain
+   * HTTP (audit finding F8). A generator that silently did nothing over HTTP would
+   * be worse than none.
+   */
+  const generateSecret = (name: string) => {
+    // Ambiguous glyphs (0/O, 1/l/I) omitted — these get read off a screen and
+    // retyped into a config file more often than anyone would like.
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    // Reject bytes past the largest whole multiple of the alphabet, so every
+    // character is equally likely rather than biased toward the low letters.
+    const limit = 256 - (256 % alphabet.length);
+    let out = "";
+    while (out.length < 24) {
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      for (const b of bytes) {
+        if (b < limit && out.length < 24) out += alphabet[b % alphabet.length];
+      }
+    }
+    setEnvValues((prev) => ({ ...prev, [name]: out }));
+  };
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [logsTarget, setLogsTarget] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -515,6 +567,7 @@ export default function Apps() {
 
   const openDeploy = (tmpl: AppTemplate) => {
     setSelected(tmpl);
+    setDeployError("");
     setAppName(tmpl.id);
     setAppPort(tmpl.default_port);
     setAppDomain("");
@@ -534,6 +587,7 @@ export default function Apps() {
     if (!selected) return;
     setDeploying(true);
     setMessage({ text: "", type: "" });
+    setDeployError("");
     try {
       const deployBody: Record<string, unknown> = {
         template_id: selected.id,
@@ -570,10 +624,11 @@ export default function Apps() {
         setDeploying(false);
       }
     } catch (e) {
-      setMessage({
-        text: e instanceof Error ? e.message : "Deploy failed",
-        type: "error",
-      });
+      // Inside the dialog, next to the button that was pressed. The page-level
+      // `message` banner renders ~700 lines above this modal and is covered by
+      // the modal's own overlay, so a deploy refusal shown there is a refusal the
+      // user never sees — the exact defect audit finding F1 turned out to be.
+      setDeployError(e instanceof Error ? e.message : "Deploy failed");
       setDeploying(false);
     }
   };
@@ -2037,16 +2092,30 @@ volumes:
                         <label className="block text-xs text-dark-200 mb-0.5">
                           {v.label} {v.required && <span className="text-danger-500">*</span>}
                         </label>
-                        <input
-                          type={v.secret ? "password" : "text"}
-                          list={selected.id === "vllm" && v.name === "MODEL" ? "vllm-models" : undefined}
-                          value={envValues[v.name] || ""}
-                          onChange={(e) =>
-                            setEnvValues({ ...envValues, [v.name]: e.target.value })
-                          }
-                          placeholder={v.default || v.name}
-                          className="w-full px-3 py-1.5 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
-                        />
+                        <div className="flex gap-2">
+                          <input
+                            type={v.secret ? "password" : "text"}
+                            list={selected.id === "vllm" && v.name === "MODEL" ? "vllm-models" : undefined}
+                            value={envValues[v.name] || ""}
+                            onChange={(e) =>
+                              setEnvValues({ ...envValues, [v.name]: e.target.value })
+                            }
+                            placeholder={v.default || v.name}
+                            className="w-full px-3 py-1.5 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                          />
+                          {/* Remove the choice rather than explain it: a required
+                              secret with no default is a field nobody can answer
+                              well, so offer to answer it for them. */}
+                          {v.secret && v.required && !v.default && (
+                            <button
+                              type="button"
+                              onClick={() => generateSecret(v.name)}
+                              className="px-3 py-1.5 bg-dark-700 text-dark-100 rounded-lg text-xs font-medium hover:bg-dark-600 shrink-0"
+                            >
+                              Generate
+                            </button>
+                          )}
+                        </div>
                         {selected.id === "vllm" && v.name === "MODEL" && (
                           <datalist id="vllm-models">
                             <option value="meta-llama/Llama-3.2-1B-Instruct" />
@@ -2068,6 +2137,23 @@ volumes:
               )}
             </div>
 
+            {/* The prerequisites render HERE, immediately above the button they
+                gate — lesson #80a: a message 1400 lines from its control is
+                indistinguishable from no message. */}
+            <PrereqList
+              checks={deployChecks}
+              checking={preflightChecking}
+              onRecheck={recheckDeploy}
+              onApply={applySuggestion}
+              className="mt-4"
+            />
+
+            {deployError && (
+              <div role="alert" className="mt-4 px-4 py-3 rounded border border-danger-500/30 bg-danger-500/10 text-sm text-danger-400 whitespace-pre-line">
+                {deployError}
+              </div>
+            )}
+
             <div className="flex justify-end gap-2 mt-6">
               <button
                 onClick={() => setSelected(null)}
@@ -2077,7 +2163,8 @@ volumes:
               </button>
               <button
                 onClick={handleDeploy}
-                disabled={deploying || !appName}
+                disabled={deploying || !appName || !!deployBlocker}
+                title={deployBlocker ? deployBlocker.title : undefined}
                 className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
               >
                 {deploying ? "Deploying..." : "Deploy"}

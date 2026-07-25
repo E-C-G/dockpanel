@@ -1,4 +1,3 @@
-use crate::safe_cmd::safe_command;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -439,7 +438,6 @@ pub async fn delete_domain(
 pub async fn domain_dns(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let domain: Option<(String, String, Option<String>)> = sqlx::query_as(
@@ -452,54 +450,37 @@ pub async fn domain_dns(
 
     let (domain, selector, dkim_pub) = domain.ok_or_else(|| err(StatusCode::NOT_FOUND, "Domain not found"))?;
 
-    // Get server's public IP for MX record
-    let server_ip = agent.get("/system/info").await
-        .ok()
-        .and_then(|info| info.get("hostname").and_then(|v| v.as_str()).map(String::from))
-        .unwrap_or_else(|| "your-server-ip".to_string());
+    // The server's PUBLIC IP — not the agent's hostname.
+    //
+    // This endpoint used to read `/system/info`'s `hostname` field into a variable
+    // called `server_ip` and publish it as an address, so it told operators to
+    // create `A mail.example.com → my-server` and the invalid SPF value
+    // `v=spf1 a mx ip4:my-server ~all`. The auto-DNS path a few hundred lines below
+    // has always used `detect_public_ip`; the two spellings had simply drifted.
+    // Both now derive from `prerequisites::mail::mail_records`.
+    let server_ip = crate::helpers::detect_public_ip_cached().await;
+    let server_ip = if server_ip.is_empty() {
+        "your-server-ip".to_string()
+    } else {
+        server_ip
+    };
 
-    let mut records = vec![
+    let records: Vec<serde_json::Value> = crate::services::prerequisites::mail::mail_records(
+        &domain,
+        &selector,
+        dkim_pub.as_deref(),
+        &server_ip,
+    )
+    .into_iter()
+    .map(|r| {
         serde_json::json!({
-            "type": "MX",
-            "name": domain,
-            "content": format!("10 mail.{domain}"),
-            "description": "Mail exchanger — points to your mail server"
-        }),
-        serde_json::json!({
-            "type": "A",
-            "name": format!("mail.{domain}"),
-            "content": server_ip,
-            "description": "Mail server hostname"
-        }),
-        serde_json::json!({
-            "type": "TXT",
-            "name": domain,
-            "content": format!("v=spf1 a mx ip4:{server_ip} ~all"),
-            "description": "SPF — authorizes this server to send mail for this domain"
-        }),
-        serde_json::json!({
-            "type": "TXT",
-            "name": format!("_dmarc.{domain}"),
-            "content": "v=DMARC1; p=quarantine; rua=mailto:postmaster@".to_string() + &domain,
-            "description": "DMARC — tells receiving servers how to handle failed SPF/DKIM"
-        }),
-    ];
-
-    if let Some(pub_key) = dkim_pub {
-        // Strip PEM headers and newlines for DNS record
-        let key_data = pub_key
-            .replace("-----BEGIN PUBLIC KEY-----", "")
-            .replace("-----END PUBLIC KEY-----", "")
-            .replace('\n', "")
-            .replace('\r', "");
-
-        records.push(serde_json::json!({
-            "type": "TXT",
-            "name": format!("{selector}._domainkey.{domain}"),
-            "content": format!("v=DKIM1; k=rsa; p={key_data}"),
-            "description": "DKIM — cryptographic signature for outgoing mail"
-        }));
-    }
+            "type": r.record_type,
+            "name": r.fqdn,
+            "content": r.value,
+            "description": r.purpose.unwrap_or_default(),
+        })
+    })
+    .collect();
 
     Ok(Json(serde_json::json!({
         "domain": domain,
@@ -959,15 +940,18 @@ async fn auto_create_mail_dns(
         return Err("Could not detect server public IP".into());
     }
 
-    // Prepare DKIM TXT value if key is available
-    let dkim_txt = dkim_public_key.map(|pk| {
-        let key_data = pk
-            .replace("-----BEGIN PUBLIC KEY-----", "")
-            .replace("-----END PUBLIC KEY-----", "")
-            .replace('\n', "")
-            .replace('\r', "");
-        format!("v=DKIM1; k=rsa; p={key_data}")
-    });
+    // THE record set — the same one the DNS tab shows and the prerequisite check
+    // verifies.
+    //
+    // This used to be spelled inline here and again in `domain_dns`, and the two
+    // had drifted apart: this path published `A <domain>` with `MX → <domain>` and
+    // `v=spf1 ip4:… -all`, while the tab described `A mail.<domain>` with
+    // `MX → mail.<domain>` and `v=spf1 a mx ip4:… ~all`, under a DKIM selector this
+    // path hardcoded to `dockpanel` regardless of the stored column. Two different
+    // mail topologies from one product. Now there is one.
+    let selector = crate::services::prerequisites::mail::DEFAULT_DKIM_SELECTOR;
+    let records =
+        crate::services::prerequisites::mail::mail_records(domain, selector, dkim_public_key, &server_ip);
 
     if provider == "cloudflare" {
         let (zone_id, token) = match (cf_zone_id, cf_api_token) {
@@ -979,42 +963,36 @@ async fn auto_create_mail_dns(
         let headers = cf_headers(&token, cf_api_email.as_deref());
         let cf_url = format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records");
 
-        // All mail records MUST be proxied: false (DNS-only)
+        for record in &records {
+            // MX priority is a separate field in the Cloudflare API, not part of
+            // the content string.
+            let (content, priority) = if record.record_type == "MX" {
+                let mut parts = record.value.splitn(2, ' ');
+                let pri: u16 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(10);
+                (parts.next().unwrap_or(&record.value).to_string(), Some(pri))
+            } else {
+                (record.value.clone(), None)
+            };
 
-        // 1. A record (DNS-only — SMTP cannot traverse CF proxy)
-        let _ = client.post(&cf_url).headers(headers.clone()).json(&serde_json::json!({
-            "type": "A", "name": domain, "content": server_ip, "proxied": false, "ttl": 1,
-        })).send().await;
-        tracing::info!("Auto-DNS (mail): created A record {domain} → {server_ip}");
+            let mut body = serde_json::json!({
+                "type": record.record_type,
+                "name": record.fqdn,
+                "content": content,
+                "ttl": 1,
+                // Every mail record must be DNS-only: SMTP cannot traverse the
+                // Cloudflare proxy, so an orange-clouded mail host is unreachable.
+                "proxied": false,
+            });
+            if let Some(pri) = priority {
+                body["priority"] = serde_json::json!(pri);
+            }
 
-        // 2. MX record
-        let _ = client.post(&cf_url).headers(headers.clone()).json(&serde_json::json!({
-            "type": "MX", "name": domain, "content": domain, "priority": 10, "ttl": 1,
-        })).send().await;
-        tracing::info!("Auto-DNS (mail): created MX record {domain} → {domain} (pri 10)");
-
-        // 3. SPF TXT record
-        let spf = format!("v=spf1 ip4:{server_ip} -all");
-        let _ = client.post(&cf_url).headers(headers.clone()).json(&serde_json::json!({
-            "type": "TXT", "name": domain, "content": spf, "ttl": 1,
-        })).send().await;
-        tracing::info!("Auto-DNS (mail): created SPF TXT for {domain}");
-
-        // 4. DMARC TXT record
-        let dmarc = format!("v=DMARC1; p=quarantine; rua=mailto:postmaster@{domain}");
-        let dmarc_name = format!("_dmarc.{domain}");
-        let _ = client.post(&cf_url).headers(headers.clone()).json(&serde_json::json!({
-            "type": "TXT", "name": dmarc_name, "content": dmarc, "ttl": 1,
-        })).send().await;
-        tracing::info!("Auto-DNS (mail): created DMARC TXT for {domain}");
-
-        // 5. DKIM TXT record (if key available)
-        if let Some(dkim_val) = &dkim_txt {
-            let dkim_name = format!("dockpanel._domainkey.{domain}");
-            let _ = client.post(&cf_url).headers(headers.clone()).json(&serde_json::json!({
-                "type": "TXT", "name": dkim_name, "content": dkim_val, "ttl": 1,
-            })).send().await;
-            tracing::info!("Auto-DNS (mail): created DKIM TXT for {domain}");
+            let _ = client.post(&cf_url).headers(headers.clone()).json(&body).send().await;
+            tracing::info!(
+                "Auto-DNS (mail): created {} record {} for {domain}",
+                record.record_type,
+                record.fqdn
+            );
         }
 
         // ── Auto-SSL: provision certificate for the mail domain ───────────
@@ -1042,44 +1020,31 @@ async fn auto_create_mail_dns(
 
         let client = reqwest::Client::new();
         let zone_fqdn = if parent.ends_with('.') { parent.clone() } else { format!("{parent}.") };
-        let domain_fqdn = format!("{domain}.");
 
-        let mut rrsets = vec![
-            // A record
-            serde_json::json!({
-                "name": &domain_fqdn, "type": "A", "ttl": 300, "changetype": "REPLACE",
-                "records": [{ "content": &server_ip, "disabled": false }]
-            }),
-            // MX record (PowerDNS includes priority in content)
-            serde_json::json!({
-                "name": &domain_fqdn, "type": "MX", "ttl": 300, "changetype": "REPLACE",
-                "records": [{ "content": format!("10 {domain_fqdn}"), "disabled": false }]
-            }),
-        ];
-
-        // SPF + DMARC as separate TXT rrsets (different names)
-        let spf = format!("\"v=spf1 ip4:{server_ip} -all\"");
-        rrsets.push(serde_json::json!({
-            "name": &domain_fqdn, "type": "TXT", "ttl": 300, "changetype": "REPLACE",
-            "records": [{ "content": &spf, "disabled": false }]
-        }));
-
-        let dmarc_name = format!("_dmarc.{domain_fqdn}");
-        let dmarc = format!("\"v=DMARC1; p=quarantine; rua=mailto:postmaster@{domain}\"");
-        rrsets.push(serde_json::json!({
-            "name": &dmarc_name, "type": "TXT", "ttl": 300, "changetype": "REPLACE",
-            "records": [{ "content": &dmarc, "disabled": false }]
-        }));
-
-        // DKIM TXT record
-        if let Some(dkim_val) = &dkim_txt {
-            let dkim_name = format!("dockpanel._domainkey.{domain_fqdn}");
-            let dkim_quoted = format!("\"{dkim_val}\"");
-            rrsets.push(serde_json::json!({
-                "name": &dkim_name, "type": "TXT", "ttl": 300, "changetype": "REPLACE",
-                "records": [{ "content": &dkim_quoted, "disabled": false }]
-            }));
-        }
+        // Same record set as the Cloudflare branch above, in PowerDNS's rrset
+        // shape: names are fully qualified with a trailing dot, MX priority stays
+        // inside the content string, and TXT values must arrive quoted.
+        let rrsets: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| {
+                let name = format!("{}.", record.fqdn);
+                let content = if record.record_type == "TXT" {
+                    format!("\"{}\"", record.value)
+                } else if record.record_type == "MX" {
+                    // "10 mail.example.com" → "10 mail.example.com."
+                    match record.value.rsplit_once(' ') {
+                        Some((pri, host)) => format!("{pri} {host}."),
+                        None => record.value.clone(),
+                    }
+                } else {
+                    record.value.clone()
+                };
+                serde_json::json!({
+                    "name": name, "type": record.record_type, "ttl": 300, "changetype": "REPLACE",
+                    "records": [{ "content": content, "disabled": false }]
+                })
+            })
+            .collect();
 
         let result = client
             .patch(&format!("{url}/api/v1/servers/localhost/zones/{zone_fqdn}"))
@@ -1149,7 +1114,9 @@ async fn auto_delete_mail_dns(
         let client = reqwest::Client::new();
         let headers = cf_headers(&token, cf_api_email.as_deref());
 
-        // Collect all record names we need to clean up
+        // Collect all record names we need to clean up. These mirror exactly what
+        // `auto_create_mail_dns` publishes (apex A + MX + SPF, _dmarc, DKIM) —
+        // keep the two lists in step, or removing a domain leaves records behind.
         let names_to_check = vec![
             domain.to_string(),
             format!("_dmarc.{domain}"),
@@ -1331,71 +1298,98 @@ pub async fn relay_remove(
 
 // ── DNS Verification ─────────────────────────────────────────────────────
 
+/// Load a mail domain's identity for the DNS paths.
+async fn mail_domain_identity(
+    db: &sqlx::PgPool,
+    id: Uuid,
+) -> Result<(String, String, Option<String>), ApiError> {
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT domain, dkim_selector, dkim_public_key FROM mail_domains WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("mail domain", e))?;
+
+    let (domain, selector, dkim_pub) =
+        row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Domain not found"))?;
+    Ok((
+        domain,
+        selector.unwrap_or_else(|| {
+            crate::services::prerequisites::mail::DEFAULT_DKIM_SELECTOR.to_string()
+        }),
+        dkim_pub,
+    ))
+}
+
 /// GET /api/mail/domains/{id}/dns-check — Verify DNS records are propagated.
+///
+/// # What this used to prove, and didn't
+///
+/// This endpoint predates the prerequisite layer and checked only that records of
+/// the right *kind* existed. MX passed on any MX at all — including a Google
+/// Workspace one, i.e. exactly the configuration under which this server's mail is
+/// never delivered. SPF passed on any `v=spf1` string, so a domain publishing
+/// `include:sendgrid.net -all` — which explicitly forbids this server — reported a
+/// pass. DKIM passed on `contains("p=")` without ever comparing our key. The A
+/// record was not checked at all.
+///
+/// An operator could therefore be shown "All DNS records verified" for a domain
+/// whose mail was being rejected. It now delegates to
+/// `prerequisites::mail::check_mail_dns_published`, which compares against the
+/// records we actually publish, while keeping this response shape so the existing
+/// Mail DNS tab keeps working.
 pub async fn dns_check(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT domain, dkim_selector, dkim_public_key FROM mail_domains WHERE id = $1"
-    ).bind(id).fetch_optional(&state.db).await
-        .map_err(|e| internal_error("dns check", e))?;
+    let (domain, selector, dkim_pub) = mail_domain_identity(&state.db, id).await?;
+    let server_ip = crate::helpers::detect_public_ip_cached().await;
 
-    let (domain, selector, _dkim_pub) = domain.ok_or_else(|| err(StatusCode::NOT_FOUND, "Domain not found"))?;
-    let selector = selector.unwrap_or_else(|| "dockpanel".to_string());
+    let verdict = crate::services::prerequisites::mail::check_mail_dns_published(
+        &domain,
+        &selector,
+        dkim_pub.as_deref(),
+        &server_ip,
+    )
+    .await;
 
-    let mut checks = Vec::new();
+    // Project the structured verdict onto the legacy per-record shape.
+    let records = match &verdict.remediation {
+        Some(crate::services::prerequisites::Remediation::DnsRecords { records }) => records.clone(),
+        // Satisfied (or undeterminable) results carry no remediation; re-derive the
+        // set so the tab always lists every record rather than going blank.
+        _ => crate::services::prerequisites::mail::mail_records(
+            &domain,
+            &selector,
+            dkim_pub.as_deref(),
+            &server_ip,
+        ),
+    };
 
-    // MX record
-    let mx_result = safe_command("dig")
-        .args(["+short", "MX", &domain])
-        .output().await;
-    let mx_value = mx_result.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    checks.push(serde_json::json!({
-        "type": "MX",
-        "status": if !mx_value.is_empty() { "pass" } else { "fail" },
-        "value": mx_value,
-    }));
+    let all_satisfied = verdict.state == crate::services::prerequisites::PrereqState::Satisfied;
 
-    // SPF (TXT record containing v=spf1)
-    let spf_result = safe_command("dig")
-        .args(["+short", "TXT", &domain])
-        .output().await;
-    let spf_raw = spf_result.ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
-    let has_spf = spf_raw.contains("v=spf1");
-    checks.push(serde_json::json!({
-        "type": "SPF",
-        "status": if has_spf { "pass" } else { "fail" },
-        "value": if has_spf { spf_raw.lines().find(|l| l.contains("v=spf1")).unwrap_or("").trim().to_string() } else { "Not found".to_string() },
-    }));
-
-    // DKIM (TXT record at selector._domainkey.domain)
-    let dkim_host = format!("{selector}._domainkey.{domain}");
-    let dkim_result = safe_command("dig")
-        .args(["+short", "TXT", &dkim_host])
-        .output().await;
-    let dkim_raw = dkim_result.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let has_dkim = dkim_raw.contains("v=DKIM1") || dkim_raw.contains("p=");
-    checks.push(serde_json::json!({
-        "type": "DKIM",
-        "status": if has_dkim { "pass" } else { "fail" },
-        "value": if has_dkim { dkim_raw.chars().take(100).collect::<String>() } else { "Not found".to_string() },
-        "host": dkim_host,
-    }));
-
-    // DMARC (TXT record at _dmarc.domain)
-    let dmarc_host = format!("_dmarc.{domain}");
-    let dmarc_result = safe_command("dig")
-        .args(["+short", "TXT", &dmarc_host])
-        .output().await;
-    let dmarc_raw = dmarc_result.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let has_dmarc = dmarc_raw.contains("v=DMARC1");
-    checks.push(serde_json::json!({
-        "type": "DMARC",
-        "status": if has_dmarc { "pass" } else { "fail" },
-        "value": if has_dmarc { dmarc_raw } else { "Not found".to_string() },
-    }));
+    let checks: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            // `present` is None only when the lookup itself couldn't run — report
+            // that as unknown, never as a failure.
+            let status = match r.present {
+                Some(true) => "pass",
+                Some(false) => "fail",
+                None if all_satisfied => "pass",
+                None => "unknown",
+            };
+            serde_json::json!({
+                "type": label_for(r),
+                "status": status,
+                "host": r.fqdn,
+                "value": r.value,
+                "description": r.purpose.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
 
     let pass_count = checks.iter().filter(|c| c["status"] == "pass").count();
 
@@ -1405,7 +1399,45 @@ pub async fn dns_check(
         "pass_count": pass_count,
         "total": checks.len(),
         "all_pass": pass_count == checks.len(),
+        // The structured verdict, for surfaces that render the guidance layer
+        // properly rather than the legacy pass/fail list.
+        "prereq": verdict,
     })))
+}
+
+/// The short name the DNS tab shows for a record — "SPF" reads better than "TXT".
+fn label_for(r: &crate::services::prerequisites::DnsRecordHint) -> &'static str {
+    if r.value.starts_with("v=spf1") {
+        "SPF"
+    } else if r.value.starts_with("v=DMARC1") {
+        "DMARC"
+    } else if r.value.starts_with("v=DKIM1") {
+        "DKIM"
+    } else if r.record_type == "MX" {
+        "MX"
+    } else {
+        "A"
+    }
+}
+
+/// GET /api/mail/domains/{id}/preflight — The mail domain's prerequisites.
+pub async fn preflight(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, selector, dkim_pub) = mail_domain_identity(&state.db, id).await?;
+    let server_ip = crate::helpers::detect_public_ip_cached().await;
+
+    let checks = crate::services::prerequisites::mail::evaluate(
+        &domain,
+        &selector,
+        dkim_pub.as_deref(),
+        &server_ip,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "domain": domain, "checks": checks })))
 }
 
 // ── Mail Logs & Storage (agent proxies) ──────────────────────────────────

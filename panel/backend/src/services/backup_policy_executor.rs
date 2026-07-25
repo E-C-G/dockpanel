@@ -20,7 +20,6 @@ struct PolicyRow {
     backup_databases: bool,
     backup_volumes: bool,
     schedule: String,
-    #[allow(dead_code)]
     destination_id: Option<Uuid>,
     retention_count: i32,
     encrypt: bool,
@@ -40,6 +39,111 @@ struct PolicyRow {
 /// `JWT_SECRET` env the executor is handed), so both sides agree byte-for-byte.
 pub fn derive_backup_encryption_key(jwt_secret: &str) -> String {
     format!("backup-enc-{}", &jwt_secret[..32.min(jwt_secret.len())])
+}
+
+/// A policy's off-site destination, resolved once per run.
+///
+/// # Why this exists
+///
+/// `destination_id` was selected by the policy query, carried on [`PolicyRow`]
+/// under an `#[allow(dead_code)]`, and **never read**. Meanwhile the Backup
+/// Orchestrator's policy form offers a Destination dropdown, the schema gives
+/// `database_backups` and `volume_backups` a `destination_id` and an `uploaded`
+/// column, and the All-Backups table renders a `remote` badge from `uploaded`.
+///
+/// So every policy-driven backup stayed on the machine it was protecting, the
+/// badge could never light for a policy row, and the operator had chosen an
+/// off-site destination and been shown no indication it was ignored. A backup
+/// that only exists on the disk it is insuring is not a backup.
+///
+/// The sibling path — `backup_scheduler`, which runs per-site schedules — has
+/// uploaded correctly all along. This brings the policy path to the same
+/// behaviour, including its retry ladder and its refusal to record a backup whose
+/// upload failed.
+struct ResolvedDestination {
+    id: Uuid,
+    /// The destination config with `type` folded in, exactly as the agent's
+    /// `/backups/upload` handler expects it.
+    payload: serde_json::Value,
+}
+
+async fn resolve_destination(db: &PgPool, policy: &PolicyRow) -> Option<ResolvedDestination> {
+    let id = policy.destination_id?;
+
+    let row: Result<Option<(String, serde_json::Value)>, _> =
+        sqlx::query_as("SELECT dtype, config FROM backup_destinations WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await;
+
+    // Distinguish "deleted" from "we couldn't ask". Both end in local-only
+    // backups, but they are different faults and collapsing them would send an
+    // operator hunting for a destination that is still perfectly there.
+    let (dtype, mut config) = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::error!(
+                "Policy '{}': destination {id} no longer exists — backups will stay on this server",
+                policy.name
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(
+                "Policy '{}': could not read destination {id} ({e}) — backups will stay on this server",
+                policy.name
+            );
+            return None;
+        }
+    };
+
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert("type".to_string(), serde_json::json!(dtype));
+    }
+
+    Some(ResolvedDestination { id, payload: config })
+}
+
+/// Push one finished backup file off the box.
+///
+/// Returns `true` only when the bytes actually landed. Mirrors
+/// `backup_scheduler`'s ladder (5s / 15s / 30s) rather than inventing a second
+/// retry policy, so the two paths fail the same way.
+///
+/// # Known gap: remote retention covers site backups only
+///
+/// The agent's `/backups/prune` is keyed on a site `domain` and prunes that
+/// domain's remote prefix, so it can enforce retention for site archives and
+/// nothing else. Database and volume copies therefore accumulate at the
+/// destination even though their LOCAL copies are pruned by `auto_healer`.
+/// Stated here rather than left to be discovered from a storage bill; a
+/// resource-agnostic prune is the fix, and it needs an agent-side change.
+async fn upload_to_destination(
+    agent: &AgentClient,
+    dest: &ResolvedDestination,
+    filepath: &str,
+    label: &str,
+) -> bool {
+    let body = serde_json::json!({ "filepath": filepath, "destination": dest.payload });
+
+    let delays = [5u64, 15, 30];
+    let mut last_err = String::new();
+
+    for (attempt, delay) in delays.iter().enumerate() {
+        match agent.post("/backups/upload", Some(body.clone())).await {
+            Ok(_) => return true,
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < delays.len() - 1 {
+                    tracing::warn!("Upload attempt {} failed for {label}: {last_err} — retrying in {delay}s", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                }
+            }
+        }
+    }
+
+    tracing::error!("Upload failed for {label} after {} attempts: {last_err}", delays.len());
+    false
 }
 
 /// Run the backup policy executor loop — checks every 60 seconds for due policies.
@@ -138,6 +242,26 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
     let mut successes = 0;
     let mut failures = 0;
 
+    // Resolved once, not per file: a policy backing up forty sites must not run
+    // forty identical destination lookups.
+    let destination = resolve_destination(db, policy).await;
+
+    // A failed upload counts as a FAILURE (so the policy reports partial/failed
+    // and the backup_failure alert fires) but the local file is still recorded.
+    // This deliberately differs from `backup_scheduler`, which drops the row
+    // entirely: these tables carry the sha256 integrity chain, and a missing row
+    // would break `previous_hash` for every backup after it. Recording the file
+    // with `uploaded = FALSE` keeps the chain intact and keeps the UI honest.
+    let mut upload_failures = 0;
+
+    // Circuit breaker. Each upload retries three times with 5s/15s/30s backoff,
+    // so a destination that is simply DOWN would cost ~50 seconds PER FILE — a
+    // policy covering forty sites would sit in one 60-second tick for half an
+    // hour, starving every other policy behind it. The first exhausted retry
+    // ladder is enough evidence: stop dialling for the rest of this run and let
+    // the next scheduled run try again from scratch.
+    let mut destination_down = false;
+
     // Get encryption key if encrypt is enabled. Use the shared derivation (single source of
     // truth) keyed on the jwt_secret passed into the executor — which equals the
     // state.config.jwt_secret the restore path uses — NOT a separate std::env read that could
@@ -168,10 +292,33 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
                     let filename = resp.get("filename").and_then(|v| v.as_str()).unwrap_or("");
                     let size_bytes = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
 
+                    let mut uploaded = false;
+                    if let (Some(dest), false) = (&destination, destination_down) {
+                        let filepath = format!("/var/backups/dockpanel/{domain}/{filename}");
+                        uploaded = upload_to_destination(agent, dest, &filepath, &format!("site {domain}")).await;
+                        if uploaded {
+                            // Enforce remote retention too, or the destination grows
+                            // without bound. Same call the scheduler makes.
+                            let _ = agent.post("/backups/prune", Some(serde_json::json!({
+                                "destination": dest.payload,
+                                "domain": domain,
+                                "retention": policy.retention_count,
+                            }))).await;
+                        } else {
+                            upload_failures += 1;
+                            destination_down = true;
+                        }
+                    } else if destination.is_some() {
+                        // Breaker already open — count it, don't dial.
+                        upload_failures += 1;
+                    }
+
                     let _ = sqlx::query(
-                        "INSERT INTO backups (site_id, filename, size_bytes) VALUES ($1, $2, $3)"
+                        "INSERT INTO backups (site_id, filename, size_bytes, destination_id, uploaded) \
+                         VALUES ($1, $2, $3, $4, $5)"
                     )
                     .bind(site_id).bind(filename).bind(size_bytes)
+                    .bind(destination.as_ref().map(|d| d.id)).bind(uploaded)
                     .execute(db).await;
 
                     successes += 1;
@@ -222,12 +369,27 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
                         "SELECT sha256_hash FROM database_backups WHERE database_id = $1 ORDER BY created_at DESC LIMIT 1"
                     ).bind(db_id).fetch_optional(db).await.unwrap_or(None);
 
+                    let mut uploaded = false;
+                    if let (Some(dest), false) = (&destination, destination_down) {
+                        // `database_backup::backup_dir` nests per database:
+                        // /var/backups/dockpanel/databases/<db_name>/<filename>.
+                        let filepath = format!("/var/backups/dockpanel/databases/{db_name}/{filename}");
+                        uploaded = upload_to_destination(agent, dest, &filepath, &format!("database {db_name}")).await;
+                        if !uploaded {
+                            upload_failures += 1;
+                            destination_down = true;
+                        }
+                    } else if destination.is_some() {
+                        upload_failures += 1;
+                    }
+
                     let _ = sqlx::query(
-                        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, policy_id, sha256_hash, previous_hash, chain_valid) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)"
+                        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, policy_id, destination_id, uploaded, sha256_hash, previous_hash, chain_valid) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE)"
                     )
                     .bind(db_id).bind(policy.server_id).bind(&filename).bind(size_bytes)
                     .bind(engine).bind(db_name).bind(encrypted).bind(policy.id)
+                    .bind(destination.as_ref().map(|d| d.id)).bind(uploaded)
                     .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
                     .bind(previous_hash.as_deref())
                     .execute(db).await;
@@ -297,12 +459,27 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
                                                 "SELECT sha256_hash FROM volume_backups WHERE container_id = $1 AND volume_name = $2 ORDER BY created_at DESC LIMIT 1"
                                             ).bind(container_id).bind(vol_name).fetch_optional(db).await.unwrap_or(None);
 
+                                            let mut uploaded = false;
+                                            if let (Some(dest), false) = (&destination, destination_down) {
+                                                // `volume_backup::backup_dir` nests per container:
+                                                // /var/backups/dockpanel/volumes/<container>/<filename>.
+                                                let filepath = format!("/var/backups/dockpanel/volumes/{container_name}/{filename}");
+                                                uploaded = upload_to_destination(agent, dest, &filepath, &format!("volume {vol_name}")).await;
+                                                if !uploaded {
+                                                    upload_failures += 1;
+                                                    destination_down = true;
+                                                }
+                                            } else if destination.is_some() {
+                                                upload_failures += 1;
+                                            }
+
                                             let _ = sqlx::query(
-                                                "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes, policy_id, sha256_hash, previous_hash, chain_valid) \
-                                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)"
+                                                "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes, policy_id, destination_id, uploaded, sha256_hash, previous_hash, chain_valid) \
+                                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE)"
                                             )
                                             .bind(container_id).bind(container_name).bind(policy.server_id)
                                             .bind(vol_name).bind(&filename).bind(size_bytes).bind(policy.id)
+                                            .bind(destination.as_ref().map(|d| d.id)).bind(uploaded)
                                             .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
                                             .bind(previous_hash.as_deref())
                                             .execute(db).await;
@@ -327,8 +504,19 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
         }
     }
 
-    // Update policy status
-    let status = if failures == 0 { "success" } else if successes > 0 { "partial" } else { "failed" };
+    // An upload failure is NOT a backup failure — the file exists locally, and it
+    // is counted in `successes` because it was taken. It IS a disaster-recovery
+    // failure, though, and reporting the run as a clean success would be exactly
+    // the silence this change exists to remove. So it degrades the status and
+    // raises the alert, while the counts keep meaning "backups taken".
+    let total_attempted = successes + failures;
+    let status = if failures == 0 && upload_failures == 0 {
+        "success"
+    } else if successes > 0 {
+        "partial"
+    } else {
+        "failed"
+    };
     let _ = sqlx::query(
         "UPDATE backup_policies SET last_run = NOW(), last_status = $2, updated_at = NOW() WHERE id = $1"
     )
@@ -336,29 +524,58 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
     .execute(db).await;
 
     tracing::info!(
-        "Policy '{}' completed: {} successes, {} failures (status: {status})",
-        policy.name, successes, failures
+        "Policy '{}' completed: {successes} successes, {failures} failures, \
+         {upload_failures} not uploaded off-site (status: {status})",
+        policy.name
     );
 
+    // How to describe a run that took its backups but couldn't get them off the
+    // box. Kept in one place so the incident, the alert and the log agree.
+    let trouble = |kind: &str| -> String {
+        match (failures, upload_failures) {
+            (0, u) => format!(
+                "{u} of {successes} {kind} could not be uploaded to the configured destination — \
+                 they exist only on this server."
+            ),
+            (f, 0) => format!("{f} {kind} failed out of {total_attempted} total"),
+            (f, u) => format!(
+                "{f} {kind} failed out of {total_attempted} total, and {u} more could not be \
+                 uploaded off-site."
+            ),
+        }
+    };
+
     // GAP 10: If backup failures, create managed incident
-    if failures > 0 {
+    if failures > 0 || upload_failures > 0 {
         let _ = sqlx::query(
             "INSERT INTO managed_incidents (user_id, title, status, severity, description, visible_on_status_page) \
              VALUES ($1, $2, 'investigating', 'major', $3, FALSE)"
         )
         .bind(policy.user_id)
-        .bind(format!("Backup policy '{}' had failures", policy.name))
-        .bind(format!("{failures} backup(s) failed, {successes} succeeded"))
+        .bind(if failures > 0 {
+            format!("Backup policy '{}' had failures", policy.name)
+        } else {
+            format!("Backup policy '{}' could not reach its destination", policy.name)
+        })
+        .bind(trouble("backup(s)"))
         .execute(db).await;
     }
 
     // Fire alert on failure
-    if failures > 0 {
+    if failures > 0 || upload_failures > 0 {
         notifications::fire_alert(
             db, policy.user_id, policy.server_id, None,
-            "backup_failure", "critical",
-            &format!("Backup policy '{}' failed", policy.name),
-            &format!("{failures} backup(s) failed out of {} total", successes + failures),
+            "backup_failure",
+            // An off-site copy that didn't happen is serious but recoverable on the
+            // next run, and the data is still on disk. Don't page at the same
+            // urgency as "the backup did not happen at all".
+            if failures > 0 { "critical" } else { "warning" },
+            &if failures > 0 {
+                format!("Backup policy '{}' failed", policy.name)
+            } else {
+                format!("Backup policy '{}' kept its backups on this server", policy.name)
+            },
+            &trouble("backup(s)"),
         ).await;
     }
 
