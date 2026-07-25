@@ -106,55 +106,39 @@ fi
 echo ""
 echo "=== Dependency audit ==="
 
-# Both npm and cargo exit non-zero when they cannot reach their advisory source,
-# which is indistinguishable from a real finding by exit code alone. Sniff the
-# output and fail OPEN on a network error — a gate that blocks on a DNS blip is
-# a gate that gets disabled.
+# The npm half is delegated to scripts/npm-audit-gate.mjs, which CI runs too.
+# It used to be reimplemented here with its own copy of the reviewed-advisory
+# allowlist — two lists that could disagree, and did: this hook waived the
+# react-router advisory while CI, which had no allowlist at all, failed on it for
+# six straight releases. One list, one behaviour, both callers.
 #
-# Reviewed advisory exceptions (comma-separated GHSA ids). HIGH/critical advisories
-# listed here are known non-exploitable in DockPanel's usage; every OTHER high/critical
-# still blocks. Keep the reason + revisit condition with each entry:
-#   GHSA-qwww-vcr4-c8h2  react-router RSC-mode CSRF bypass. The frontend is a Vite SPA
-#     (BrowserRouter; no @react-router server/framework packages; no server
-#     components/actions), so the RSC action path is unreachable — mutations go through the
-#     backend's own CSRF-protected API. The latest react-router-dom (7.18.1) is itself in
-#     the vulnerable 7.12.0-8.2.0 range; the only npm-offered fix is a breaking downgrade to
-#     7.11.0. Revisit + remove when a forward-patched release above the range ships.
-NPM_AUDIT_ALLOWLIST="GHSA-qwww-vcr4-c8h2"
+# The fail-open-on-network rule is preserved, just moved into an exit code:
+# 1 = a real advisory (block), 2 = unreadable output (block, we cannot tell),
+# 3 = the registry was unreachable (warn only — a gate that blocks on a DNS blip
+# is a gate that gets disabled with --no-verify).
+AUDIT_GATE="$(git rev-parse --show-toplevel)/scripts/npm-audit-gate.mjs"
 
 for DIR in panel/frontend website/client website/server; do
   [ -f "$DIR/package.json" ] || continue
-  OUT=$( (cd "$DIR" && npm audit --audit-level=high) 2>&1 )
-  if [ $? -eq 0 ]; then
-    echo -e "${GREEN}npm audit clean: ${DIR}${NC}"
-  elif echo "$OUT" | grep -qiE 'audit endpoint returned an error|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network'; then
-    echo -e "${YELLOW}WARNING: npm audit could not reach the registry for ${DIR} — not enforced${NC}"
-  else
-    # High/critical present. Enumerate the advisory ids and block unless EVERY one is in
-    # the reviewed allowlist. Fail closed: if the ids cannot be enumerated, block.
-    GHSAS=$( (cd "$DIR" && npm audit --json 2>/dev/null) \
-             | jq -r '.vulnerabilities[]? | select(.severity=="high" or .severity=="critical") | .via[]? | objects | .url' 2>/dev/null \
-             | grep -oE 'GHSA-[a-z0-9-]+' | sort -u )
-    if [ -z "$GHSAS" ]; then
-      echo -e "${RED}BLOCKED: npm audit found high/critical advisories in ${DIR} (could not enumerate for allowlist)${NC}"
-      echo "$OUT" | grep -iE 'severity|vulnerabilities' | head -5
-      FOUND=1
-    else
-      UNWAIVED=""
-      for G in $GHSAS; do
-        case ",$NPM_AUDIT_ALLOWLIST," in
-          *",$G,"*) ;;
-          *) UNWAIVED="$UNWAIVED $G" ;;
-        esac
-      done
-      if [ -n "$UNWAIVED" ]; then
-        echo -e "${RED}BLOCKED: npm audit high/critical advisories not in allowlist in ${DIR}:${UNWAIVED}${NC}"
-        FOUND=1
+  OUT=$( (cd "$DIR" && node "$AUDIT_GATE") 2>&1 )
+  case $? in
+    0)
+      if echo "$OUT" | grep -q '^waived'; then
+        echo -e "${YELLOW}npm audit: ${DIR} — advisories present, all individually reviewed${NC}"
+        echo "$OUT" | grep '^waived'
       else
-        echo -e "${YELLOW}npm audit: ${DIR} high/critical advisories all in reviewed allowlist (${NPM_AUDIT_ALLOWLIST}) — not blocking${NC}"
+        echo -e "${GREEN}npm audit clean: ${DIR}${NC}"
       fi
-    fi
-  fi
+      ;;
+    3)
+      echo -e "${YELLOW}WARNING: npm audit could not reach the registry for ${DIR} — not enforced${NC}"
+      ;;
+    *)
+      echo -e "${RED}BLOCKED: npm audit gate failed for ${DIR}${NC}"
+      echo "$OUT" | tail -12
+      FOUND=1
+      ;;
+  esac
 done
 
 # cargo-audit lives in ~/.cargo/bin, which is not on a git hook's PATH.

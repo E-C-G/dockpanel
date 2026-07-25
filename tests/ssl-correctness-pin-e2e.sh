@@ -82,8 +82,21 @@ grep -q "stale" "$TMP/out" \
 # A gate that cannot parse its input must not report success.
 echo 'not json at all' > "$TMP/report.json"
 check "unparseable audit output is an error, not a pass" "$(run_gate)" "2"
+# Distinct from a parse failure on purpose: the pre-push hook warns on this and
+# blocks on the other. A gate that blocks on a DNS blip is one that gets
+# disabled with --no-verify, so the two must stay tellable apart.
 printf '{"error":{"summary":"registry unreachable"}}' > "$TMP/report.json"
-check "a failed audit run is an error, not a pass"       "$(run_gate)" "2"
+check "an unreachable registry is its own outcome, not a pass" "$(run_gate)" "3"
+
+# One allowlist, not two. This hook used to carry its own copy and waive the
+# advisory locally while CI — which had none — failed on it for six releases.
+HOOK="$REPO/scripts/hooks/pre-push"
+grep -q 'npm-audit-gate.mjs' "$HOOK" \
+  && ok "the pre-push hook uses the same gate CI does" \
+  || bad "the pre-push hook audits npm its own way again"
+grep -q 'NPM_AUDIT_ALLOWLIST' "$HOOK" \
+  && bad "a second npm allowlist is back in the pre-push hook" \
+  || ok "there is exactly one reviewed-advisory allowlist"
 
 echo
 echo "── B: a site is installed at the scheme it can actually serve ──"

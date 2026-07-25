@@ -14,6 +14,13 @@
 //
 // Usage:  node scripts/npm-audit-gate.mjs [--input audit.json] [--level high]
 //         (run from the directory holding the package.json to audit)
+//
+// Exit codes, kept distinct because the pre-push hook treats them differently:
+//   0  clean, or everything at/above the level is waived
+//   1  a real un-waived advisory — block
+//   2  the output could not be parsed — block, because we cannot tell
+//   3  npm could not reach the advisory source — WARN and let it through. A gate
+//      that blocks on a DNS blip is a gate that gets disabled with --no-verify.
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -70,8 +77,11 @@ try {
 }
 
 if (report.error) {
-  console.error(`npm audit reported an error: ${report.error.summary ?? JSON.stringify(report.error)}`);
-  process.exit(2);
+  // npm reports registry/network trouble this way, and it is indistinguishable
+  // from a real finding by exit code alone. Distinct code so the caller can
+  // decide; the pre-push hook warns, CI blocks.
+  console.error(`npm audit could not complete: ${report.error.summary ?? JSON.stringify(report.error)}`);
+  process.exit(3);
 }
 
 // npm >= 7 report shape: { vulnerabilities: { <pkg>: { via: [ {url, title, severity} | "<pkg>" ] } } }
