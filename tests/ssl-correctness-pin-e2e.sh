@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Regression pins for the s258 SSL-correctness ship.
 #
-# Two independent things are pinned here, both of which had already shipped
-# broken once in a way a green unit suite could not see:
+# Everything here had already shipped broken once, in a way a green unit suite
+# could not see — none of these assertions can be made by a test that only knows
+# about Rust:
 #
-#   A. The npm audit gate. It must WAIVE the reviewed advisory and still FAIL on
+#   A. The npm audit gate must WAIVE the reviewed advisory and still FAIL on
 #      anything else. An always-red gate and an always-green gate fail the same
-#      way — neither can report a new advisory — so both directions are pinned.
-#   B. A site is installed at the scheme it can actually serve. Before this ship
-#      WordPress was installed at the secure URL even when the certificate step
-#      had already failed, leaving the site dead on both schemes.
+#      way — neither can report a new advisory — so both directions are pinned,
+#      along with there being exactly ONE allowlist.
+#   B. A site is installed at the scheme it can actually serve.
+#   C. …and the promotion to HTTPS only ever touches the URL DockPanel itself set.
+#   D. A certificate that stops renewing is announced, not just logged.
+#   E. The installer does not read "I could not ask systemd" as "the service
+#      failed" — which aborted a real fresh install four steps from the end.
 #
 # No running panel needed.
 #   run: bash tests/ssl-correctness-pin-e2e.sh
@@ -161,6 +165,50 @@ grep -q 'fire_alert_deduped' "$HEALER" && grep -q 'fire_alert_deduped' "$SCAN" \
 grep -q 'fire_alert(' "$SCAN" && grep -q 'ssl_renewal' "$SCAN" \
   && ok "the scanner's renewal path reaches the alert system at all" \
   || bad "the scanner's renewal failure is still log-only"
+
+
+# ── E: the installer must not read "I could not ask" as "it failed" ──────────
+#
+# Driven out of a real fresh-box install (s258): a dbus hiccup made
+# `systemctl is-active` exit non-zero with an empty answer, and the installer
+# aborted at step 11/15 blaming a service that was running. Stubbed here because
+# a transient bus failure cannot be summoned on demand — but the three answers it
+# has to tell apart can.
+echo
+echo "── E: the installer's unit readiness check ──"
+
+SETUP="$REPO/scripts/setup.sh"
+grep -q 'wait_for_unit()' "$SETUP" \
+  && ok "there is a readiness helper" \
+  || bad "the installer is back to a single is-active call"
+check "no bare is-active decides a service's fate" \
+  "$(grep -c 'if systemctl is-active --quiet dockpanel' "$SETUP")" "0"
+
+# Extract the helper and run it against a stubbed systemctl.
+sed -n '/^wait_for_unit() {/,/^}/p' "$SETUP" > "$TMP/helper.sh"
+mkstub() { mkdir -p "$TMP/bin"; printf '#!/usr/bin/env bash\n%s\n' "$1" > "$TMP/bin/systemctl"; chmod +x "$TMP/bin/systemctl"; }
+runhelper() { ( PATH="$TMP/bin:$PATH"; . "$TMP/helper.sh"; wait_for_unit some-unit "${1:-3}" >/dev/null 2>&1; echo $?; ); }
+
+mkstub 'echo active'
+check "an active unit is accepted"                       "$(runhelper)" "0"
+
+# THE REGRESSION: dbus down — non-zero exit, nothing on stdout, unit is fine.
+mkstub 'echo "Failed to retrieve unit state: Message recipient disconnected from message bus without replying" >&2; exit 1'
+check "a bus that cannot answer is not a failed service"  "$(runhelper 2)" "1"
+mkstub 'if [ -f "$0.seen" ]; then echo active; else touch "$0.seen"; echo "Failed to retrieve unit state" >&2; exit 1; fi'
+rm -f "$TMP/bin/systemctl.seen"
+check "…and one bad answer followed by a good one succeeds" "$(runhelper 5)" "0"
+
+# A unit that is still coming up must be waited for, not condemned.
+mkstub 'if [ -f "$0.seen" ]; then echo active; else touch "$0.seen"; echo activating; exit 3; fi'
+rm -f "$TMP/bin/systemctl.seen"
+check "an activating unit is waited for"                 "$(runhelper 5)" "0"
+
+# And a genuinely dead one still fails — the check must keep its teeth.
+mkstub 'echo failed; exit 3'
+check "a failed unit fails immediately"                  "$(runhelper 3)" "1"
+mkstub 'echo inactive; exit 3'
+check "a unit that never starts still fails"             "$(runhelper 2)" "1"
 
 echo
 echo "──────────────────────────────────────────"

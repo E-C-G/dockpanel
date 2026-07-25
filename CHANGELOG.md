@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The installer no longer aborts because it could not ask systemd a question.**
+  `systemctl is-active` answers "running", "not running" and "I could not reach the bus" with
+  two exit codes; during install the bus can be momentarily unavailable, and the call then
+  exits non-zero having printed nothing. The installer read that as the service having failed
+  and stopped four steps from the end — observed on a fresh Ubuntu 24.04 box, where the
+  journal excerpt printed directly under "Agent failed to start" showed the agent started and
+  listening. Both service checks now poll for a bounded window and read the answer rather than
+  the exit code: `failed` still gives up at once, and a unit that never starts still fails.
+  (Delivered from `main`, which is what `install.sh` clones.)
+
 ## [2.32.0] - 2026-07-25
 
 ### Fixed

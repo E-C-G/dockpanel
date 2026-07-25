@@ -155,6 +155,36 @@ SVC_FAIL=()
 svc_ok()   { SVC_OK+=("$1"); }
 svc_fail() { SVC_FAIL+=("$1"); }
 
+# Wait for a unit to come up, and do not confuse "not running" with "could not ask".
+#
+# `systemctl is-active` answers three different questions with two exit codes.
+# During install, dbus can be momentarily unavailable — the call then prints
+#   Failed to retrieve unit state: Message recipient disconnected from message
+#   bus without replying
+# to stderr, exits non-zero, and says nothing on stdout. A caller that reads only
+# the exit code concludes the service failed. Observed on a genuinely fresh
+# Ubuntu 24.04 box (s258): the installer aborted at step 11/15 with "Agent failed
+# to start" while its own journal excerpt, printed directly underneath, showed the
+# agent started and listening on its socket. The install stopped four steps from
+# the end over a question that was never answered.
+#
+# So read the ANSWER, not the exit code: `active` succeeds, `failed` gives up
+# immediately (waiting cannot help a unit that already failed), and anything else
+# — `activating`, `inactive`, or the empty string we get when the bus is out — is
+# treated as "not yet" and retried inside a bounded window.
+wait_for_unit() {
+    local unit="$1" tries="${2:-20}" state
+    for _ in $(seq 1 "$tries"); do
+        state=$(systemctl is-active "$unit" 2>/dev/null || true)
+        case "$state" in
+            active) return 0 ;;
+            failed) return 1 ;;
+            *)      sleep 1 ;;
+        esac
+    done
+    [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "active" ]
+}
+
 join_comma() {
     local out="" item
     for item in "$@"; do
@@ -844,9 +874,8 @@ EOF
     # Start agent
     systemctl enable dockpanel-agent > /dev/null 2>&1
     systemctl restart dockpanel-agent
-    sleep 2
 
-    if systemctl is-active --quiet dockpanel-agent; then
+    if wait_for_unit dockpanel-agent; then
         log "Agent service running"
     else
         error "Agent failed to start"
@@ -857,9 +886,8 @@ EOF
     # Start API
     systemctl enable dockpanel-api > /dev/null 2>&1
     systemctl restart dockpanel-api
-    sleep 2
 
-    if systemctl is-active --quiet dockpanel-api; then
+    if wait_for_unit dockpanel-api; then
         log "API service running"
     else
         error "API failed to start"
