@@ -3,6 +3,10 @@
 //! The prerequisite behind every HTTP-01 certificate, and the single most common
 //! reason a new user's site doesn't work.
 
+use super::copy::{
+    self, DNS_ENTER_A_DOMAIN, DNS_NOT_RESOLVING, DNS_NO_PUBLIC_IP, DNS_POINTS_ELSEWHERE,
+    DNS_POINTS_ELSEWHERE_SUBDOMAIN, DNS_POINTS_HERE, DNS_POINTS_HERE_CHECK,
+};
 use super::{DnsRecordHint, PrereqResult, Remediation};
 use std::net::IpAddr;
 
@@ -52,27 +56,18 @@ pub(super) fn looks_like_a_domain(domain: &str) -> bool {
 ///   from "pointed at the wrong server" by IP alone — so blocking it would refuse
 ///   a setup we have direct evidence works.
 pub async fn check_dns_points_here(domain: &str) -> PrereqResult {
-    let key = "dns.points_here";
+    let check: &copy::Prereq = &DNS_POINTS_HERE_CHECK;
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
 
     if !looks_like_a_domain(&domain) {
-        return PrereqResult::unknown(
-            key,
-            "Enter a domain",
-            "Once you enter a domain, DockPanel checks whether it already points here.",
-        );
+        return check.result(&DNS_ENTER_A_DOMAIN, &[]);
     }
 
     let server_ip = crate::helpers::detect_public_ip_cached().await;
     if server_ip.is_empty() {
         // We don't know our own address, so we cannot judge theirs. Say so
         // plainly rather than inventing a verdict.
-        return PrereqResult::unknown(
-            key,
-            "Couldn't determine this server's public address",
-            "DockPanel could not detect its own public IP, so it can't check whether \
-             the domain points here. SSL issuance will still be attempted.",
-        );
+        return check.result(&DNS_NO_PUBLIC_IP, &[]);
     }
 
     let (host, apex) = split_record_name(&domain);
@@ -95,50 +90,45 @@ pub async fn check_dns_points_here(domain: &str) -> PrereqResult {
     };
 
     if resolved.is_empty() {
-        return PrereqResult::blocking(
-            key,
-            format!("{domain} doesn't resolve yet"),
-            format!(
-                "No DNS record was found for {domain}. Create the record below at whoever \
-                 manages this domain's DNS, then check again. New records usually appear \
-                 within a few minutes."
-            ),
-        )
-        .with_expected(server_ip)
-        .with_remediation(Remediation::DnsRecord { record: hint });
+        return check
+            .result(&DNS_NOT_RESOLVING, &[("domain", &domain)])
+            .with_expected(server_ip)
+            .with_remediation(Remediation::DnsRecord { record: hint });
     }
 
     if resolved.iter().any(|ip| ip == &server_ip) {
-        return PrereqResult::satisfied(
-            key,
-            format!("{domain} points here"),
-            format!("{domain} resolves to this server ({server_ip})."),
-        )
-        .with_expected(server_ip)
-        .with_observed(resolved);
+        let rendered = check.result(
+            &DNS_POINTS_HERE,
+            &[("domain", &domain), ("server_ip", &server_ip)],
+        );
+        return rendered.with_expected(server_ip).with_observed(resolved);
     }
 
-    PrereqResult::warning(
-        key,
-        format!("{domain} points somewhere else"),
-        format!(
-            "{domain} resolves to {} rather than this server ({server_ip}).\n\n\
-             If you use Cloudflare's proxy (the orange cloud), this is expected and \
-             certificate issuance normally still works — Cloudflare passes the validation \
-             request through to this server. You can continue.\n\n\
-             Otherwise the domain is pointed at a different host. Update the record below \
-             and check again{}.",
-            resolved.join(", "),
-            if host == "@" {
-                String::new()
-            } else {
-                format!(" — note this is the record for {}, not for {apex}", &domain)
-            }
-        ),
-    )
-    .with_expected(server_ip)
-    .with_observed(resolved)
-    .with_remediation(Remediation::DnsRecord { record: hint })
+    // An apex and a subdomain differ in the advice, not in the verdict: someone
+    // pointing `www` has to edit the `www` record, and telling them to point "the
+    // domain" here sends them to change the wrong one.
+    let rendered = {
+        let joined = resolved.join(", ");
+        let outcome = if host == "@" {
+            &DNS_POINTS_ELSEWHERE
+        } else {
+            &DNS_POINTS_ELSEWHERE_SUBDOMAIN
+        };
+        check.result(
+            outcome,
+            &[
+                ("domain", domain.as_str()),
+                ("resolved", joined.as_str()),
+                ("server_ip", server_ip.as_str()),
+                ("apex", apex.as_str()),
+            ],
+        )
+    };
+
+    rendered
+        .with_expected(server_ip)
+        .with_observed(resolved)
+        .with_remediation(Remediation::DnsRecord { record: hint })
 }
 
 #[cfg(test)]

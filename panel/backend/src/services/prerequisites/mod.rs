@@ -32,11 +32,17 @@
 //!
 //! Adding a vertical is a new submodule plus a route; it is never an edit to an
 //! existing check.
+//!
+//! [`copy`] holds every sentence all four of them say. A check module decides
+//! *which* outcome a situation is; it does not decide what that outcome says, and
+//! it cannot, because the words are not in it. That separation is what lets the
+//! documentation be generated rather than written — see [`copy::manual`].
 
 use serde::Serialize;
 
 pub mod apps;
 pub mod backups;
+pub mod copy;
 pub mod dns;
 pub mod mail;
 
@@ -190,44 +196,30 @@ impl PrereqResult {
         self.state == PrereqState::Unsatisfied && self.severity == PrereqSeverity::Blocking
     }
 
-    fn new(
+    /// Fixture constructor. **Tests only, deliberately.**
+    ///
+    /// In the running product there is exactly one way to produce a
+    /// `PrereqResult` — [`copy::Prereq::result`] — and that is not a convention,
+    /// it is the absence of an alternative: a check cannot invent a sentence
+    /// because it has no constructor that takes one. Removing the four
+    /// hand-rolled constructors that shipped through v2.29.0 is what turned the
+    /// registry from the recommended path into the only path.
+    #[cfg(test)]
+    pub(crate) fn fixture(
         key: impl Into<String>,
         state: PrereqState,
         severity: PrereqSeverity,
-        title: impl Into<String>,
-        detail: impl Into<String>,
     ) -> Self {
         Self {
             key: key.into(),
             state,
             severity,
-            title: title.into(),
-            detail: detail.into(),
+            title: String::new(),
+            detail: String::new(),
             expected: None,
             observed: Vec::new(),
             remediation: None,
         }
-    }
-
-    /// Verified true. Rendered as a quiet confirmation, or not at all.
-    pub fn satisfied(key: impl Into<String>, title: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::new(key, PrereqState::Satisfied, PrereqSeverity::Info, title, detail)
-    }
-
-    /// Could not be determined. Always safe: never blocks, never accuses.
-    pub fn unknown(key: impl Into<String>, title: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::new(key, PrereqState::Unknown, PrereqSeverity::Info, title, detail)
-    }
-
-    /// Verified false, and the action *will* fail. Gates its control.
-    pub fn blocking(key: impl Into<String>, title: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::new(key, PrereqState::Unsatisfied, PrereqSeverity::Blocking, title, detail)
-    }
-
-    /// Verified false, but the action may still work — or fails in a way the user
-    /// should accept knowingly rather than be refused.
-    pub fn warning(key: impl Into<String>, title: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::new(key, PrereqState::Unsatisfied, PrereqSeverity::Warning, title, detail)
     }
 
     pub fn with_expected(mut self, expected: impl Into<String>) -> Self {
@@ -258,31 +250,33 @@ pub fn first_blocker(results: &[PrereqResult]) -> Option<&PrereqResult> {
 mod tests {
     use super::*;
 
+    fn warning(key: &str) -> PrereqResult {
+        PrereqResult::fixture(key, PrereqState::Unsatisfied, PrereqSeverity::Warning)
+    }
+    fn blocking(key: &str) -> PrereqResult {
+        PrereqResult::fixture(key, PrereqState::Unsatisfied, PrereqSeverity::Blocking)
+    }
+    fn unknown(key: &str) -> PrereqResult {
+        PrereqResult::fixture(key, PrereqState::Unknown, PrereqSeverity::Info)
+    }
+
     /// A `Warning` must never gate a control — only `Blocking` does. This is the
     /// s252 orange-cloud case: it looks unsatisfied but demonstrably works.
     #[test]
     fn only_blocking_unsatisfied_results_gate_a_control() {
-        let warn = PrereqResult::warning("t", "", "");
-        assert!(!warn.blocks(), "a warning must let the user proceed");
+        assert!(!warning("t").blocks(), "a warning must let the user proceed");
+        assert!(blocking("t").blocks());
 
-        let blocking = PrereqResult::blocking("t", "", "");
-        assert!(blocking.blocks());
-
-        assert!(!PrereqResult::satisfied("t", "", "").blocks());
+        assert!(!PrereqResult::fixture("t", PrereqState::Satisfied, PrereqSeverity::Info).blocks());
         assert!(
-            !PrereqResult::unknown("t", "", "").blocks(),
+            !unknown("t").blocks(),
             "an undeterminable check must never block"
         );
     }
 
     #[test]
     fn first_blocker_ignores_warnings_and_unknowns() {
-        let set = vec![
-            PrereqResult::warning("a", "", ""),
-            PrereqResult::unknown("b", "", ""),
-            PrereqResult::blocking("c", "", ""),
-            PrereqResult::blocking("d", "", ""),
-        ];
+        let set = vec![warning("a"), unknown("b"), blocking("c"), blocking("d")];
         assert_eq!(first_blocker(&set).map(|r| r.key.as_str()), Some("c"));
         assert!(first_blocker(&set[..2]).is_none());
     }

@@ -38,67 +38,31 @@ The installation takes about 30 seconds.
 
 ## DNS Records
 
-After adding a mail domain, you must add these DNS records at your domain registrar or DNS provider. DockPanel shows the exact values on the domain detail page.
+After adding a mail domain, you must add these DNS records at your domain registrar or DNS provider.
 
-### MX Record
+**Read them from the panel, not from here.** Open the domain, go to the **DNS Records** tab, and copy each record — every field is copyable and each one is marked *published* or *missing* once you press **Verify DNS**. The values depend on your server's address and on the DKIM key generated for your domain, so a page like this one cannot state them without going stale.
 
-Routes incoming email to your server:
+This guide used to spell the records out, and every one of them was wrong in some way by the time you read it: it named the DKIM selector `default` when DockPanel has always used `dockpanel`, and it described the mail host as `mail.example.com` when the records DockPanel publishes use the domain itself. Following it produced a DKIM record that could never verify.
 
-```
-Type: MX
-Name: example.com (or @)
-Value: mail.example.com
-Priority: 10
-TTL: 3600
-```
+What the panel gives you, and why each one exists:
 
-Also add an A record for the mail subdomain:
+| Record | What it does |
+|---|---|
+| `A` | The address other mail servers connect to. Must not be proxied. |
+| `MX` | Where mail for this domain is delivered. |
+| `TXT` (SPF) | Authorises this server to send mail for the domain. |
+| `TXT` (DKIM) | The public key receivers use to verify our signature. |
+| `TXT` (DMARC) | Tells receivers what to do when SPF or DKIM fails. |
 
-```
-Type: A
-Name: mail
-Value: 203.0.113.10  (your server IP)
-TTL: 3600
-```
+If DockPanel manages the domain's DNS zone, these are created for you when you add the domain — there is nothing to copy.
 
-### SPF Record
+### Checking them
 
-Tells receiving servers which IPs are allowed to send email for your domain:
+**Verify DNS** on the same tab checks that each record resolves *and points at this server*, rather than merely that something exists. A domain whose MX belongs to another provider is reported as such. See [What DockPanel checks for you](prerequisites.md) for the full behaviour, including what happens when a lookup cannot be run at all.
 
-```
-Type: TXT
-Name: example.com (or @)
-Value: v=spf1 ip4:203.0.113.10 -all
-TTL: 3600
-```
+### DMARC policy
 
-Replace `203.0.113.10` with your server's public IP.
-
-### DKIM Record
-
-Cryptographic signature that proves emails were sent from your server. DockPanel generates a 2048-bit RSA key pair when you add the domain. Copy the value shown in the panel:
-
-```
-Type: TXT
-Name: default._domainkey.example.com
-Value: v=DKIM1; k=rsa; p=MIIBIjANBgkqh... (long key)
-TTL: 3600
-```
-
-The full DKIM value is displayed in DockPanel's domain detail page. Copy it exactly.
-
-### DMARC Record
-
-Tells receiving servers what to do with emails that fail SPF or DKIM checks:
-
-```
-Type: TXT
-Name: _dmarc.example.com
-Value: v=DMARC1; p=quarantine; rua=mailto:postmaster@example.com
-TTL: 3600
-```
-
-Start with `p=quarantine` (flag suspicious emails). Once you confirm everything works, change to `p=reject` (block spoofed emails).
+DockPanel suggests `p=quarantine`, which asks receivers to flag suspicious mail. Once you have confirmed everything works, tightening it to `p=reject` (block spoofed email outright) is a change worth making by hand at your DNS provider.
 
 ## Create Mailboxes
 
@@ -141,11 +105,13 @@ Send an email from an external account (Gmail, Outlook) to `user@example.com` an
 
 ### Verify DNS records
 
-Check your email authentication setup:
+Press **Verify DNS** on the domain's DNS Records tab — that checks the records point at *this* server, which a raw lookup cannot tell you.
+
+To check by hand, substituting your own domain (and noting that DockPanel's DKIM selector is `dockpanel`, not the `default` many guides assume):
 
 - **MX**: `dig MX example.com +short`
 - **SPF**: `dig TXT example.com +short`
-- **DKIM**: `dig TXT default._domainkey.example.com +short`
+- **DKIM**: `dig TXT dockpanel._domainkey.example.com +short`
 - **DMARC**: `dig TXT _dmarc.example.com +short`
 
 Use [mail-tester.com](https://www.mail-tester.com) to check your overall email deliverability score.

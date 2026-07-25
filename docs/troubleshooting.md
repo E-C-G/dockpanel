@@ -159,13 +159,21 @@ grep fastcgi_pass /etc/nginx/sites-available/example.com
 
 **Cause**: Let's Encrypt cannot verify domain ownership.
 
+Before working through this list, check the SSL card on the site itself. DockPanel evaluates the DNS prerequisite before it will attempt issuance, and says which of these it is — see [What DockPanel checks for you](guides/prerequisites.md). If the button is disabled, the reason is on screen.
+
 **Fix**:
 
-1. **DNS must point to this server**:
+1. **DNS must resolve**:
    ```bash
    dig example.com +short
-   # Must return this server's public IP
+   # Must return something
    ```
+
+   Usually this is the server's own public IP. It does **not** have to be: a
+   domain behind Cloudflare's proxy resolves to Cloudflare's addresses and
+   issuance still succeeds, because the proxy passes the challenge request
+   through to this server. A domain that resolves to *nothing* is the case that
+   cannot work.
 
 2. **Port 80 must be open** (HTTP-01 challenge):
    ```bash

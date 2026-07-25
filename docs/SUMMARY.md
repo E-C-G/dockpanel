@@ -2,6 +2,7 @@
 
 - [Getting Started](getting-started.md)
 - [Configuration](CONFIGURATION.md)
+- [What DockPanel checks for you](guides/prerequisites.md)
 - [Guides]()
   - [WordPress](guides/wordpress.md)
   - [Git Deploy](guides/git-deploy.md)

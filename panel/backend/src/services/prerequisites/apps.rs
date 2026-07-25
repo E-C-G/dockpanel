@@ -17,6 +17,13 @@
 
 use std::collections::HashMap;
 
+use super::copy::{
+    APPS_ENV_ALL_PRESENT, APPS_ENV_CHECK, APPS_ENV_MISSING_SECRETS, APPS_ENV_MISSING_SETTINGS,
+    APPS_MEM_CHECK, APPS_MEM_FITS, APPS_MEM_NOT_CHECKED, APPS_MEM_OVER_FREE, APPS_MEM_OVER_TOTAL,
+    APPS_NAME_AVAILABLE, APPS_NAME_CHECK, APPS_NAME_TAKEN, APPS_NAME_UNSET, APPS_PORT_CHECK,
+    APPS_PORT_FREE, APPS_PORT_HELD_BY_KNOWN, APPS_PORT_HELD_BY_UNKNOWN, APPS_PORT_UNPROBEABLE,
+    APPS_PORT_UNSET,
+};
 use super::{PrereqResult, Remediation};
 
 /// What the user is about to deploy.
@@ -94,8 +101,6 @@ impl HostFacts {
 /// `Blocking`, because the template's own author declared it required and the fix
 /// is to type something into a field that is already on screen.
 pub fn check_required_env(intent: &AppDeployIntent, specs: &[AppEnvSpec]) -> PrereqResult {
-    let key = "apps.required_env";
-
     let missing: Vec<&AppEnvSpec> = specs
         .iter()
         .filter(|s| s.required)
@@ -113,48 +118,34 @@ pub fn check_required_env(intent: &AppDeployIntent, specs: &[AppEnvSpec]) -> Pre
         .collect();
 
     if missing.is_empty() {
-        return PrereqResult::satisfied(
-            key,
-            "Required settings are filled in",
-            "Every setting this app needs has a value.",
-        );
+        return APPS_ENV_CHECK.result(&APPS_ENV_ALL_PRESENT, &[]);
     }
 
     let names: Vec<String> = missing
         .iter()
         .map(|s| format!("{} ({})", s.label, s.name))
         .collect();
-    let secrets: Vec<&&AppEnvSpec> = missing.iter().filter(|s| s.secret).collect();
 
-    let detail = if secrets.len() == missing.len() {
-        format!(
-            "{} needs a value for {}. These are passwords or keys with no safe default — \
-             the container is started without them entirely, which usually means it refuses \
-             to start or comes up with no protection at all.\n\n\
-             Use Generate to have DockPanel pick a strong value.",
-            intent.template_id,
-            names.join(", ")
-        )
-    } else {
-        format!(
-            "{} needs a value for {}. Without it the setting is not passed to the container \
-             at all, so the app starts misconfigured — usually failing minutes later, after \
-             the image has finished downloading.",
-            intent.template_id,
-            names.join(", ")
+    // A set that is entirely passwords and keys gets the Generate wording; one
+    // that mixes in ordinary settings cannot promise a button that isn't there.
+    let all_secret = missing.iter().all(|s| s.secret);
+    let outcome = if all_secret { &APPS_ENV_MISSING_SECRETS } else { &APPS_ENV_MISSING_SETTINGS };
+
+    let rendered = {
+        let count = missing.len().to_string();
+        let joined = names.join(", ");
+        APPS_ENV_CHECK.result(
+            outcome,
+            &[
+                ("first_label", missing[0].label.as_str()),
+                ("count", count.as_str()),
+                ("template_id", intent.template_id.as_str()),
+                ("names", joined.as_str()),
+            ],
         )
     };
 
-    PrereqResult::blocking(
-        key,
-        if missing.len() == 1 {
-            format!("{} needs a value", missing[0].label)
-        } else {
-            format!("{} required settings have no value", missing.len())
-        },
-        detail,
-    )
-    .with_observed(names)
+    rendered.with_observed(names)
 }
 
 /// Check: is the requested host port actually free?
@@ -167,17 +158,13 @@ pub fn check_required_env(intent: &AppDeployIntent, specs: &[AppEnvSpec]) -> Pre
 /// Three sources, in order of authority: the host's own bind probe, then the
 /// containers DockPanel manages, then the sites it proxies.
 pub fn check_port_available(intent: &AppDeployIntent, facts: &HostFacts) -> PrereqResult {
-    let key = "apps.port_available";
     let port = intent.port;
 
     if port == 0 {
-        return PrereqResult::blocking(
-            key,
-            "Choose a port",
-            "Pick the host port this app should be reachable on.",
-        );
+        return APPS_PORT_CHECK.result(&APPS_PORT_UNSET, &[]);
     }
 
+    let port_str = port.to_string();
     let suggestion = facts.next_free_port(port.saturating_add(1)).map(|p| Remediation::Value {
         label: "Use this port instead".to_string(),
         value: p.to_string(),
@@ -187,16 +174,12 @@ pub fn check_port_available(intent: &AppDeployIntent, facts: &HostFacts) -> Prer
 
     // Something DockPanel knows about holds it — we can name what.
     if let Some(holder) = facts.holder_of(port) {
-        let mut r = PrereqResult::blocking(
-            key,
-            format!("Port {port} is already in use"),
-            format!(
-                "Port {port} is taken by {}. Two things cannot publish on the same host \
-                 port, so this deploy would fail once the image finished downloading.",
-                holder.description
-            ),
-        )
-        .with_observed(vec![holder.description.clone()]);
+        let mut r = APPS_PORT_CHECK
+            .result(
+                &APPS_PORT_HELD_BY_KNOWN,
+                &[("port", port_str.as_str()), ("holder", holder.description.as_str())],
+            )
+            .with_observed(vec![holder.description.clone()]);
         if let Some(s) = suggestion {
             r = r.with_remediation(s);
         }
@@ -204,36 +187,18 @@ pub fn check_port_available(intent: &AppDeployIntent, facts: &HostFacts) -> Prer
     }
 
     match facts.port_probe_free {
-        Some(true) => PrereqResult::satisfied(
-            key,
-            format!("Port {port} is free"),
-            format!("Nothing is listening on port {port}."),
-        ),
+        Some(true) => APPS_PORT_CHECK.result(&APPS_PORT_FREE, &[("port", port_str.as_str())]),
         Some(false) => {
             // Nothing of ours holds it, yet the bind failed — so something outside
             // DockPanel does. We can't name it, but the consequence is identical.
-            let mut r = PrereqResult::blocking(
-                key,
-                format!("Port {port} is already in use"),
-                format!(
-                    "Something on this server is already listening on port {port}. It isn't \
-                     managed by DockPanel, so it may be another service you installed \
-                     yourself. Pick a different port, or stop whatever is using this one."
-                ),
-            );
+            let mut r = APPS_PORT_CHECK
+                .result(&APPS_PORT_HELD_BY_UNKNOWN, &[("port", port_str.as_str())]);
             if let Some(s) = suggestion {
                 r = r.with_remediation(s);
             }
             r
         }
-        None => PrereqResult::unknown(
-            key,
-            "Couldn't check the port",
-            format!(
-                "DockPanel couldn't ask this server whether port {port} is free, so it will \
-                 be attempted as-is."
-            ),
-        ),
+        None => APPS_PORT_CHECK.result(&APPS_PORT_UNPROBEABLE, &[("port", port_str.as_str())]),
     }
 }
 
@@ -242,11 +207,10 @@ pub fn check_port_available(intent: &AppDeployIntent, facts: &HostFacts) -> Prer
 /// Container names are unique per host, and the deploy form pre-fills the name
 /// with the template id — so deploying a second Postgres collides by default.
 pub fn check_name_available(intent: &AppDeployIntent, facts: &HostFacts) -> PrereqResult {
-    let key = "apps.name_available";
     let name = intent.name.trim();
 
     if name.is_empty() {
-        return PrereqResult::unknown(key, "Name this app", "Give the app a name to continue.");
+        return APPS_NAME_CHECK.result(&APPS_NAME_UNSET, &[]);
     }
 
     if facts.taken_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
@@ -256,15 +220,9 @@ pub fn check_name_available(intent: &AppDeployIntent, facts: &HostFacts) -> Prer
             .map(|n| format!("{name}-{n}"))
             .find(|candidate| !facts.taken_names.iter().any(|n| n.eq_ignore_ascii_case(candidate)));
 
-        let mut r = PrereqResult::blocking(
-            key,
-            format!("An app called {name} already exists"),
-            format!(
-                "This server already runs an app named {name}. Container names have to be \
-                 unique, so this deploy would be refused. Pick a different name."
-            ),
-        )
-        .with_observed(vec![name.to_string()]);
+        let mut r = APPS_NAME_CHECK
+            .result(&APPS_NAME_TAKEN, &[("name", name)])
+            .with_observed(vec![name.to_string()]);
 
         if let Some(s) = suggestion {
             r = r.with_remediation(Remediation::Value {
@@ -277,7 +235,7 @@ pub fn check_name_available(intent: &AppDeployIntent, facts: &HostFacts) -> Prer
         return r;
     }
 
-    PrereqResult::satisfied(key, "Name is available", format!("No other app is called {name}."))
+    APPS_NAME_CHECK.result(&APPS_NAME_AVAILABLE, &[("name", name)])
 }
 
 /// Check: does the server have the memory this deploy asks for?
@@ -286,52 +244,34 @@ pub fn check_name_available(intent: &AppDeployIntent, facts: &HostFacts) -> Prer
 /// kernel will page, and the operator may know something we don't about what is
 /// about to be freed. What is *not* acceptable is finding out from an OOM kill.
 pub fn check_resource_headroom(intent: &AppDeployIntent, facts: &HostFacts) -> PrereqResult {
-    let key = "apps.resource_headroom";
-
     let (Some(total), Some(used), Some(want)) = (facts.mem_total_mb, facts.mem_used_mb, intent.memory_mb)
     else {
-        return PrereqResult::unknown(
-            key,
-            "Memory not checked",
-            "No memory limit was set for this app, or this server's memory couldn't be read.",
-        );
+        return APPS_MEM_CHECK.result(&APPS_MEM_NOT_CHECKED, &[]);
     };
 
     let free = total.saturating_sub(used);
+    let (want_s, total_s, free_s) = (want.to_string(), total.to_string(), free.to_string());
+    let vars = [
+        ("want", want_s.as_str()),
+        ("total", total_s.as_str()),
+        ("free", free_s.as_str()),
+    ];
 
     if want > total {
-        return PrereqResult::warning(
-            key,
-            "That's more memory than this server has",
-            format!(
-                "This app is limited to {want} MB, but the server only has {total} MB in total \
-                 ({free} MB currently free). The limit will be accepted, but the container can \
-                 never reach it — and the server will start swapping first."
-            ),
-        )
-        .with_expected(format!("{total} MB total"))
-        .with_observed(vec![format!("{want} MB requested"), format!("{free} MB free")]);
+        return APPS_MEM_CHECK
+            .result(&APPS_MEM_OVER_TOTAL, &vars)
+            .with_expected(format!("{total} MB total"))
+            .with_observed(vec![format!("{want} MB requested"), format!("{free} MB free")]);
     }
 
     if want > free {
-        return PrereqResult::warning(
-            key,
-            "Less free memory than this app is allowed",
-            format!(
-                "This app is allowed {want} MB but only {free} MB of the server's {total} MB is \
-                 free right now. It will still start; if it actually uses its full limit, the \
-                 kernel will have to reclaim memory from something else."
-            ),
-        )
-        .with_expected(format!("{free} MB free"))
-        .with_observed(vec![format!("{want} MB requested")]);
+        return APPS_MEM_CHECK
+            .result(&APPS_MEM_OVER_FREE, &vars)
+            .with_expected(format!("{free} MB free"))
+            .with_observed(vec![format!("{want} MB requested")]);
     }
 
-    PrereqResult::satisfied(
-        key,
-        "Enough memory",
-        format!("{free} MB free, {want} MB requested."),
-    )
+    APPS_MEM_CHECK.result(&APPS_MEM_FITS, &vars)
 }
 
 /// Evaluate every Docker-app prerequisite for one intended deploy.
@@ -574,6 +514,50 @@ mod tests {
         let results = evaluate(&intent(), &[spec("POSTGRES_PASSWORD", "", true, true)], &facts);
         let blocker = super::super::first_blocker(&results).expect("must block");
         assert_eq!(blocker.key, "apps.required_env");
+    }
+
+    /// No check may leak an unfilled `{placeholder}` to a user.
+    ///
+    /// The registry's own tests prove each template can be filled from its
+    /// declared vars; this proves the *callers* actually pass them. The two are
+    /// not the same guarantee, and only this one covers a check that forgets an
+    /// argument — `Prereq::result`'s assertion is a `debug_assert`, and the
+    /// release builds we ship and test compile it out.
+    #[test]
+    fn no_app_check_leaks_an_unfilled_placeholder() {
+        let mut taken = intent();
+        taken.memory_mb = Some(8192);
+        let facts = HostFacts {
+            used_ports: vec![PortHolder { port: 5432, description: "the app `pg`".into() }],
+            taken_names: vec!["postgres".into()],
+            mem_total_mb: Some(2048),
+            mem_used_mb: Some(900),
+            port_probe_free: Some(false),
+            ..Default::default()
+        };
+        let specs = [spec("POSTGRES_PASSWORD", "", true, true), spec("TZ", "", true, false)];
+
+        let mut cases: Vec<PrereqResult> = evaluate(&taken, &specs, &facts);
+        // The other side of every branch: empty host, nothing probeable, and a
+        // form that has not been filled in yet.
+        let mut blank = intent();
+        blank.name = String::new();
+        blank.port = 0;
+        cases.extend(evaluate(&blank, &[], &HostFacts::default()));
+        cases.push(check_port_available(&intent(), &HostFacts { port_probe_free: Some(true), ..Default::default() }));
+        cases.push(check_resource_headroom(
+            &{ let mut i = intent(); i.memory_mb = Some(64); i },
+            &HostFacts { mem_total_mb: Some(2048), mem_used_mb: Some(100), ..Default::default() },
+        ));
+        cases.push(check_resource_headroom(
+            &{ let mut i = intent(); i.memory_mb = Some(1500); i },
+            &HostFacts { mem_total_mb: Some(2048), mem_used_mb: Some(1000), ..Default::default() },
+        ));
+
+        for r in cases {
+            assert!(!r.title.contains('{'), "unfilled placeholder in title: {}", r.title);
+            assert!(!r.detail.contains('{'), "unfilled placeholder in detail: {}", r.detail);
+        }
     }
 
     #[test]

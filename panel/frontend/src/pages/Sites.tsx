@@ -5,6 +5,7 @@ import { formatDate } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
 import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
+import { FieldHelp, InfoTip } from "../components/FieldHelp";
 
 interface Site {
   id: string;
@@ -187,10 +188,7 @@ export default function Sites() {
                 placeholder="example.com"
                 className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm"
               />
-              <p className="text-xs text-dark-400 mt-1.5">
-                Your site's public domain name (e.g., example.com). It needs to point at this
-                server before HTTPS can be issued — DockPanel checks that for you below.
-              </p>
+              <FieldHelp id="sites.create.domain" />
               <PrereqCallout
                 prereq={dnsPrereq}
                 onRecheck={recheckDns}
@@ -201,7 +199,13 @@ export default function Sites() {
             </div>
             {!cms ? (
               <div>
-                <label htmlFor="site-runtime" className="block text-sm font-medium text-dark-100 mb-1">Runtime</label>
+                {/* The (i) sits beside the label, never inside it: a button
+                    inside a <label> activates the labelled control, so opening
+                    the tooltip would also drop the select's list over it. */}
+                <div className="flex items-center mb-1">
+                  <label htmlFor="site-runtime" className="block text-sm font-medium text-dark-100">Runtime</label>
+                  <InfoTip id="sites.create.runtime" />
+                </div>
                 <select
                   id="site-runtime"
                   value={runtime}
@@ -250,6 +254,7 @@ export default function Sites() {
               <div>
                 <label className="block text-sm font-medium text-dark-100 mb-1">Admin Password</label>
                 <input type="password" value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} placeholder="Auto-generated if blank" className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm" />
+                <FieldHelp id="sites.create.admin_password" />
               </div>
             </div>
             </>
@@ -269,7 +274,7 @@ export default function Sites() {
                 max="65535"
                 className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm max-w-xs"
               />
-              <p className="text-xs text-dark-400 mt-1.5">The local port your application listens on</p>
+              <FieldHelp id="sites.create.proxy_port" />
             </div>
           )}
 

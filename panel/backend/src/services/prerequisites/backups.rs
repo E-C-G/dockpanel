@@ -18,6 +18,11 @@
 
 use uuid::Uuid;
 
+use super::copy::{
+    BACKUPS_DEST_CHECK, BACKUPS_DEST_DELETED, BACKUPS_DEST_LOCAL_NO_OPTIONS,
+    BACKUPS_DEST_LOCAL_WITH_OPTIONS, BACKUPS_DEST_UPLOADS, BACKUPS_POLICY_CHECK,
+    BACKUPS_POLICY_NONE, BACKUPS_POLICY_NOTHING, BACKUPS_POLICY_RUNNING,
+};
 use super::{PrereqResult, Remediation};
 
 /// What we know about one policy's off-site story.
@@ -48,65 +53,53 @@ pub struct PolicyDestinationFacts {
 /// still a warning, but a different sentence, because the operator did choose and
 /// the choice silently stopped applying.
 pub fn check_backup_destination(facts: &PolicyDestinationFacts) -> PrereqResult {
-    let key = "backups.destination_configured";
-    let name = &facts.policy_name;
+    let name = facts.policy_name.as_str();
 
     match (facts.destination_id, facts.destination_exists) {
         // Chose one, it's there. The only good outcome.
-        (Some(_), true) => PrereqResult::satisfied(
-            key,
-            "Backups are copied off this server",
-            format!(
-                "'{name}' uploads to {}.",
-                facts.destination_name.as_deref().unwrap_or("its destination")
-            ),
+        (Some(_), true) => BACKUPS_DEST_CHECK.result(
+            &BACKUPS_DEST_UPLOADS,
+            &[
+                ("policy", name),
+                (
+                    "destination",
+                    facts.destination_name.as_deref().unwrap_or("its destination"),
+                ),
+            ],
         ),
 
         // Chose one, it's gone. Materially worse than never having chosen: the
         // operator believes this is handled.
-        (Some(_), false) => PrereqResult::warning(
-            key,
-            "This policy's backup destination no longer exists",
-            format!(
-                "'{name}' is set to upload to a destination that has since been deleted, so its \
-                 backups are staying on this server. Pick a destination again, or create a new \
-                 one."
-            ),
-        )
-        .with_remediation(Remediation::Link {
-            label: "Backup destinations".to_string(),
-            href: "/backup-orchestrator?tab=destinations".to_string(),
-        }),
+        (Some(_), false) => BACKUPS_DEST_CHECK
+            .result(&BACKUPS_DEST_DELETED, &[("policy", name)])
+            .with_remediation(Remediation::Link {
+                label: "Backup destinations".to_string(),
+                href: "/backup-orchestrator?tab=destinations".to_string(),
+            }),
 
-        // Never chose one.
+        // Never chose one. The advice differs by whether there is anything to
+        // pick — telling someone to create a destination they already have is
+        // how guidance loses its credibility.
         (None, _) => {
-            let detail = if facts.destinations_available > 0 {
-                format!(
-                    "'{name}' writes its backups to this server's own disk and nowhere else. \
-                     You already have {} destination(s) configured — choosing one means these \
-                     backups survive losing this machine.",
-                    facts.destinations_available
+            let has_options = facts.destinations_available > 0;
+            let available = facts.destinations_available.to_string();
+            let rendered = if has_options {
+                BACKUPS_DEST_CHECK.result(
+                    &BACKUPS_DEST_LOCAL_WITH_OPTIONS,
+                    &[("policy", name), ("available", available.as_str())],
                 )
             } else {
-                format!(
-                    "'{name}' writes its backups to this server's own disk and nowhere else. \
-                     That protects you from a bad deploy or a dropped table, but not from losing \
-                     the server: disk failure, a deleted instance or a compromised host take the \
-                     backups with the data.\n\n\
-                     Add an S3 or SFTP destination and select it on this policy."
-                )
+                BACKUPS_DEST_CHECK.result(&BACKUPS_DEST_LOCAL_NO_OPTIONS, &[("policy", name)])
             };
 
-            PrereqResult::warning(key, "Backups never leave this server", detail).with_remediation(
-                Remediation::Link {
-                    label: if facts.destinations_available > 0 {
-                        "Choose a destination".to_string()
-                    } else {
-                        "Add a destination".to_string()
-                    },
-                    href: "/backup-orchestrator?tab=destinations".to_string(),
+            rendered.with_remediation(Remediation::Link {
+                label: if has_options {
+                    "Choose a destination".to_string()
+                } else {
+                    "Add a destination".to_string()
                 },
-            )
+                href: "/backup-orchestrator?tab=destinations".to_string(),
+            })
         }
     }
 }
@@ -116,36 +109,21 @@ pub fn check_backup_destination(facts: &PolicyDestinationFacts) -> PrereqResult 
 /// Distinct from the destination question and prior to it — a panel with zero
 /// enabled policies has nothing to send anywhere.
 pub fn check_any_policy_enabled(enabled_policies: usize, sites: usize) -> PrereqResult {
-    let key = "backups.policy_configured";
-
     if sites == 0 {
-        return PrereqResult::unknown(
-            key,
-            "Nothing to back up yet",
-            "Once you add a site or a database, DockPanel can back it up on a schedule.",
-        );
+        return BACKUPS_POLICY_CHECK.result(&BACKUPS_POLICY_NOTHING, &[]);
     }
     if enabled_policies > 0 {
-        return PrereqResult::satisfied(
-            key,
-            "Scheduled backups are running",
-            format!("{enabled_policies} enabled backup policy/policies."),
-        );
+        let count = enabled_policies.to_string();
+        return BACKUPS_POLICY_CHECK.result(&BACKUPS_POLICY_RUNNING, &[("count", count.as_str())]);
     }
 
-    PrereqResult::warning(
-        key,
-        "Nothing is being backed up on a schedule",
-        format!(
-            "This server hosts {sites} site(s) and has no enabled backup policy, so nothing is \
-             backed up automatically. Manual backups still work, but they only exist when \
-             somebody remembers."
-        ),
-    )
-    .with_remediation(Remediation::Link {
-        label: "Create a backup policy".to_string(),
-        href: "/backup-orchestrator?tab=policies".to_string(),
-    })
+    let sites_s = sites.to_string();
+    BACKUPS_POLICY_CHECK
+        .result(&BACKUPS_POLICY_NONE, &[("sites", sites_s.as_str())])
+        .with_remediation(Remediation::Link {
+            label: "Create a backup policy".to_string(),
+            href: "/backup-orchestrator?tab=policies".to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -217,6 +195,44 @@ mod tests {
             "a panel with no sites is not neglecting anything"
         );
         assert_eq!(check_any_policy_enabled(1, 3).state, PrereqState::Satisfied);
+    }
+
+    /// See the equivalent in `apps` — the registry proves its templates *can* be
+    /// filled; this proves these callers *do* fill them, which a release build's
+    /// compiled-out `debug_assert` cannot.
+    #[test]
+    fn no_backup_check_leaks_an_unfilled_placeholder() {
+        let mut live = facts();
+        live.destination_id = Some(Uuid::nil());
+        live.destination_exists = true;
+        live.destination_name = Some("wasabi-eu".into());
+
+        let mut dangling = facts();
+        dangling.destination_id = Some(Uuid::nil());
+
+        let mut with_options = facts();
+        with_options.destinations_available = 2;
+
+        // A live destination whose name we somehow don't have — the `unwrap_or`
+        // branch, which is the one a placeholder would hide in.
+        let mut unnamed = live.clone();
+        unnamed.destination_name = None;
+
+        let cases = [
+            check_backup_destination(&facts()),
+            check_backup_destination(&live),
+            check_backup_destination(&dangling),
+            check_backup_destination(&with_options),
+            check_backup_destination(&unnamed),
+            check_any_policy_enabled(0, 0),
+            check_any_policy_enabled(0, 3),
+            check_any_policy_enabled(2, 3),
+        ];
+
+        for r in cases {
+            assert!(!r.title.contains('{'), "unfilled placeholder in title: {}", r.title);
+            assert!(!r.detail.contains('{'), "unfilled placeholder in detail: {}", r.detail);
+        }
     }
 
     /// Nothing on the backup surface gates a control.

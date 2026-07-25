@@ -131,18 +131,23 @@ Verification types: `site`, `database`, `volume`.
 
 ## Backup Destinations
 
-Store backups off-server. Supported providers:
+Store backups off-server. There are exactly two destination types — `s3` and `sftp` — and every S3-compatible provider uses the first:
 
 | Provider | Type | Endpoint example |
 |----------|------|-----------------|
 | AWS S3 | `s3` | `https://s3.us-east-1.amazonaws.com` |
-| Backblaze B2 | `b2` | `https://s3.us-west-001.backblazeb2.com` |
-| Google Cloud Storage | `gcs` | `https://storage.googleapis.com` |
-| Any SFTP server | `sftp` | `sftp://backup.example.com:22` |
+| Backblaze B2 | `s3` | `https://s3.us-west-001.backblazeb2.com` |
+| Google Cloud Storage | `s3` | `https://storage.googleapis.com` |
 | DigitalOcean Spaces | `s3` | `https://nyc3.digitaloceanspaces.com` |
 | MinIO (self-hosted) | `s3` | `https://minio.example.com:9000` |
+| Cloudflare R2 | `s3` | `https://<account>.r2.cloudflarestorage.com` |
+| Any SFTP server | `sftp` | `sftp://backup.example.com:22` |
 
-Add a destination under **Backups** > **Destinations**, then select it in your policies.
+Add a destination under **Backup Manager** > **Destinations**, then select it on a policy.
+
+A policy with no destination writes its archives to this server's own disk and nowhere else. DockPanel says so on the Backup Manager overview rather than leaving you to discover it — see [What DockPanel checks for you](prerequisites.md).
+
+> **Retention off-site covers site archives only.** The prune that enforces a retention count at the destination is keyed on a site's domain, so remote copies of *database* and *volume* backups accumulate there even as their local copies are pruned. Watch the bucket, or prune it on the provider's own lifecycle rules, until this is resource-agnostic.
 
 ## Encryption
 

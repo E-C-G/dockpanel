@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, type PrereqResult } from "../components/Prerequisite";
+import { InfoTip } from "../components/FieldHelp";
 
 interface MailDomain {
   id: string;
@@ -1115,7 +1116,10 @@ export default function Mail() {
                 {tab === "dns" && (
                   <div>
                     <div className="flex items-center justify-between mb-4">
-                      <h3 className="text-xs text-dark-300 uppercase tracking-widest">Required DNS Records</h3>
+                      <h3 className="text-xs text-dark-300 uppercase tracking-widest">
+                        Required DNS Records
+                        <InfoTip id="mail.domain.records" />
+                      </h3>
                       <button disabled={checkingDns} onClick={async () => {
                         if (!selectedDomain) return;
                         setCheckingDns(true);

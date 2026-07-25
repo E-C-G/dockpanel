@@ -57,7 +57,7 @@ Scheduled backups run in the background. The backup scheduler checks for pending
 
 Store backups off-server for disaster recovery. DockPanel supports any S3-compatible storage (AWS S3, Backblaze B2, MinIO, Wasabi, DigitalOcean Spaces, etc.).
 
-1. Go to **Backups** > **Destinations**
+1. Go to **Backup Manager** > **Destinations** (also reachable from **Settings**)
 2. Click **Add Destination**
 3. Enter:
    - **Name**: A label (e.g., `backblaze-b2`)

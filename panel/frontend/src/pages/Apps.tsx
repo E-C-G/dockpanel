@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback, type ReactNode } from "react"
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
 import { PrereqList, usePrereqs } from "../components/Prerequisite";
+import { FieldHelp } from "../components/FieldHelp";
 import { timeAgo } from "../utils/format";
 
 interface EnvVar {
@@ -1888,6 +1889,7 @@ volumes:
                   onChange={(e) => setAppName(e.target.value)}
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
                 />
+                <FieldHelp id="apps.deploy.name" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-dark-100 mb-1">Host Port</label>
@@ -1897,6 +1899,7 @@ volumes:
                   onChange={(e) => setAppPort(Number(e.target.value))}
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
                 />
+                <FieldHelp id="apps.deploy.port" />
               </div>
 
               <div>
@@ -1941,6 +1944,7 @@ volumes:
                       min="0"
                       className="w-full px-3 py-1.5 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
                     />
+                    <FieldHelp id="apps.deploy.memory" />
                   </div>
                   <div>
                     <label className="block text-xs text-dark-200 mb-0.5">CPU (%)</label>

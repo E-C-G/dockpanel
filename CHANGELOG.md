@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.30.0] - 2026-07-25
+
+The guidance layer stops being four verticals that share a type and becomes one content system. Its
+copy now lives in a single registry, the documentation is generated from that registry rather than
+written beside it, and the passive tier — the line under a field, the text behind an (i) — comes from
+the same place as the callouts.
+
+The reason this was worth doing is in the Fixed section: the manual was already contradicting the
+product, in a way that broke a real user's mail.
+
+### Added
+
+- **One registry of guidance copy** (`services/prerequisites/copy.rs`). Every sentence the guidance
+  layer says — nine checks, thirty-odd outcomes — is data in one greppable file, alongside the prose
+  a format string has nowhere to put: what the check proves, why it matters, and why it blocks rather
+  than warns. A check now decides *which* outcome a situation is; it cannot decide what that outcome
+  says, because the four hand-rolled `PrereqResult` constructors are gone and the only remaining path
+  goes through the registry.
+- **The documentation is generated from it.** `dockpanel-api --emit-guidance <repo>` writes
+  `docs/guides/prerequisites.md` — the shipped binary emits its own manual. A test regenerates and
+  compares, so changing a sentence without regenerating fails the suite, naming the line and the
+  command to fix it. This is the mechanism, not a convention: a page that is emitted cannot describe
+  a version of the product that no longer exists.
+- **The passive tier joined the same system.** `components/FieldHelp.tsx` renders field help and a
+  click-to-open (i) from `content/guidance.generated.ts`, emitted from the same registry and
+  type-checked against it, so a typo in a field id is a compile error rather than a silently blank
+  hint. Wired on the create-site form, the Docker deploy dialog, the backup-policy destination and
+  the mail DNS tab. Per the brief, tooltips and callouts are now one content system rendered at
+  different urgencies.
+- Field help for the CMS admin password, which had none, saying where the generated password is
+  stored — the custody question v2.28.0 fixed but never explained.
+
+### Fixed
+
+- **The manual told you to publish a DKIM record that could never verify.** `docs/guides/email.md`
+  documented the selector as `default`; DockPanel has used `dockpanel` for its entire life. Anyone
+  who set mail up from the documentation rather than from the panel got a record at the wrong name,
+  unsigned mail, and — since v2.29.0 — a DNS check correctly reporting it missing while the manual
+  insisted it was right. The same page described the mail host as `mail.example.com` and the SPF
+  policy as `-all`, where the product publishes the apex and `~all`. The records section now sends
+  you to the panel, which knows your server's address and your domain's key, instead of restating
+  values that go stale.
+- **Backup destination types.** The Backup Manager guide listed `b2` and `gcs` as destination types;
+  the API accepts `s3` and `sftp` and rejects everything else. Backblaze and Google Cloud Storage do
+  work — through their S3-compatible endpoints, as type `s3`, which is now what the table says. The
+  same guide sent you to "Backups > Destinations", which is not where they live.
+- **Troubleshooting contradicted the DNS check.** It stated a domain must resolve to this server's
+  own IP; the panel treats a domain resolving elsewhere as a warning precisely because issuance
+  through a proxy such as Cloudflare demonstrably works. Resolving to *nothing* is the case that
+  cannot succeed, and that is now what the page says.
+- **An (i) opened where it could not be read.** The tooltip was clipped by the viewport edge when its
+  trigger sat in a form's right-hand column; it now flips to the right edge when it would overflow.
+  It is also no longer nested inside a `<label>`, where clicking it dropped the labelled select's
+  list over the text it had just opened.
+- **A value containing a placeholder was substituted twice.** Copy filling ran a sequence of
+  replacements over its own output, so a backup policy named `{available}` came back rendered as a
+  number. Filling is now single-pass — the product does not quietly rewrite what an operator typed.
+
+### Notes
+
+- Retention at a remote destination still covers site archives only; database and volume copies
+  accumulate there. Now documented in the Backup Manager guide rather than only in the code.
+
 ## [2.29.1] - 2026-07-26
 
 One gap only a fresh box could show, found by driving v2.29.0 on one rather than by re-reading the diff.

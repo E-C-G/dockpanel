@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "dockpanel-agent"
-version = "2.29.1"
+version = "2.30.0"
 dependencies = [
  "axum",
  "axum-server",

@@ -64,8 +64,49 @@ pub struct AppState {
     pub panel_update_state: services::panel_update::UpdateStateHandle,
 }
 
+/// Write the generated guidance artefacts and exit.
+///
+/// The point of the guidance layer's copy registry is that the manual is
+/// *emitted* by the product rather than written alongside it, so this is the
+/// literal mechanism: the shipped binary can print its own documentation. The
+/// test `guidance_manual_is_current` runs the same functions and fails when the
+/// committed files differ, which is what makes drift impossible rather than
+/// merely discouraged.
+///
+/// Usage: `dockpanel-api --emit-guidance <repo-root>`
+fn emit_guidance(root: &str) -> std::io::Result<()> {
+    use services::prerequisites::copy;
+
+    let manual_path = std::path::Path::new(root).join("docs/guides/prerequisites.md");
+    let module_path = std::path::Path::new(root)
+        .join("panel/frontend/src/content/guidance.generated.ts");
+
+    if let Some(dir) = module_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&manual_path, copy::manual())?;
+    std::fs::write(&module_path, copy::frontend_module())?;
+
+    println!("wrote {}", manual_path.display());
+    println!("wrote {}", module_path.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
+    // Documentation generation runs before anything else is set up: it needs no
+    // database, no config and no network, and a developer regenerating docs
+    // should never risk touching a live system to do it.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--emit-guidance") {
+        let root = args.get(i + 1).map(String::as_str).unwrap_or(".");
+        if let Err(e) = emit_guidance(root) {
+            eprintln!("failed to emit guidance docs: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Install rustls CryptoProvider before any TLS usage. Required by rustls 0.23+
     // when constructing a ClientConfig with a custom ServerCertVerifier (e.g., the
     // PinnedFingerprintVerifier used for remote-agent TLS pinning). Without this,

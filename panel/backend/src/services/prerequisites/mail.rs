@@ -40,6 +40,10 @@
 //! the `parse_agent_cert_expiry` consolidation in v2.28.0: a value spelled in two
 //! places is a value that is wrong in one of them.
 
+use super::copy::{
+    MAIL_DKIM_CHECK, MAIL_DKIM_MISSING, MAIL_DKIM_READY, MAIL_DNS_ALL_PUBLISHED, MAIL_DNS_CHECK,
+    MAIL_DNS_MISSING_ALL, MAIL_DNS_MISSING_SOME, MAIL_DNS_NO_PUBLIC_IP, MAIL_DNS_UNREADABLE,
+};
 use super::{DnsRecordHint, PrereqResult, Remediation};
 use crate::safe_cmd::safe_command;
 
@@ -244,15 +248,8 @@ pub async fn check_mail_dns_published(
     dkim_public_key: Option<&str>,
     server_ip: &str,
 ) -> PrereqResult {
-    let key = "mail.dns_published";
-
     if server_ip.is_empty() {
-        return PrereqResult::unknown(
-            key,
-            "Couldn't determine this server's public address",
-            "DockPanel could not detect its own public IP, so it can't tell you which records \
-             this domain needs.",
-        );
+        return MAIL_DNS_CHECK.result(&MAIL_DNS_NO_PUBLIC_IP, &[]);
     }
 
     let wanted = mail_records(domain, selector, dkim_public_key, server_ip);
@@ -288,49 +285,39 @@ pub async fn check_mail_dns_published(
 
     // Every lookup failed — that is a broken `dig`, not a broken domain.
     if unreadable == checked.len() {
-        return PrereqResult::unknown(
-            key,
-            "Couldn't check DNS",
-            "DockPanel couldn't run DNS lookups on this server, so it can't verify these \
-             records. Create them if you haven't already.",
-        )
-        .with_remediation(Remediation::DnsRecords { records: checked });
+        return MAIL_DNS_CHECK
+            .result(&MAIL_DNS_UNREADABLE, &[])
+            .with_remediation(Remediation::DnsRecords { records: checked });
     }
 
     if missing.is_empty() {
-        return PrereqResult::satisfied(
-            key,
-            format!("{domain}'s mail records are published"),
-            "MX, SPF, DKIM and DMARC all resolve and point at this server. Mail from this \
-             domain can be authenticated."
-                .to_string(),
-        )
-        .with_observed(observed);
+        return MAIL_DNS_CHECK
+            .result(&MAIL_DNS_ALL_PUBLISHED, &[("domain", domain)])
+            .with_observed(observed);
     }
 
-    let detail = format!(
-        "{} of {} records for {domain} are missing or point somewhere else: {}.\n\n\
-         Until they are correct, receiving servers can't verify that this server may send \
-         mail for {domain} — messages are likely to be filed as spam or rejected. Create the \
-         records below at whoever manages this domain's DNS; DockPanel re-checks \
-         automatically.",
-        missing.len(),
-        checked.len(),
-        missing.join(", ")
-    );
-
-    PrereqResult::warning(
-        key,
-        if missing.len() == checked.len() {
-            format!("{domain} has no mail DNS records yet")
+    let rendered = {
+        let count = missing.len().to_string();
+        let total = checked.len().to_string();
+        let joined = missing.join(", ");
+        let vars = [
+            ("domain", domain),
+            ("count", count.as_str()),
+            ("total", total.as_str()),
+            ("missing", joined.as_str()),
+        ];
+        let outcome = if missing.len() == checked.len() {
+            &MAIL_DNS_MISSING_ALL
         } else {
-            format!("{} mail records still missing for {domain}", missing.len())
-        },
-        detail,
-    )
-    .with_expected(server_ip.to_string())
-    .with_observed(observed)
-    .with_remediation(Remediation::DnsRecords { records: checked })
+            &MAIL_DNS_MISSING_SOME
+        };
+        MAIL_DNS_CHECK.result(outcome, &vars)
+    };
+
+    rendered
+        .with_expected(server_ip.to_string())
+        .with_observed(observed)
+        .with_remediation(Remediation::DnsRecords { records: checked })
 }
 
 /// A domain whose DKIM keys never generated can't sign anything.
@@ -340,23 +327,11 @@ pub async fn check_mail_dns_published(
 /// stores the domain anyway when generation fails, so this state is reachable and
 /// otherwise invisible.
 pub fn check_dkim_key_present(domain: &str, dkim_public_key: Option<&str>) -> PrereqResult {
-    let key = "mail.dkim_key";
-    match dkim_public_key {
-        Some(pem) if !pem.trim().is_empty() => PrereqResult::satisfied(
-            key,
-            "DKIM signing key is ready",
-            format!("Outgoing mail for {domain} is signed."),
-        ),
-        _ => PrereqResult::warning(
-            key,
-            "No DKIM signing key",
-            format!(
-                "DKIM key generation failed when {domain} was added, so outgoing mail isn't \
-                 signed and there is no DKIM record to publish. Check that the mail stack is \
-                 installed, then remove and re-add the domain to retry."
-            ),
-        ),
-    }
+    let outcome = match dkim_public_key {
+        Some(pem) if !pem.trim().is_empty() => &MAIL_DKIM_READY,
+        _ => &MAIL_DKIM_MISSING,
+    };
+    MAIL_DKIM_CHECK.result(outcome, &[("domain", domain)])
 }
 
 /// Evaluate the mail prerequisites for one domain.

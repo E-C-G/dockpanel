@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { api } from "../api";
 import { formatSize, formatDate, timeAgo } from "../utils/format";
 import { PrereqList, type PrereqResult } from "../components/Prerequisite";
+import { FieldHelp } from "../components/FieldHelp";
 
 interface ServerSla {
   server_id: string | null;
@@ -891,6 +892,7 @@ function PoliciesTab({
                 <option value="">Local only</option>
                 {destinations.map(d => <option key={d.id} value={d.id}>{d.name} ({d.dtype})</option>)}
               </select>
+              <FieldHelp id="backups.policy.destination" />
             </div>
             <div>
               <label className="block text-xs font-medium text-dark-100 mb-1 font-mono">Retention (backups)</label>
