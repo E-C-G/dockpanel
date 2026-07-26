@@ -16,12 +16,15 @@ DockPanel is a free, self-hosted, Docker-native server management panel built in
 
 Docker and Nginx are installed automatically if not already present.
 
-> **On the RHEL family (CentOS, Rocky, AlmaLinux, Fedora)** the panel, sites, PHP, SSL and
-> Docker apps all work, and the installer configures firewalld and SELinux for you. What is
-> *not* supported yet is installing the **optional services** — Redis, Node.js, PowerDNS, the
-> mail server, the WAF, Cloudflare Tunnel — from inside the panel: those installers are still
-> Debian/Ubuntu-only. Install them with `dnf` and the panel will detect them. The panel tells
-> you this explicitly rather than failing obscurely.
+> **On the RHEL family (CentOS, Rocky, AlmaLinux, Fedora)** the panel, sites, PHP, SSL,
+> Docker apps and the **optional-service installers** all work, and the installer configures
+> firewalld and SELinux for you. Redis, Node.js, PowerDNS, the WAF, Cloudflare Tunnel,
+> Composer, Fail2Ban and PHP extensions were each installed from the panel on Rocky 9.8.
+> Two deliberate exceptions remain: the **mail server** still refuses on RPM (the packages
+> resolve, but its configuration layout has not been driven there yet), and **UFW** refuses
+> on any box already running firewalld — installing it would create a second rule set that
+> nothing consults, so the panel opens ports through firewalld instead. Both say so plainly
+> rather than failing obscurely.
 
 ## Installation
 

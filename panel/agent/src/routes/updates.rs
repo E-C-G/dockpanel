@@ -3,9 +3,7 @@ use axum::body::Body;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_stream::StreamExt;
-use std::process::Stdio;
 use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 
 use super::AppState;
@@ -162,10 +160,11 @@ async fn apply_updates(Json(body): Json<ApplyRequest>) -> Response {
             cmd.args(["upgrade", "-y"]);
         }
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // stdout and stderr both arrive on one channel: the escape hatch no
+        // longer passes descriptors (see safe_cmd::UnsandboxedCommand), so the
+        // inner command's output is tailed out of its capture files.
+        let mut run = match cmd.spawn_streaming() {
+            Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(format!("{}\n", serde_json::json!({"type":"line","line":format!("Failed to start apt: {e}")}))).await;
                 let _ = tx.send(format!("{}\n", serde_json::json!({"type":"done","success":false,"reboot_required":false}))).await;
@@ -173,35 +172,15 @@ async fn apply_updates(Json(body): Json<ApplyRequest>) -> Response {
             }
         };
 
-        let stderr = child.stderr.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-
-        // Read stderr in a separate task and send lines through the same channel
-        let tx_err = tx.clone();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.is_empty() { continue; }
-                let msg = serde_json::json!({"type":"line","line":line});
-                if tx_err.send(format!("{msg}\n")).await.is_err() { break; }
-            }
-        });
-
-        // Read stdout line-by-line and stream immediately
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = run.lines.recv().await {
             if line.is_empty() { continue; }
             let msg = serde_json::json!({"type":"line","line":line});
             if tx.send(format!("{msg}\n")).await.is_err() { break; }
         }
 
-        // Wait for stderr reader to finish
-        let _ = stderr_task.await;
-
-        // Wait for process to exit (with timeout)
-        let success = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        // The channel closes only after the inner command has exited and its
+        // output has been drained, so this resolves immediately in practice.
+        let success = match tokio::time::timeout(Duration::from_secs(10), run.status()).await {
             Ok(Ok(status)) => status.success(),
             _ => false,
         };

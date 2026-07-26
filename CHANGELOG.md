@@ -4,6 +4,39 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.40.0] - 2026-07-26
+
+### Fixed
+
+- **No package operation could run on any SELinux system, and it never could.**
+  Installing Redis, Node.js, PowerDNS, the WAF, Cloudflare Tunnel, Composer,
+  Fail2Ban or a PHP extension from the panel failed on every RHEL-family box
+  with `Failed to start transient service unit: Connection reset by peer`. This
+  had been true since the agent's sandbox was introduced, and the cause was one
+  flag: the agent escaped its `ProtectSystem=strict` sandbox with `systemd-run
+  --pipe`, which passes stdin/stdout/stderr **as file descriptors over D-Bus**.
+  On the RHEL family the system bus is `dbus-broker`, and SELinux checks the
+  receiver's access to a passed object — receiving a writable pipe labelled
+  `unconfined_service_t`, the label every systemd service's pipes carry, is
+  denied. The broker drops the connection, and the rule is `dontaudit`ed, so
+  nothing whatsoever is logged. The same command works from a shell because a
+  shell's pipes are labelled `unconfined_t`.
+
+  The escape hatch no longer passes descriptors at all: systemd is asked to
+  open the capture files itself (`-p StandardOutput=file:…`), which it may do,
+  while `--wait` still propagates the inner command's exit status. The change
+  applies on every distribution rather than only where it broke, so the path
+  Debian and Ubuntu exercise is the same one.
+
+  Verified on Rocky 9.8, before and after on one box: Redis 6.2.22, Composer
+  2.10.2, Fail2Ban 1.1.0, Node.js 22.23.1, PowerDNS 5.0.6, ModSecurity 1.0.4,
+  cloudflared 2026.7.3 and `php-bcmath` all installed from the panel, on the
+  machine that had refused every one of them minutes earlier. Re-verified on
+  Debian 12 so the working family stayed working.
+
+  UFW still refuses on a box already running firewalld, and the mail server
+  still refuses on RPM — both deliberate, both stated.
+
 ## [2.39.0] - 2026-07-26
 
 ### Fixed
