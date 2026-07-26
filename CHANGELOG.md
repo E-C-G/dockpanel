@@ -4,6 +4,16 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.34.2] - 2026-07-26
+
+### Fixed
+
+- **Hardening:** the single-file restore now explicitly refuses `.dockpanel-backup`, the archive
+  directory holding a backup's database dumps. It could not reach them in practice — that function
+  prefixes every request with `./` while the payload members carry no prefix — but the protection
+  was an accident of how tar names members rather than a decision, and those dumps are the site's
+  entire content in plaintext being extracted into a publicly-served document root.
+
 ## [2.34.1] - 2026-07-26
 
 ### Fixed

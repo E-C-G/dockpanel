@@ -662,6 +662,18 @@ pub async fn restore_single_file(domain: &str, filename: &str, file_path: &str) 
     if file_path.starts_with('/') {
         return Err("File path must not start with '/'".into());
     }
+    // Never hand back the database payload through the single-file path: those
+    // dumps are the site's entire content in plaintext and the target is a
+    // publicly-served document root. Today the archive's payload members carry
+    // no `./` prefix while this function always adds one, so tar would not match
+    // them anyway — but that is an accident of member naming, and the guard
+    // should not depend on it.
+    let normalized = file_path.strip_prefix("./").unwrap_or(file_path);
+    if normalized == PAYLOAD_DIR || normalized.starts_with(&format!("{PAYLOAD_DIR}/")) {
+        return Err(format!(
+            "'{PAYLOAD_DIR}' holds this backup's database dumps and cannot be restored into the site directory; restore the whole backup instead"
+        ));
+    }
 
     let backup_filepath = backup_dir(domain).join(filename);
     if !backup_filepath.exists() {
@@ -876,6 +888,33 @@ mod db_payload_tests {
             !site.root().join(PAYLOAD_DIR).exists(),
             "database dumps must never be extracted into the document root"
         );
+    }
+
+    /// The single-file restore extracts an arbitrary member into the document
+    /// root. It must refuse the database payload explicitly.
+    #[tokio::test]
+    async fn single_file_restore_refuses_the_database_payload() {
+        let site = TestSite::new("singlefile");
+        let info = create_backup(site.domain(), &[]).await.expect("backup");
+
+        for attempt in [
+            ".dockpanel-backup/db/x.sql.gz",
+            "./.dockpanel-backup/db/x.sql.gz",
+            ".dockpanel-backup",
+        ] {
+            let err = restore_single_file(site.domain(), &info.filename, attempt)
+                .await
+                .expect_err(&format!("must refuse '{attempt}'"));
+            assert!(
+                err.contains("database dumps"),
+                "refusal must say why, got: {err}"
+            );
+        }
+
+        // An ordinary file is still restorable.
+        restore_single_file(site.domain(), &info.filename, "index.html")
+            .await
+            .expect("a normal file still restores");
     }
 
     #[test]

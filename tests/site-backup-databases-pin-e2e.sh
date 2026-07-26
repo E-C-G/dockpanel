@@ -100,6 +100,8 @@ hasE "$AGENT_SVC" 'remove_dir_all\(&?stage' \
      "staging is always removed, including on the error path"
 has  "$AGENT_SVC" 'site root contains a reserved' \
      "a site that already owns the payload path is refused, not shadowed"
+has  "$AGENT_SVC" "cannot be restored into the site directory" \
+     "the single-file restore explicitly refuses the database payload"
 
 echo
 echo "D. A partial restore is a failure"
