@@ -1,6 +1,6 @@
 # How DockPanel Is Tested
 
-> **Reflects v2.39.0.** The version stamp, the template count and every
+> **Reflects v2.40.0.** The version stamp, the template count and every
 > assertion total on this page are checked against the source by
 > `tests/docs-claims-pin-e2e.sh`, so this page cannot quietly fall behind the
 > code it describes.
@@ -289,15 +289,16 @@ full restore drill on the upgraded box brought the deleted post back.
 
 This section is the reason the rest of the page is worth reading.
 
-- **On the RHEL family, the optional-service installers do not work.** Redis,
-  Node.js, PowerDNS, the mail server, the WAF and Cloudflare Tunnel are all
-  installed with `apt-get` in code that has no `dnf` path — 55 call sites across
-  12 files. The panel now refuses these with a stated reason and a remedy instead
-  of an obscure failure, but the capability is genuinely missing, not merely
-  unpolished.
-- **Every vertical above install is still apt-only evidence on the RPM family.**
-  Mail, backups, git deploy, DNS and PHP pools have been driven end to end on
-  Debian/Ubuntu only.
+- **The mail server still refuses to install on the RHEL family.** Its packages
+  resolve, but the configuration half — Dovecot's layout, the OpenDKIM socket
+  directory, `/etc/dovecot/users` ownership — has never been driven there, and a
+  mail stack running with the wrong configuration reports itself healthy and
+  delivers nothing. Refusing is the honest state until it is driven.
+- **The remaining verticals above install are still apt-only evidence on the RPM
+  family.** Backups, git deploy, DNS and PHP pools have been driven end to end on
+  Debian/Ubuntu only. Optional-service *installation* is no longer in this list:
+  as of v2.40.0 Redis, Node.js, PowerDNS, the WAF, Cloudflare Tunnel, Composer,
+  Fail2Ban and PHP extensions were each installed from the panel on Rocky 9.8.
 
 - **The webmail message list can render empty.** Login, delivery and IMAP all
   work, and the mailbox demonstrably holds mail, but a frame is navigated to the
@@ -387,7 +388,7 @@ that reads the source and fails if the fix is undone — including the shapes th
 are easy to undo by accident. The mail pins assert, among other things, that the
 sandbox was **not** widened to include `/etc/opendkim.conf`, since widening it
 would have "fixed" the bug while destroying the reason the bug was
-survivable. Seven suites, **190 assertions**, all green at the current commit:
+survivable. Seven suites, **195 assertions**, all green at the current commit:
 
 | Suite | Assertions |
 |---|---|
@@ -397,7 +398,7 @@ survivable. Seven suites, **190 assertions**, all green at the current commit:
 | `git-deploy-sandbox-pin-e2e.sh` | 20 |
 | `ssl-correctness-pin-e2e.sh` | 30 |
 | `nginx-listen-pin-e2e.sh` | 17 |
-| `rpm-install-pin-e2e.sh` | 29 |
+| `rpm-install-pin-e2e.sh` | 34 |
 
 **On every release** (`release.yml`, `smoke-test.yml`):
 

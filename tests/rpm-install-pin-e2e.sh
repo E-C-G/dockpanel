@@ -405,6 +405,75 @@ else
   bad "the NodeSource repo choice is not family-branched — an RPM box gets the Debian setup script, which is the half-migration s265 deliberately left alone"
 fi
 
+echo "── 6. The privileged escape hatch must never pass file descriptors again (s267) ──"
+
+# THE WALL. `systemd-run --pipe` passes stdin/stdout/stderr over D-Bus. On the
+# RHEL family the bus is dbus-broker (system_dbusd_t), and SELinux's
+# file_receive hook forbids it to receive a writable pipe labelled
+# unconfined_service_t — the label every systemd service's pipes carry. The
+# broker drops the connection and systemd-run reports "Connection reset by
+# peer", with the denial dontaudit'ed so nothing is logged. Every package
+# operation on every RHEL box failed this way, for as long as the sandbox had
+# existed.
+#
+# These assertions read CODE ONLY. safe_cmd.rs discusses `--pipe` at length in
+# its doc comments precisely because it must never use it again, so a grep over
+# the raw file would match the explanation and sit green through the regression
+# it names — the trap that let one of s266's own pins pass its mutation test.
+SAFE=panel/agent/src/safe_cmd.rs
+# Production code only: comments are stripped, and everything from #[cfg(test)]
+# onward is dropped. The unit tests must SPELL the forbidden flag in order to
+# assert its absence, and a scanner cannot tell a guard from a use — so the
+# guard would convict itself. (Rust's own tests cover that region.)
+code_only() { sed '/#\[cfg(test)\]/q' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*)'; }
+
+if code_only "$SAFE" | grep -q -- '--pipe'; then
+  bad "$SAFE passes --pipe to systemd-run again — that is THE WALL, and it makes every package operation fail on every SELinux box"
+else
+  ok "the escape hatch passes no file descriptors (no --pipe in code)"
+fi
+
+if code_only "$SAFE" | grep -q -- '--wait'; then
+  ok "the escape hatch still waits, so the inner command's exit status is what callers see"
+else
+  bad "--wait is gone from $SAFE: systemd-run would return as soon as PID1 accepted the job and every caller's success check would become meaningless"
+fi
+
+if code_only "$SAFE" | grep -q 'StandardOutput=file:' && \
+   code_only "$SAFE" | grep -q 'StandardError=file:'; then
+  ok "output is captured via files PID1 opens itself, keeping stdout and stderr separate"
+else
+  bad "the StandardOutput/StandardError capture properties are gone — without them the ~10 call sites that parse stdout get nothing back"
+fi
+
+# /tmp is NOT usable: PID1 runs as init_t and writing a tmp_t file is denied on
+# the RHEL family. Measured, not assumed.
+CAPDIR=$(code_only "$SAFE" | sed -n 's/^const CAPTURE_DIR: &str = "\([^"]*\)".*/\1/p')
+if [ -z "$CAPDIR" ]; then
+  bad "CAPTURE_DIR is gone from $SAFE, so this check cannot see where captured output lands"
+elif printf '%s' "$CAPDIR" | grep -qE '^/(tmp|var/tmp)(/|$)'; then
+  bad "capture files live in $CAPDIR — PID1 (init_t) may not write tmp_t, so every unsandboxed command loses its output on RHEL"
+elif grep -m1 '^ReadWritePaths=' "$UNIT" | tr ' ' '\n' | sed 's/^-//' | grep -qxF "$(printf '%s' "$CAPDIR" | sed 's#\(/var/lib/[^/]*\).*#\1#')"; then
+  ok "capture files live under $CAPDIR, which the agent unit may read back and PID1 may write"
+else
+  bad "$CAPDIR is outside the agent unit's ReadWritePaths — PID1 would write the output and the agent could not read it"
+fi
+
+# The hatch is shared, but a call site could still hand-roll systemd-run.
+# Do NOT look for --pipe on the same LINE as systemd-run: panel_update.rs builds
+# its invocation across several .arg() calls, so a per-line match cannot see it
+# and this assertion passed its own mutation test until it was rewritten. The
+# flag has no other legitimate use anywhere in the agent, so require it absent
+# from every code line outside the one file whose comments explain it.
+stray_pipe=$(grep -rn -- '--pipe' panel/agent/src --include=*.rs \
+   | grep -v '^panel/agent/src/safe_cmd.rs:' \
+   | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(///|//!|//|\*)')
+if [ -n "$stray_pipe" ]; then
+  bad "a file outside safe_cmd.rs names --pipe, which reaches the wall again through that path:${stray_pipe}"
+else
+  ok "no call site hand-rolls a descriptor-passing systemd-run"
+fi
+
 echo
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

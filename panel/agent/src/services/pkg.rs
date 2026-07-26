@@ -539,25 +539,24 @@ pub async fn refresh_index() {
 ///
 /// Whether the privileged escape hatch actually works on this box.
 ///
-/// **This is the wall s266 hit, and it is not ours.** Every package operation
-/// runs through `safe_command_unsandboxed`, which asks systemd for a transient
-/// unit via `systemd-run`. On the RHEL family that call fails from inside
-/// `dockpanel-agent.service`:
+/// **This was the wall s266 hit; s267 root-caused and fixed it.** Every package
+/// operation runs through `safe_command_unsandboxed`, which asks systemd for a
+/// transient unit. That call used to pass the caller's stdin/stdout/stderr as
+/// **file descriptors over D-Bus** (`systemd-run --pipe`), and on the RHEL
+/// family SELinux forbids the message bus to receive them, so the connection
+/// was torn down and every package operation failed with:
 ///
 ///     Failed to start transient service unit: Connection reset by peer
 ///
-/// Measured on Rocky 9.8 at s266, and **pre-existing** — `install_composer`,
-/// which s266 never touched, fails identically, so this has been true since the
-/// sandbox was introduced. It is not the sandbox directives (reproduced with
-/// every one of them disabled, each override verified effective via
-/// `systemctl show`), not `env_clear` (an empty environment works from a
-/// shell), and not SELinux (no AVC with dontaudit disabled). The discriminator:
-/// the very same agent binary, run **from a shell instead of as a service**,
-/// installs Composer successfully.
+/// The hatch no longer passes descriptors at all — see
+/// `safe_cmd::UnsandboxedCommand` for the mechanism and the evidence. Verified
+/// on Rocky 9.8: Redis, Composer, Fail2Ban and a PHP extension all installed
+/// through the panel on the same box that refused them one binary earlier.
 ///
-/// Until that is root-caused, a package operation here would fail with a D-Bus
-/// string that tells an operator nothing. Probing first lets us say what is
-/// actually wrong. The probe is cheap (`systemd-run … /bin/true`) and cached.
+/// The probe is KEPT because it is cheap (`systemd-run … /bin/true`, cached
+/// once) and because it is the difference between an operator reading a
+/// sentence they can act on and reading a raw D-Bus string. If some future
+/// policy or systemd change closes the hatch again, this is what notices.
 async fn escape_hatch_works() -> bool {
     static OK: OnceCell<bool> = OnceCell::const_new();
     *OK.get_or_init(|| async {
@@ -588,9 +587,10 @@ pub async fn privileged_ops_reason(what: &str) -> Option<String> {
     }
     Some(format!(
         "{what} cannot run on this system: the agent is unable to launch privileged helper \
-         processes (systemd refuses the transient unit it uses to step outside its sandbox). \
-         This is a known limitation on RHEL-family distributions and is being tracked. Install \
-         the package with your system package manager (dnf) and the panel will detect it."
+         processes (systemd refused the transient unit it uses to step outside its sandbox). \
+         This is unexpected — please report it with the output of \
+         `systemd-run --wait --collect -- /bin/true` run as root. In the meantime, install the \
+         package with your system package manager and the panel will detect it."
     ))
 }
 
