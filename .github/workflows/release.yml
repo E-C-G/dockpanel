@@ -13,7 +13,82 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The release page is where most people meet this project, and it used to show
+  # an auto-generated commit list — so the CHANGELOG's account of what was broken
+  # and what is still broken never reached a single reader. This job lifts the
+  # tag's own section out of CHANGELOG.md and hands it to the release body.
+  #
+  # It runs FIRST and everything else needs it, so a tag pushed without a
+  # changelog entry costs ~20 seconds instead of a full build. It fails loudly
+  # rather than falling back to the generated notes: a silent fallback is exactly
+  # the behaviour being fixed here.
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract this tag's section from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # index(...)==1 rather than a regex: the version contains dots, and
+          # anchoring on a literal prefix avoids escaping them into a match for
+          # "2x36x0". Stops at the next "## [" so the next release is excluded.
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > section.md
+
+          # Trim leading and trailing blank lines.
+          sed -e '/./,$!d' section.md | tac | sed -e '/./,$!d' | tac > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section. Add the entry for ${GITHUB_REF_NAME} before tagging — the release body is written from it."
+            exit 1
+          fi
+
+          cat >> release-notes.md <<'FOOTER'
+
+          ---
+
+          **Install:** `curl -sL dockpanel.dev/install.sh | bash`
+
+          Every release is installed on a throwaway VPS and driven as a user before
+          it ships. What that means, and what it has found, is written up at
+          <https://docs.dockpanel.dev/testing.html>.
+
+          Binaries are static musl builds signed with Sigstore; `checksums.txt`
+          and the `.sig`/`.pem` pairs are attached below.
+          FOOTER
+
+          # The compare link the generated notes would have given us. Taken from
+          # the heading that FOLLOWS this version's section (not simply the
+          # second heading in the file) so that re-tagging an older release
+          # still points at that release's real predecessor.
+          PREV=$(awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 {
+              sub(/^## \[/, ""); sub(/\].*/, ""); print; exit
+            }
+          ' CHANGELOG.md)
+          if [ -n "$PREV" ] && [ "$PREV" != "$VERSION" ]; then
+            echo "" >> release-notes.md
+            echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/compare/v${PREV}...${GITHUB_REF_NAME}" >> release-notes.md
+          fi
+
+          echo "Release body (${VERSION}):"
+          cat release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+
   build:
+    needs: changelog
     strategy:
       matrix:
         include:
@@ -131,7 +206,7 @@ jobs:
           path: dockpanel-frontend.tar.gz
 
   release:
-    needs: [build, frontend]
+    needs: [changelog, build, frontend]
     runs-on: ubuntu-latest
 
     steps:
@@ -148,6 +223,11 @@ jobs:
           cp artifacts/binaries-amd64/* release/
           cp artifacts/binaries-arm64/* release/
           cp artifacts/frontend/dockpanel-frontend.tar.gz release/
+
+          # The notes come down with the other artifacts but are the release
+          # BODY, not an asset — keep them out of release/ so they are not
+          # published, checksummed or signed as a downloadable file.
+          test -s artifacts/release-notes/release-notes.md
 
           # Create checksums (over binaries + SBOMs, before signatures)
           cd release
@@ -206,7 +286,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          # The body is exactly the CHANGELOG section, and nothing else appends
+          # to it. generate_release_notes is deliberately NOT set: GitHub's
+          # documented behaviour when both are supplied reads ambiguously, and
+          # what a reader sees first is the entire point of this change. The
+          # compare link the generated notes would have provided is written into
+          # the body by the changelog job instead.
+          body_path: artifacts/release-notes/release-notes.md
           files: |
             release/*
 

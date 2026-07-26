@@ -205,3 +205,22 @@ jobs:
 
       - name: Audit Marketing Site (server)
         run: cd website/server && npm ci && node ../../scripts/npm-audit-gate.mjs
+
+  # s263: the same fact was published on three surfaces — the .md files GitHub
+  # renders, docs.dockpanel.dev, and the dockpanel.dev marketing site — and kept
+  # in sync by hand. It drifted: the app-template count read 152 in ten places
+  # while the catalogue held 153, and FEATURES.md was stamped with a version
+  # five months and 28 releases old. Neither was discoverable without counting a
+  # Rust array by hand, so neither was ever discovered.
+  #
+  # This job makes the published numbers derive from source and checks them on
+  # every commit, which is the only version of "keep the docs in sync" that does
+  # not depend on somebody remembering.
+  docs-claims:
+    name: Documentation Claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Published claims match the source
+        run: bash tests/docs-claims-pin-e2e.sh

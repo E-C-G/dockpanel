@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>The most feature-packed free server panel ever built.</strong><br>
-  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~19MB of RAM</strong>. 776 API endpoints. 152 app templates. 454 E2E tests. ~41MB binaries. Zero subscriptions.
+  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~19MB of RAM</strong>. 776 API endpoints. 153 app templates. 454 E2E tests. ~41MB binaries. Zero subscriptions.
 </p>
 
 <p align="center">
@@ -39,13 +39,13 @@ Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, Fedora 39+, Amazon Linux 2
 
 ## Why DockPanel?
 
-No other free panel gives you Git push-to-deploy with blue-green zero-downtime updates, 152 one-click Docker app templates, per-image CVE scanning with deploy gating, a WAF, passkey login, GPU passthrough, multi-server management, reseller accounts, a developer CLI, and Infrastructure as Code — all while the panel services themselves use under 20MB of RAM. DockPanel does.
+No other free panel gives you Git push-to-deploy with blue-green zero-downtime updates, 153 one-click Docker app templates, per-image CVE scanning with deploy gating, a WAF, passkey login, GPU passthrough, multi-server management, reseller accounts, a developer CLI, and Infrastructure as Code — all while the panel services themselves use under 20MB of RAM. DockPanel does.
 
 | | DockPanel | HestiaCP | CloudPanel | RunCloud |
 |---|---|---|---|---|
 | **Price** | **Free** | Free | Free | $8/mo+ |
 | **Stack** | **Rust + React** | PHP | PHP | PHP (SaaS) |
-| **Docker native** | **152 templates** | No | No | No |
+| **Docker native** | **153 templates** | No | No | No |
 | **Git deploy** | **Blue-green, zero-downtime** | No | No | Basic |
 | **Multi-server** | **Unlimited** | No | No | Yes |
 | **Reseller + white-label** | **Yes** | Reseller only | No | No |
@@ -53,6 +53,15 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 | **RAM usage (panel)** | **~19MB** | ~200MB+ | ~150MB+ | SaaS |
 | **ARM64 / Homelab** | **Yes** | Partial | No | No |
 | **Self-hosted** | **Yes** | Yes | Yes | No |
+
+A feature table is easy to write, so here is the harder claim: before each
+release DockPanel is installed on a throwaway VPS with a real domain and a real
+Let's Encrypt certificate, and each journey is driven to the point where a user
+would get value from it — mail is not "installed", a message is sent to another
+server and its DKIM signature checked on arrival. That has repeatedly found
+features whose setup half worked and whose payoff half had never once run.
+[How DockPanel is tested](https://docs.dockpanel.dev/testing.html) lists what it
+found, including what is still broken.
 
 ## Screenshots
 
@@ -75,7 +84,7 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 </details>
 
 <details>
-<summary><strong>Docker Apps</strong> — 152 one-click templates across 14 categories</summary>
+<summary><strong>Docker Apps</strong> — 153 one-click templates across 14 categories</summary>
 
 ![Docker Apps](.github/screenshots/dp-apps.png)
 </details>
@@ -163,7 +172,7 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 ### Hosting
 - **Sites** — Static, PHP (8.1-8.4), Node.js, Python, reverse proxy. Automatic Nginx config, SSL, PHP-FPM pools.
 - **Databases** — MySQL/PostgreSQL in Docker. Built-in SQL browser, visual schema browser, point-in-time recovery (WAL/binlog). Auto-cleanup on site delete.
-- **Docker Apps** — 152 templates across 14 categories (AI, CMS, Database, Media, Monitoring, and more). Compose stacks. Resource limits. GPU passthrough.
+- **Docker Apps** — 153 templates across 14 categories (AI, CMS, Database, Media, Monitoring, and more). Compose stacks. Resource limits. GPU passthrough.
 - **Git Deploy** — Push-to-deploy. Atomic zero-downtime deploys (Capistrano-style). Nixpacks (30+ languages). Preview environments.
 - **WordPress Toolkit** — Multi-site dashboard, vulnerability scanning, security hardening, bulk updates.
 - **CMS Install** — WordPress, Laravel, Drupal, Joomla, Symfony, CodeIgniter — one click.
@@ -285,6 +294,7 @@ sudo bash /opt/dockpanel/scripts/uninstall.sh   # Remove
 ## Documentation
 
 - [Live Docs](https://docs.dockpanel.dev) — Getting started, guides, configuration
+- [How DockPanel is tested](https://docs.dockpanel.dev/testing.html) — The fresh-VPS drills, what they found, and what is still broken
 - [FEATURES.md](FEATURES.md) — Complete feature manifest (60+ features, ~280 capabilities)
 - [CHANGELOG.md](CHANGELOG.md) — Version history
 - [SECURITY.md](SECURITY.md) — Security model and vulnerability reporting
