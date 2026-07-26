@@ -181,15 +181,20 @@ svc_fail() { SVC_FAIL+=("$1"); }
 # treated as "not yet" and retried inside a bounded window.
 wait_for_unit() {
     local unit="$1" tries="${2:-20}" state
-    for _ in $(seq 1 "$tries"); do
+    for i in $(seq 1 "$tries"); do
         state=$(systemctl is-active "$unit" 2>/dev/null || true)
         case "$state" in
             active) return 0 ;;
             failed) return 1 ;;
-            *)      sleep 1 ;;
         esac
+
+        if [ "$i" -lt 5 ]; then
+            sleep 0.2
+        else
+            sleep 1
+        fi
     done
-    [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "active" ]
+    return 1
 }
 
 join_comma() {
