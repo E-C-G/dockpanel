@@ -9,7 +9,15 @@
 3. Select the site to back up
 4. Click **Create**
 
-The backup includes the site files, database (if attached), and Nginx configuration. It is saved as a compressed tarball in `/var/backups/dockpanel/`.
+The backup contains the site's directory — its files, and nothing else. It is saved as a
+compressed tarball in `/var/backups/dockpanel/`.
+
+> **Databases are not included.** For a CMS such as WordPress, almost everything you think of as
+> "the site" — posts, pages, comments, users, settings — lives in the database, not in these
+> files. A site backup will not bring any of it back. Back databases up separately (see
+> [Database Backups](#database-backups) below) and keep both if you want to be able to restore
+> the site as it was. The site's Nginx configuration is not in the tarball either; the panel
+> rewrites it from its own records.
 
 ### From the CLI
 
@@ -91,7 +99,11 @@ Once a destination is configured, edit your backup schedule and select it as the
 3. Click **Restore**
 4. Confirm the restore
 
-The restore replaces the site files and database with the backup contents. The current state is not automatically backed up before restore -- create a manual backup first if you want a safety net.
+The restore replaces the site's files with the backup contents. It does **not** touch the
+database, so a site restored after a database problem comes back with its files intact and its
+content unchanged — restore the database separately if that is what went wrong. The current
+state is not automatically backed up before restore -- create a manual backup first if you want
+a safety net.
 
 ### From the CLI
 
@@ -103,9 +115,8 @@ Sample output:
 
 ```
 Restoring example.com from example.com_2026-03-20_143022.tar.gz...
-  [1/3] Extracting files...
-  [2/3] Restoring database...
-  [3/3] Reloading nginx...
+  [1/2] Extracting files...
+  [2/2] Reloading services...
 Restore complete.
 ```
 
@@ -129,7 +140,9 @@ DockPanel runs an automatic daily database backup cron job for the panel's own P
 - **Retention**: 7 days (older backups are automatically deleted)
 - **Location**: `/var/backups/dockpanel/`
 
-This is separate from site backups. Site backups include the site's own database (MySQL or PostgreSQL container) as part of the site backup tarball.
+This is separate from site backups, and it covers the panel's own database only — not your
+sites'. A site's database (its MySQL or PostgreSQL container) is not captured by either one, so
+back it up with the manual step below or from the **Databases** page.
 
 ### Manual database-only backup
 

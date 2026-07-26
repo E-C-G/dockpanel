@@ -4,9 +4,44 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [2.33.0] - 2026-07-26
 
 ### Fixed
+
+- **Nobody could log in to a mailbox.** The Dovecot password file was written `0600 root:root` —
+  the instinctive choice for a file full of password hashes, and one notch too strict: Dovecot's
+  authentication worker drops privileges to the `dovecot` user, so it could not open the file at
+  all. Every IMAP, POP3 and submission login failed with `Temporary authentication failure`,
+  while the panel reported the account as created successfully; the only evidence was a
+  `Permission denied` line in Dovecot's own log. The file is now written `0640` owned by group
+  `dovecot` — still unreadable to every other user on the box, readable by the one process whose
+  job is to read it — with the ownership set before the atomic rename, so the live path is never
+  briefly published with permissions that lock authentication out. Found by creating a mailbox
+  on a fresh box and trying to log in as its owner.
+
+- **Auto-sleep stopped containers that were serving users.** Nothing ever recorded a visitor:
+  `last_activity_at` moved only when an administrator woke a container by hand, so "idle" in
+  practice meant "nobody used the *panel*". A container answering a request every sixteen
+  seconds was stopped on the timer, and the next visitor got a 502 with nothing to wake it.
+  The sleeper now asks nginx when the container's domain last served a request and counts that
+  as activity. A domain with no access log reports *unknown* rather than zero, because a silent
+  zero is exactly what would stop a container nothing is known about.
+
+- **Enabling auto-sleep on a default install did nothing at all, silently.** The sleeper runs as
+  a step of the auto-healer, which is off by default and configured on a different page, so the
+  switch stored the setting, answered "enabled", and was never acted upon. The setting still
+  saves, but the panel now says plainly when the loop that honours it is switched off, and the
+  control no longer describes an idleness it was not measuring.
+
+### Changed
+
+- **A site backup says what it actually contains.** Creating one archives the site directory and
+  nothing else, while the panel's own records know the site has a database. For a CMS that is a
+  fraction of the site: a restore returns the files and not a single post, page or setting —
+  confirmed by restoring one and finding a deleted post still gone. The Backups page now states
+  that backups are files only and points at where databases are backed up, rather than leaving
+  the word "backup" to be read as "my site is safe". Including databases in the archive is a
+  larger change to a destructive restore path and is tracked separately.
 
 - **The installer no longer aborts because it could not ask systemd a question.**
   `systemctl is-active` answers "running", "not running" and "I could not reach the bus" with

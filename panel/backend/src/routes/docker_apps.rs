@@ -1855,7 +1855,28 @@ pub async fn update_sleep_config(
         Some("container"), Some(&container_name), None, None,
     ).await;
 
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // Report whether the loop that honours this setting is actually running.
+    //
+    // The sleeper is a step inside the auto-healer, which is off by default and
+    // is configured on a different page entirely. Enabling auto-sleep on a fresh
+    // install therefore stored the setting, answered `ok`, and did nothing at
+    // all — for ever, silently. The switch is not wrong to store; it is wrong to
+    // report plain success while the thing that acts on it is switched off, so
+    // the caller gets told and can say so.
+    let auto_heal_enabled: bool = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'auto_heal_enabled'"
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| v == "true")
+    .unwrap_or(false);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "auto_heal_enabled": auto_heal_enabled,
+    })))
 }
 
 /// POST /api/apps/{container_id}/wake — Wake a sleeping container.

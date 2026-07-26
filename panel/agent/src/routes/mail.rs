@@ -294,8 +294,7 @@ ssl = required
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_mailbox_maps: {e}")))?;
     write_file_atomic(POSTFIX_VIRTUAL_ALIAS, "").await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_alias_maps: {e}")))?;
-    // 0600: the Dovecot users file holds password hashes — never world-readable.
-    write_file_atomic_mode(DOVECOT_USERS, "", 0o600).await
+    write_dovecot_users("").await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot users: {e}")))?;
     let _ = safe_command("postmap").arg(POSTFIX_VIRTUAL_MAILBOX).output().await;
     let _ = safe_command("postmap").arg(POSTFIX_VIRTUAL_ALIAS).output().await;
@@ -634,8 +633,7 @@ async fn sync_config(
             format!("{}:{}::::{}::userdb_quota_rule=*:storage={}M", a.email, a.password_hash, maildir, a.quota_mb)
         })
         .collect();
-    // 0600: this file holds every mail account's password hash — never world-readable.
-    write_file_atomic_mode(DOVECOT_USERS, &dovecot_lines.join("\n"), 0o600).await
+    write_dovecot_users(&dovecot_lines.join("\n")).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot users: {e}")))?;
 
     // 5. Run postmap to rebuild hash tables
@@ -1495,16 +1493,36 @@ async fn write_file_atomic(path: &str, content: &str) -> Result<(), String> {
 /// so a secret file (e.g. the Dovecot users file, which holds mail-account password hashes) is
 /// never even briefly world-readable. Without this, `write_file_atomic` leaves the file at the
 /// process umask (0644 under root's default 022) — the s236 mail-audit finding.
-async fn write_file_atomic_mode(path: &str, content: &str, mode: u32) -> Result<(), String> {
-    let tmp_path = format!("{path}.tmp");
+/// Write the Dovecot passwd-file so that Dovecot can actually read it.
+///
+/// The file holds every mail account's password hash, so it must not be
+/// world-readable. `0600 root:root` enforces that and is the instinctive
+/// choice — but it is one notch too strict, and the cost is the entire mail
+/// vertical: Dovecot's auth worker drops privileges to the `dovecot` user, so
+/// it could not open this file at all. Every IMAP, POP3 and submission login
+/// failed with `Temporary authentication failure` while the panel reported the
+/// account as created successfully, and the only evidence was a
+/// `Permission denied (euid=…(dovecot) … missing +r perm)` line in Dovecot's
+/// own log. `0640` with group `dovecot` is the arrangement Dovecot documents:
+/// still unreadable to every other user on the box, readable by the one
+/// process whose job is to read it.
+///
+/// The group is set on the temporary file *before* the rename, so the real
+/// path is never momentarily visible with ownership that would lock auth out.
+/// A box that has no `dovecot` group has no Dovecot either, so a failing
+/// `chown` is not worth losing the write over — the mode already keeps the
+/// hashes private.
+async fn write_dovecot_users(content: &str) -> Result<(), String> {
+    let tmp_path = format!("{DOVECOT_USERS}.tmp");
     tokio::fs::write(&tmp_path, content).await.map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))
+        tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o640))
             .await
             .map_err(|e| e.to_string())?;
     }
-    tokio::fs::rename(&tmp_path, path).await.map_err(|e| e.to_string())?;
+    let _ = safe_command("chown").args(["root:dovecot", &tmp_path]).output().await;
+    tokio::fs::rename(&tmp_path, DOVECOT_USERS).await.map_err(|e| e.to_string())?;
     Ok(())
 }

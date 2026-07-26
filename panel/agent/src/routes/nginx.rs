@@ -1297,6 +1297,37 @@ async fn site_logs(
     Ok(Json(serde_json::json!({ "logs": content, "lines": line_count, "file": log_file })))
 }
 
+/// GET /nginx/last-activity/{domain} — When this domain last served a request.
+///
+/// The access log's mtime, as seconds since the epoch. That is deliberately not
+/// a parse of the log: the only consumer is the auto-sleep timer, which asks
+/// "has anyone visited recently?" every two minutes for every configured
+/// container, and reading the last write time of a file answers that exactly,
+/// in constant time, no matter how large the log has grown.
+///
+/// `seconds_ago` is `null` when the domain has no access log at all — a vhost
+/// that has never been written, or an app with no domain. That is "unknown",
+/// not "idle", and callers must treat it as such: reporting a silent zero here
+/// is what would let a timer stop a container it knows nothing about.
+async fn last_activity(Path(domain): Path<String>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !super::is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let log_file = format!("/var/log/nginx/{domain}.access.log");
+
+    let seconds_ago = std::fs::metadata(&log_file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs());
+
+    Ok(Json(serde_json::json!({
+        "domain": domain,
+        "seconds_ago": seconds_ago,
+        "log_file": log_file,
+    })))
+}
+
 /// GET /nginx/site-stats/{domain} — Basic traffic stats from access log.
 async fn site_stats(Path(domain): Path<String>) -> Result<Json<serde_json::Value>, ApiErr> {
     if !super::is_valid_domain(&domain) {
@@ -2199,6 +2230,7 @@ pub fn router() -> Router<AppState> {
         // Site Logs & Stats
         .route("/nginx/site-logs/{domain}", get(site_logs))
         .route("/nginx/site-stats/{domain}", get(site_stats))
+        .route("/nginx/last-activity/{domain}", get(last_activity))
         .route("/nginx/php-errors/{domain}", get(php_errors))
         // Site Cloning
         .route("/nginx/clone-site", post(clone_site))

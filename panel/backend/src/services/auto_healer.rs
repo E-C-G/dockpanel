@@ -1452,7 +1452,37 @@ async fn auto_sleep_idle_containers(pool: &PgPool, agent: &AgentClient) {
 
     let now = chrono::Utc::now();
 
-    for (container_id, container_name, _domain, threshold_minutes) in &configs {
+    for (container_id, container_name, domain, threshold_minutes) in &configs {
+        // Real traffic counts as activity, and it is the only thing that should.
+        //
+        // Nothing else writes `last_activity_at` from visitors: the column moves
+        // only when an admin wakes the container by hand, on the first-run
+        // bootstrap below, or through an admin-only ping endpoint the frontend
+        // does not call. So without this lookup, "idle" meant "nobody used the
+        // *panel*", and a container serving requests every few seconds was
+        // stopped out from under its users on the timer — verified on a real box
+        // against a continuous stream of HTTP 200s, which the sleeper then turned
+        // into 502s. Ask nginx when the domain last answered, and let that count.
+        if let Some(domain) = domain.as_deref().filter(|d| !d.is_empty()) {
+            if let Ok(result) = agent.get(&format!("/nginx/last-activity/{domain}")).await {
+                // A domain with no access log yet reports `null` — unknown, not
+                // idle. Leave the stored value alone and let the checks below
+                // decide on what they do know.
+                if let Some(secs) = result.get("seconds_ago").and_then(|v| v.as_u64()) {
+                    let seen = chrono::Utc::now() - chrono::Duration::seconds(secs as i64);
+                    let _ = sqlx::query(
+                        "UPDATE container_sleep_config SET last_activity_at = $2 \
+                         WHERE container_id = $1 \
+                           AND (last_activity_at IS NULL OR last_activity_at < $2)"
+                    )
+                    .bind(container_id)
+                    .bind(seen)
+                    .execute(pool)
+                    .await;
+                }
+            }
+        }
+
         // Check last activity: use the stored last_activity_at
         let last_activity: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
             "SELECT last_activity_at FROM container_sleep_config WHERE container_id = $1"

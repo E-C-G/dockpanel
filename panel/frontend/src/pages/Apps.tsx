@@ -1580,14 +1580,24 @@ volumes:
                           onClick={async () => {
                             const cfg = await api.get<{ auto_sleep_enabled: boolean; sleep_after_minutes: number }>(`/apps/${app.container_id}/sleep-config`);
                             const newEnabled = !cfg.auto_sleep_enabled;
-                            await api.put(`/apps/${app.container_id}/sleep-config`, {
+                            const res = await api.put<{ auto_heal_enabled?: boolean }>(`/apps/${app.container_id}/sleep-config`, {
                               auto_sleep_enabled: newEnabled,
                               sleep_after_minutes: cfg.sleep_after_minutes || 30,
                             });
-                            setMessage({ text: `Auto-sleep ${newEnabled ? "enabled" : "disabled"}`, type: "success" });
+                            // Auto-sleep runs as a step of the auto-healer. With
+                            // that switched off the setting is stored and never
+                            // acted on, so saying "enabled" would be a lie.
+                            if (newEnabled && res?.auto_heal_enabled === false) {
+                              setMessage({
+                                text: "Auto-sleep saved, but it will not run until Auto-Healing is enabled in Settings.",
+                                type: "error",
+                              });
+                            } else {
+                              setMessage({ text: `Auto-sleep ${newEnabled ? "enabled" : "disabled"}`, type: "success" });
+                            }
                           }}
                           className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-300 hover:bg-dark-600"
-                          title="Toggle auto-sleep (stop container when idle)"
+                          title="Toggle auto-sleep (stop the container when its domain has served no requests for a while; requires Auto-Healing)"
                         >
                           Sleep
                         </button>

@@ -173,6 +173,16 @@ export default function Backups() {
         <div>
           <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">Backups</h1>
           <p className="text-sm text-dark-200 mt-1 font-mono">{site?.domain}</p>
+          {/* A site backup is `tar` of the site directory and nothing else. For a
+              CMS that is a fraction of the site: restoring one returns the files
+              and not a single post, page, comment or setting. Saying so here is
+              not a nicety — someone who reads "Backup" as "my site is safe"
+              finds out otherwise at the worst possible moment. */}
+          <p className="text-xs text-dark-300 mt-2 max-w-xl">
+            Contains this site&apos;s <strong className="text-dark-200">files only</strong>. Databases are
+            not included &mdash; back them up from the Databases page, or a restore here will bring back
+            the files without their content.
+          </p>
         </div>
         <button
           onClick={handleCreate}
@@ -361,7 +371,7 @@ export default function Backups() {
             </svg>
             <p className="text-dark-200 text-sm">No backups yet</p>
             <p className="text-dark-300 text-xs mt-1">
-              Create your first backup to protect your site files
+              Create your first backup to protect your site files (databases are backed up separately)
             </p>
           </div>
         ) : (
