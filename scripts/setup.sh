@@ -483,33 +483,52 @@ install_dependencies() {
     run "Refreshing package index" pkg_update || true
 
     # EPEL for RHEL-family (needed for certbot, fail2ban, etc.)
-    if [ "$PKG_MGR" != "apt" ]; then
+    if [ "$PKG_MGR" != "apt" ] && ! rpm -q epel-release &>/dev/null; then
         run "Enabling EPEL repository" pkg_install epel-release || true
     fi
 
-    local BASE_PKGS="curl, openssl, ca-certificates"
+    local BASE_PKGS="curl openssl ca-certificates"
     if [ "$PKG_MGR" = "apt" ]; then
-        # gnupg + lsb-release only exist/matter on Debian-based
-        run "Installing base packages (${BASE_PKGS}, gnupg, lsb-release)" \
-            pkg_install curl openssl ca-certificates gnupg lsb-release
+        # Check if missing any base package or gnupg/lsb-release
+        if ! dpkg -s curl openssl ca-certificates gnupg lsb-release &>/dev/null; then
+            run "Refreshing package index" pkg_update || true
+            run "Installing base packages (curl, openssl, ca-certificates, gnupg, lsb-release)" \
+                pkg_install curl openssl ca-certificates gnupg lsb-release
+        else
+            log "Base packages already installed"
+        fi
     else
-        run "Installing base packages (${BASE_PKGS})" \
-            pkg_install curl openssl ca-certificates
+        if ! rpm -q curl openssl ca-certificates &>/dev/null; then
+            run "Refreshing package index" pkg_update || true
+            run "Installing base packages (curl, openssl, ca-certificates)" \
+                pkg_install curl openssl ca-certificates
+        else
+            log "Base packages already installed"
+        fi
     fi
 
     # Build tools required for Rust compilation (cmake for aws-lc-sys, gcc for ring)
     if [ "$INSTALL_FROM_RELEASE" != "1" ]; then
         if [ "$PKG_MGR" = "apt" ]; then
-            run "Installing build tools (build-essential, cmake, pkg-config, libssl-dev)" \
-                pkg_install build-essential cmake pkg-config libssl-dev
+            if ! dpkg -s build-essential cmake pkg-config libssl-dev &>/dev/null; then
+                run "Installing build tools (build-essential, cmake, pkg-config, libssl-dev)" \
+                    pkg_install build-essential cmake pkg-config libssl-dev
+                log "Build tools installed"
+            else
+                log "Build tools already installed"
+            fi
         else
-            run "Installing build tools (gcc, cmake, make, pkg-config, openssl-devel)" \
-                pkg_install gcc gcc-c++ cmake make pkg-config openssl-devel
+            if ! rpm -q gcc gcc-c++ cmake make pkg-config openssl-devel &>/dev/null; then
+                run "Installing build tools (gcc, cmake, make, pkg-config, openssl-devel)" \
+                    pkg_install gcc gcc-c++ cmake make pkg-config openssl-devel
+                log "Build tools installed"
+            else
+                log "Build tools already installed"
+            fi
         fi
-        log "Build tools installed"
     fi
 
-    log "Base packages installed"
+    log "Base packages checked"
 }
 
 # Docker's convenience script points each distro at its own repo path under
