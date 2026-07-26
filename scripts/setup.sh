@@ -667,16 +667,31 @@ fetched_msg() {
 download_binaries() {
     header "Downloading Pre-built Binaries"
 
-    # Get latest release tag
+    # Which release to install.
+    #
+    # install.sh already reads DOCKPANEL_VERSION and clones that ref — but this,
+    # its only consumer, used to always fetch releases/latest. So
+    # `DOCKPANEL_VERSION=v2.31.2 install.sh` produced a v2.31.2 tree running
+    # v2.34.2 binaries and printed "Version: v2.34.2" at the end (s261). Unit
+    # files, nginx templates and install-agent.sh are deployed from the tree,
+    # so that skew is the same class that stranded the v2.8.13 -> v2.8.14
+    # upgrade path. Honour the pin here; `main` (the default) means "latest".
     local RELEASE_TAG
-    RELEASE_TAG=$(curl --retry 3 --retry-delay 2 -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    if [ -n "${DOCKPANEL_VERSION:-}" ] && [ "${DOCKPANEL_VERSION}" != "main" ]; then
+        RELEASE_TAG="$DOCKPANEL_VERSION"
+        case "$RELEASE_TAG" in
+            [0-9]*) RELEASE_TAG="v$RELEASE_TAG" ;;
+        esac
+        log "Pinned release: $RELEASE_TAG (DOCKPANEL_VERSION)"
+    else
+        RELEASE_TAG=$(curl --retry 3 --retry-delay 2 -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        log "Latest release: $RELEASE_TAG"
+    fi
 
     if [ -z "$RELEASE_TAG" ]; then
         error "Could not determine latest release. Check https://github.com/${GITHUB_REPO}/releases"
         exit 1
     fi
-
-    log "Latest release: $RELEASE_TAG"
     INSTALLED_VERSION="$RELEASE_TAG"
     BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
 

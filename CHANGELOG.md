@@ -4,6 +4,51 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.35.0] - 2026-07-26
+
+### Fixed
+
+- **Git deploy could never build on a normal install.** The agent runs
+  `ProtectSystem=strict` + `ProtectHome=yes`, and `docker build` creates `$HOME/.docker`
+  before it will run — so with `HOME=/root` mounted read-only, every Dockerfile-based
+  deploy aborted at `mkdir /root/.docker: read-only file system`. The repository was
+  cloned, the build never ran once, on any install. The docker CLI is now pointed at
+  `DOCKER_CONFIG=/var/lib/dockpanel/docker`, inside the unit's `ReadWritePaths`. Set in
+  the shared `safe_cmd` helpers rather than at a call site: `env_clear()` means a
+  unit-level `Environment=` never reaches the child, and ~77 docker invocations share
+  those helpers. The sandbox itself is unchanged — `/root` and `/usr/local/bin` stay
+  read-only.
+- **The Dockerfile-less fallback could not rescue it either.** nixpacks installed itself
+  into `/usr/local/bin` (read-only under the same sandbox) and cached into
+  `/var/cache/dockpanel` (never in `ReadWritePaths`). Both now live under
+  `/var/lib/dockpanel`, matching how the image scanner already handles this. A
+  previously downloaded copy is also found again, instead of being re-fetched on every
+  agent restart because it sits off the agent's `PATH`.
+- **`update.sh`'s agent health check could never pass.** It probed the panel's
+  `/api/system/info` with no credentials; that endpoint is authenticated, so it answered
+  401, `curl -sf` read that as failure, and every update on every install printed
+  "Agent connectivity check failed" whether the agent was healthy or dead. It now asks
+  the agent's own `/health` over its unix socket, which is auth-exempt by design, and
+  falls back to the legacy `/var/run` socket path on older boxes.
+- **`DOCKPANEL_VERSION` was read by the installer and ignored by its only consumer.**
+  `install.sh` clones the requested ref, but `setup.sh` always downloaded
+  `releases/latest` — so `DOCKPANEL_VERSION=v2.31.2` produced a v2.31.2 tree running
+  the newest binaries and reported the newest version on completion. Unit files, nginx
+  templates and `install-agent.sh` are deployed from the tree, so that skew is the same
+  class that once stranded the v2.8.13 → v2.8.14 upgrade. `setup.sh` now honours the
+  pin and names the release it installed.
+
+### Verified
+
+- The update path itself, driven end to end on a fresh box for the first time: a
+  published **v2.31.2** install with a live WordPress site upgraded in place to current.
+  Panel, agent, CLI, tree and schema all moved forward (96 → 97 migrations), every row
+  survived, the site and panel kept serving over their real Let's Encrypt certificates,
+  and a backup taken after the upgrade carried its database (`1/1`) while the
+  pre-upgrade row correctly stayed `0/0`. A full restore drill on the upgraded box
+  brought back a deleted WordPress post. Evidence:
+  `dockpanel-update-path-drill-s261.md`.
+
 ## [2.34.2] - 2026-07-26
 
 ### Fixed

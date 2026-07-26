@@ -8,6 +8,20 @@
 /// Minimal safe PATH containing only system directories.
 const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Config directory handed to every docker CLI invocation.
+///
+/// The agent unit runs `ProtectHome=yes`, so the `HOME=/root` these helpers set
+/// is an empty read-only mount inside the sandbox. The docker CLI creates
+/// `$HOME/.docker` on first use, and `docker build` does not tolerate failing to
+/// — it aborts with `mkdir /root/.docker: read-only file system`. That took down
+/// every Dockerfile-based git deploy on every hardened install (s261): the clone
+/// succeeded, the build never ran once. Point the CLI at a directory that IS in
+/// the unit's `ReadWritePaths` instead of widening the sandbox. Set here rather
+/// than at a call site because `env_clear()` means a unit-level `Environment=`
+/// would never reach the child, and because ~77 docker invocations share these
+/// helpers — one of them silently missing it is exactly the drift that hid this.
+const DOCKER_CONFIG_DIR: &str = "/var/lib/dockpanel/docker";
+
 /// Create an async `tokio::process::Command` with a sanitized environment.
 ///
 /// The child process starts with an **empty** environment and only receives:
@@ -15,6 +29,7 @@ const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 /// - `HOME`  – `/root`
 /// - `LANG`  – `C.UTF-8`
 /// - `LC_ALL` – `C.UTF-8`
+/// - `DOCKER_CONFIG` – a writable dir, since `HOME` is not one under the sandbox
 ///
 /// Callers that need additional env vars (e.g. `PGPASSWORD`) should add them
 /// via `.env("KEY", "value")` **after** calling this function.
@@ -25,6 +40,7 @@ pub fn safe_command(binary: &str) -> tokio::process::Command {
     cmd.env("HOME", "/root");
     cmd.env("LANG", "C.UTF-8");
     cmd.env("LC_ALL", "C.UTF-8");
+    cmd.env("DOCKER_CONFIG", DOCKER_CONFIG_DIR);
     cmd
 }
 
@@ -39,6 +55,7 @@ pub fn safe_command_sync(binary: &str) -> std::process::Command {
     cmd.env("HOME", "/root");
     cmd.env("LANG", "C.UTF-8");
     cmd.env("LC_ALL", "C.UTF-8");
+    cmd.env("DOCKER_CONFIG", DOCKER_CONFIG_DIR);
     cmd
 }
 
@@ -73,6 +90,7 @@ pub fn safe_command_unsandboxed(
     cmd.arg("--setenv=LANG=C.UTF-8");
     cmd.arg("--setenv=LC_ALL=C.UTF-8");
     cmd.arg("--setenv=DEBIAN_FRONTEND=noninteractive");
+    cmd.arg(format!("--setenv=DOCKER_CONFIG={DOCKER_CONFIG_DIR}"));
     for (k, v) in extra_env {
         cmd.arg(format!("--setenv={k}={v}"));
     }
@@ -96,6 +114,7 @@ pub fn safe_command_sync_unsandboxed(
     cmd.arg("--setenv=LANG=C.UTF-8");
     cmd.arg("--setenv=LC_ALL=C.UTF-8");
     cmd.arg("--setenv=DEBIAN_FRONTEND=noninteractive");
+    cmd.arg(format!("--setenv=DOCKER_CONFIG={DOCKER_CONFIG_DIR}"));
     for (k, v) in extra_env {
         cmd.arg(format!("--setenv={k}={v}"));
     }

@@ -719,9 +719,21 @@ if ! curl -sf --max-time 30 http://127.0.0.1:3080/api/auth/setup-status > /dev/n
 fi
 log "Health check: /api/auth/setup-status OK"
 
-# Agent reachable (non-fatal — agent may start slower)
-if ! curl -sf --max-time 30 http://127.0.0.1:3080/api/system/info > /dev/null 2>&1; then
+# Agent reachable (non-fatal — agent may start slower).
+#
+# Ask the AGENT, not the panel. `/api/system/info` is behind auth, and this
+# check sent no token — so it returned 401, `curl -sf` treated that as failure,
+# and every update on every install printed "Agent connectivity check failed"
+# whether the agent was healthy or dead. A check that fails identically in both
+# states carries no signal; it only taught operators to ignore the warning.
+# The agent's own /health is explicitly exempt from auth
+# (panel/agent/src/routes/mod.rs), which makes it the honest probe.
+AGENT_SOCK=/run/dockpanel/agent.sock
+[ -S "$AGENT_SOCK" ] || AGENT_SOCK=/var/run/dockpanel/agent.sock
+if ! curl -sf --max-time 30 --unix-socket "$AGENT_SOCK" http://localhost/health > /dev/null 2>&1; then
     warn "Agent connectivity check failed (non-fatal, agent may still be starting)"
+else
+    log "Health check: agent /health OK"
 fi
 
 # CLI health check (non-fatal)

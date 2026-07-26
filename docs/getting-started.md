@@ -48,6 +48,17 @@ cd /opt/dockpanel
 sudo bash scripts/setup.sh
 ```
 
+To install a specific release rather than the newest one, set `DOCKPANEL_VERSION` to a
+release tag. It selects both the source tree and the binaries, so the two cannot drift
+apart:
+
+```bash
+DOCKPANEL_VERSION=v2.34.2 curl -sL https://dockpanel.dev/install.sh | sudo bash
+```
+
+Before 2.35.0 this variable chose the source tree only and the binaries were always the
+newest release, so a pinned install ended up mismatched.
+
 ## First Login
 
 1. Open your browser and go to `https://YOUR_SERVER_IP:8443`

@@ -1048,6 +1048,16 @@ async fn cleanup_blue(docker: &Docker, container_id: &str) {
 
 static NIXPACKS_PATH: OnceLock<Option<String>> = OnceLock::new();
 
+/// Where the agent keeps its own nixpacks copy, and its build cache.
+///
+/// Both used to live outside the agent unit's `ReadWritePaths`
+/// (`/usr/local/bin` under `ProtectSystem=strict`, `/var/cache/dockpanel` not
+/// listed at all), so the download failed with "Read-only file system" and the
+/// Dockerfile-less build path was unreachable on every hardened install (s261).
+const NIXPACKS_DIR: &str = "/var/lib/dockpanel/bin";
+const NIXPACKS_BIN: &str = "/var/lib/dockpanel/bin/nixpacks";
+const NIXPACKS_CACHE_ROOT: &str = "/var/lib/dockpanel/nixpacks-cache";
+
 /// Ensure nixpacks binary is available. Downloads on first use if not found.
 pub async fn ensure_nixpacks() -> Option<String> {
     // Check cache
@@ -1055,7 +1065,14 @@ pub async fn ensure_nixpacks() -> Option<String> {
         return cached.clone();
     }
 
-    // Check if already installed
+    // Our own copy first: NIXPACKS_BIN is outside the agent's SAFE_PATH, so
+    // `which` cannot see it and every restart would re-download otherwise.
+    if std::path::Path::new(NIXPACKS_BIN).is_file() {
+        let _ = NIXPACKS_PATH.set(Some(NIXPACKS_BIN.into()));
+        return Some(NIXPACKS_BIN.into());
+    }
+
+    // Check if already installed system-wide (operator-provided)
     let check = safe_command("which")
         .arg("nixpacks")
         .output()
@@ -1099,16 +1116,16 @@ pub async fn ensure_nixpacks() -> Option<String> {
     let download = safe_command("sh")
         .arg("-c")
         .arg(format!(
-            "curl -fsSL '{url}' | tar xz -C /tmp && mv /tmp/nixpacks /usr/local/bin/nixpacks && chmod +x /usr/local/bin/nixpacks"
+            "mkdir -p {NIXPACKS_DIR} && curl -fsSL '{url}' | tar xz -C {NIXPACKS_DIR} && chmod +x {NIXPACKS_BIN}"
         ))
         .output()
         .await;
 
     match download {
         Ok(out) if out.status.success() => {
-            tracing::info!("Nixpacks installed to /usr/local/bin/nixpacks");
-            let _ = NIXPACKS_PATH.set(Some("/usr/local/bin/nixpacks".into()));
-            Some("/usr/local/bin/nixpacks".into())
+            tracing::info!("Nixpacks installed to {NIXPACKS_BIN}");
+            let _ = NIXPACKS_PATH.set(Some(NIXPACKS_BIN.into()));
+            Some(NIXPACKS_BIN.into())
         }
         Ok(out) => {
             tracing::warn!("Failed to download nixpacks: {}", String::from_utf8_lossy(&out.stderr));
@@ -1142,7 +1159,7 @@ pub async fn nixpacks_build(
     let context_dir = format!("/var/lib/dockpanel/git/{name}/{build_context}");
 
     // Set up persistent cache directory for faster rebuilds
-    let cache_dir = format!("/var/cache/dockpanel/nixpacks/{name}");
+    let cache_dir = format!("{NIXPACKS_CACHE_ROOT}/{name}");
     std::fs::create_dir_all(&cache_dir).ok();
 
     // Build nixpacks command
