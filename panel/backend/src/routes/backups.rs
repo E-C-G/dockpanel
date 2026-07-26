@@ -67,12 +67,27 @@ impl SiteDatabases {
 /// The agent has no access to the `databases` table, so this is the only place
 /// that can answer "what does backing up this site actually involve?".
 async fn site_databases(state: &AppState, site_id: Uuid) -> SiteDatabases {
+    site_database_specs(&state.db, &state.config.jwt_secret, site_id).await
+}
+
+/// The same resolution, reachable from the schedulers — which hold a pool and a
+/// secret rather than an `AppState`.
+///
+/// EVERY path that creates a site backup must go through this. A manual backup
+/// that includes the database while the SCHEDULED one silently does not would
+/// be the same defect this exists to close, hiding in the automated path that
+/// people rely on most.
+pub async fn site_database_specs(
+    db: &sqlx::PgPool,
+    jwt_secret: &str,
+    site_id: Uuid,
+) -> SiteDatabases {
     let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT name, engine, db_user, db_password_enc, container_id \
          FROM databases WHERE site_id = $1 ORDER BY name",
     )
     .bind(site_id)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .unwrap_or_else(|e| {
         tracing::warn!("Could not resolve databases for site {site_id}: {e}");
@@ -98,7 +113,7 @@ async fn site_databases(state: &AppState, site_id: Uuid) -> SiteDatabases {
 
         let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(
             &password_enc,
-            &state.config.jwt_secret,
+            jwt_secret,
         );
 
         specs.push(serde_json::json!({

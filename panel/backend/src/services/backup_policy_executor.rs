@@ -281,11 +281,18 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
         .fetch_all(db).await.unwrap_or_default();
 
         for (site_id, domain) in &sites {
-            let mut result = agent.post(&format!("/backups/{domain}/create"), None).await;
+            // WITH the site's databases — a policy-driven backup that omitted
+            // them would reintroduce, on the automated path, exactly the gap
+            // v2.34.0 closed on the manual one.
+            let site_dbs = crate::routes::backups::site_database_specs(db, jwt_secret, *site_id).await;
+            let db_expected = site_dbs.expected() as i32;
+            let agent_body = serde_json::json!({ "databases": site_dbs.specs });
+
+            let mut result = agent.post(&format!("/backups/{domain}/create"), Some(agent_body.clone())).await;
             // Retry once on failure
             if result.is_err() {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                result = agent.post(&format!("/backups/{domain}/create"), None).await;
+                result = agent.post(&format!("/backups/{domain}/create"), Some(agent_body)).await;
             }
             match result {
                 Ok(resp) => {
@@ -314,11 +321,13 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
                     }
 
                     let _ = sqlx::query(
-                        "INSERT INTO backups (site_id, filename, size_bytes, destination_id, uploaded) \
-                         VALUES ($1, $2, $3, $4, $5)"
+                        "INSERT INTO backups (site_id, filename, size_bytes, destination_id, uploaded, databases_included, databases_expected) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)"
                     )
                     .bind(site_id).bind(filename).bind(size_bytes)
                     .bind(destination.as_ref().map(|d| d.id)).bind(uploaded)
+                    .bind(resp.get("databases_included").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) as i32)
+                    .bind(db_expected)
                     .execute(db).await;
 
                     successes += 1;

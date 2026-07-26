@@ -376,7 +376,10 @@ async fn main() {
 
     // Spawn supervised background tasks
     let (s_db, s_agent) = (state.db.clone(), state.agent.clone());
-    spawn_supervised("backup_scheduler", &shutdown_tx, move |rx| services::backup_scheduler::run(s_db.clone(), s_agent.clone(), rx));
+    // The scheduler decrypts database credentials to include them in site
+    // backups, so it needs the same secret the restore path uses.
+    let s_jwt_bs = state.config.jwt_secret.clone();
+    spawn_supervised("backup_scheduler", &shutdown_tx, move |rx| services::backup_scheduler::run(s_db.clone(), s_agent.clone(), s_jwt_bs.clone(), rx));
 
     let s_db = state.db.clone();
     spawn_supervised("server_monitor", &shutdown_tx, move |rx| services::server_monitor::run(s_db.clone(), rx));

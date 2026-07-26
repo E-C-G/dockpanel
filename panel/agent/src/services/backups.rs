@@ -9,6 +9,26 @@ const WEBROOT: &str = "/var/www";
 /// Must live under a path the agent unit lists in `ReadWritePaths`.
 const STAGING_ROOT: &str = "/var/backups/dockpanel/.staging";
 
+// The three roots below are indirected through functions ONLY so the unit tests
+// can run hermetically under a temp directory: the real paths need root and a
+// provisioned box, which CI is neither. The override exists exclusively in
+// `cfg(test)` builds — a release binary has no way to relocate these.
+#[cfg(not(test))]
+fn webroot_root() -> PathBuf { PathBuf::from(WEBROOT) }
+#[cfg(not(test))]
+fn backups_root() -> PathBuf { PathBuf::from(BACKUP_DIR) }
+#[cfg(not(test))]
+fn staging_root() -> PathBuf { PathBuf::from(STAGING_ROOT) }
+
+#[cfg(test)]
+fn test_root() -> PathBuf { std::env::temp_dir().join("dockpanel-agent-tests") }
+#[cfg(test)]
+fn webroot_root() -> PathBuf { test_root().join("www") }
+#[cfg(test)]
+fn backups_root() -> PathBuf { test_root().join("backups") }
+#[cfg(test)]
+fn staging_root() -> PathBuf { test_root().join("backups/.staging") }
+
 /// Directory inside the archive that holds everything DockPanel adds to a site
 /// backup beyond the webroot itself. Deliberately NOT under `./` so it is a
 /// distinct top-level member and can be extracted (and excluded) on its own.
@@ -96,7 +116,7 @@ impl RestoreReport {
 /// Create a staging directory that only root can read. The dumps inside are the
 /// site's entire content in plaintext.
 fn make_staging(tag: &str) -> Result<PathBuf, String> {
-    let dir = PathBuf::from(format!("{STAGING_ROOT}/{tag}"));
+    let dir = staging_root().join(tag);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create staging dir: {e}"))?;
     #[cfg(unix)]
@@ -104,10 +124,7 @@ fn make_staging(tag: &str) -> Result<PathBuf, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         // The parent is shared by every staged backup; keep it closed too.
-        let _ = std::fs::set_permissions(
-            PathBuf::from(STAGING_ROOT),
-            std::fs::Permissions::from_mode(0o700),
-        );
+        let _ = std::fs::set_permissions(staging_root(), std::fs::Permissions::from_mode(0o700));
     }
     Ok(dir)
 }
@@ -154,7 +171,7 @@ fn is_safe_filename(name: &str) -> bool {
 }
 
 fn backup_dir(domain: &str) -> PathBuf {
-    PathBuf::from(format!("{BACKUP_DIR}/{domain}"))
+    backups_root().join(domain)
 }
 
 /// Create a backup of the site's webroot, plus a dump of each database the panel
@@ -163,7 +180,7 @@ fn backup_dir(domain: &str) -> PathBuf {
 /// With an empty `databases` slice this produces byte-for-byte the archive it
 /// always did, so nothing about existing backups or callers changes.
 pub async fn create_backup(domain: &str, databases: &[DbSpec]) -> Result<BackupInfo, String> {
-    let site_root = PathBuf::from(format!("{WEBROOT}/{domain}"));
+    let site_root = webroot_root().join(domain);
     if !site_root.exists() {
         return Err(format!("Site root does not exist: {}", site_root.display()));
     }
@@ -438,7 +455,7 @@ pub async fn restore_backup(
         return Err("Backup file not found".into());
     }
 
-    let site_root = PathBuf::from(format!("{WEBROOT}/{domain}"));
+    let site_root = webroot_root().join(domain);
     std::fs::create_dir_all(&site_root)
         .map_err(|e| format!("Failed to create site root: {e}"))?;
 
@@ -651,7 +668,7 @@ pub async fn restore_single_file(domain: &str, filename: &str, file_path: &str) 
         return Err("Backup file not found".into());
     }
 
-    let target = format!("{WEBROOT}/{domain}");
+    let target = webroot_root().join(domain).to_string_lossy().to_string();
     let backup_str = backup_filepath
         .to_str()
         .ok_or_else(|| "Invalid backup path encoding".to_string())?;
@@ -693,14 +710,14 @@ mod db_payload_tests {
     impl TestSite {
         fn new(tag: &str) -> Self {
             let domain = format!("dp-pin-{tag}.invalid");
-            let root = PathBuf::from(format!("{WEBROOT}/{domain}"));
+            let root = webroot_root().join(&domain);
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("create test site root");
             std::fs::write(root.join("index.html"), b"<h1>marker</h1>").expect("write marker");
             TestSite(domain)
         }
         fn domain(&self) -> &str { &self.0 }
-        fn root(&self) -> PathBuf { PathBuf::from(format!("{WEBROOT}/{}", self.0)) }
+        fn root(&self) -> PathBuf { webroot_root().join(&self.0) }
     }
 
     impl Drop for TestSite {

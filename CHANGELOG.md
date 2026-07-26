@@ -4,6 +4,20 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.34.1] - 2026-07-26
+
+### Fixed
+
+- **Scheduled and policy-driven site backups still contained no database.** v2.34.0 added
+  databases to the backup the panel button creates, but both automated paths still asked the
+  agent for a files-only archive — so the people most reliant on backups, the ones who set a
+  schedule and stopped thinking about it, kept getting archives that could not restore their
+  content. All three paths now share one resolver, an incomplete scheduled run is logged
+  loudly because nobody is watching it, and the backup row records what the archive holds.
+- The agent's backup unit tests wrote to `/var/www` and `/var/backups`, so they passed on a
+  provisioned server and failed in CI. They now run entirely under a temp directory; the
+  indirection exists only in test builds.
+
 ## [2.34.0] - 2026-07-26
 
 ### Added

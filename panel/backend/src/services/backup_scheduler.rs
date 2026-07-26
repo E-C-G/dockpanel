@@ -20,7 +20,7 @@ struct ScheduleRow {
 }
 
 /// Run the backup scheduler loop — checks every 60 seconds for due schedules.
-pub async fn run(db: PgPool, agent: AgentClient, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+pub async fn run(db: PgPool, agent: AgentClient, jwt_secret: String, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
     tracing::info!("Backup scheduler started");
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -28,7 +28,7 @@ pub async fn run(db: PgPool, agent: AgentClient, mut shutdown_rx: tokio::sync::b
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = tick(&db, &agent).await {
+                if let Err(e) = tick(&db, &agent, &jwt_secret).await {
                     tracing::error!("Backup scheduler error: {e}");
                 }
             }
@@ -40,7 +40,7 @@ pub async fn run(db: PgPool, agent: AgentClient, mut shutdown_rx: tokio::sync::b
     }
 }
 
-async fn tick(db: &PgPool, agent: &AgentClient) -> Result<(), String> {
+async fn tick(db: &PgPool, agent: &AgentClient, jwt_secret: &str) -> Result<(), String> {
     let now = chrono::Utc::now();
 
     // Fetch all enabled schedules with their destination and site info
@@ -71,7 +71,7 @@ async fn tick(db: &PgPool, agent: &AgentClient) -> Result<(), String> {
         }
 
         tracing::info!("Running scheduled backup for {}", row.domain);
-        let result = run_scheduled_backup(db, agent, row).await;
+        let result = run_scheduled_backup(db, agent, jwt_secret, row).await;
 
         let status = if result.is_ok() { "success" } else { "failed" };
         if let Err(ref e) = result {
@@ -136,6 +136,7 @@ async fn get_last_run(db: &PgPool, schedule_id: Uuid) -> Option<chrono::DateTime
 async fn run_scheduled_backup(
     db: &PgPool,
     agent: &AgentClient,
+    jwt_secret: &str,
     row: &ScheduleRow,
 ) -> Result<(), String> {
     // 0. Pre-flight: check disk space via agent before creating backup
@@ -184,12 +185,50 @@ async fn run_scheduled_backup(
         }
     }
 
-    // 1. Create backup via agent
+    // 1. Create backup via agent — WITH the site's databases. A scheduled
+    // backup that quietly omitted them would be the exact defect v2.34.0
+    // closed, surviving in the path people rely on most.
+    let site_dbs = crate::routes::backups::site_database_specs(db, jwt_secret, row.site_id).await;
+    let db_expected = site_dbs.expected() as i32;
+    let agent_body = serde_json::json!({ "databases": site_dbs.specs });
+
     let agent_path = format!("/backups/{}/create", row.domain);
     let backup_result = agent
-        .post(&agent_path, None)
+        .post(&agent_path, Some(agent_body))
         .await
         .map_err(|e| format!("Backup creation failed: {e}"))?;
+
+    let db_included = backup_result
+        .get("databases_included")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0) as i32;
+    if db_included < db_expected {
+        // Loud, because nobody is watching a scheduled run.
+        let missing: Vec<String> = backup_result
+            .get("databases_failed")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|f| {
+                let n = f.get("db_name")?.as_str()?;
+                let w = f.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                Some(format!("{n}: {w}"))
+            }).collect())
+            .unwrap_or_default();
+        tracing::error!(
+            "Scheduled backup for {} is INCOMPLETE — {db_included} of {db_expected} databases included: {}",
+            row.domain, missing.join("; ")
+        );
+        crate::services::system_log::log_event(
+            db,
+            "warning",
+            "backup_scheduler",
+            &format!(
+                "Scheduled backup for {} does not contain {} of its {} database(s) — restoring it will not bring that content back",
+                row.domain, db_expected - db_included, db_expected
+            ),
+            None,
+        ).await;
+    }
 
     let filename = backup_result
         .get("filename")
@@ -270,11 +309,14 @@ async fn run_scheduled_backup(
     // 3. Record in DB only after successful creation and upload (if configured).
     // This ensures the DB only contains backups that are fully complete.
     let _ = sqlx::query(
-        "INSERT INTO backups (site_id, filename, size_bytes) VALUES ($1, $2, $3)",
+        "INSERT INTO backups (site_id, filename, size_bytes, databases_included, databases_expected) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(row.site_id)
     .bind(filename)
     .bind(size_bytes)
+    .bind(db_included)
+    .bind(db_expected)
     .execute(db)
     .await;
 

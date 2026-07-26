@@ -38,6 +38,8 @@ DOC="$REPO/docs/guides/backups.md"
 CLIDOC="$REPO/docs/cli-reference.md"
 MIGRATION="$REPO/panel/backend/migrations/20260726100000_site_backup_databases.sql"
 DBBACKUP="$REPO/panel/agent/src/services/database_backup.rs"
+SCHED="$REPO/panel/backend/src/services/backup_scheduler.rs"
+POLICY="$REPO/panel/backend/src/services/backup_policy_executor.rs"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
@@ -111,6 +113,26 @@ has  "$API" 'backup.restore_partial' \
      "a partial restore is a distinct activity-log event"
 has  "$API" 'This backup contains files only' \
      "restoring a files-only archive onto a site with databases warns BEFORE it starts"
+
+echo
+echo "G. EVERY path that creates a site backup includes the databases"
+# The manual button and the scheduled job must not disagree. A scheduled backup
+# that quietly omitted the database would be this exact defect surviving in the
+# path people rely on most — and nobody is watching when it runs.
+has  "$API" 'pub async fn site_database_specs' \
+     "one shared resolver, reachable from the schedulers as well as the route"
+hasnt "$SCHED" 'agent_path, None' \
+     "the schedule path no longer creates a backup with no databases"
+has  "$SCHED" 'site_database_specs' \
+     "the schedule path resolves the site's databases"
+has  "$SCHED" 'is INCOMPLETE' \
+     "an incomplete scheduled backup is logged loudly, since nobody is watching"
+has  "$SCHED" 'databases_included, databases_expected' \
+     "…and its backup row records what the archive really holds"
+hasnt "$POLICY" 'create"), None' \
+     "the backup-policy path no longer creates a backup with no databases"
+has  "$POLICY" 'site_database_specs' \
+     "the backup-policy path resolves the site's databases too"
 
 echo
 echo "F. The restore actually reaches a client binary that exists"
