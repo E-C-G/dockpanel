@@ -82,6 +82,19 @@ const POSTFIX_VIRTUAL_MAILBOX: &str = "/etc/postfix/virtual_mailbox_maps";
 const POSTFIX_VIRTUAL_ALIAS: &str = "/etc/postfix/virtual_alias_maps";
 const DOVECOT_USERS: &str = "/etc/dovecot/users";
 const DKIM_KEYS_DIR: &str = "/etc/dockpanel/dkim";
+/// OpenDKIM's own config lives under the DockPanel data dir, not at the
+/// distro's `/etc/opendkim.conf`, so it can be written under the hardened
+/// agent sandbox (ProtectSystem=strict) — the unit's ReadWritePaths covers
+/// /etc/dockpanel but not bare files in /etc. Same reasoning as the scanner
+/// dir in services/image_scanner.rs. A systemd drop-in points the daemon here.
+const OPENDKIM_CONF: &str = "/etc/dockpanel/opendkim.conf";
+const OPENDKIM_DROPIN_DIR: &str = "/etc/systemd/system/opendkim.service.d";
+const OPENDKIM_SOCKET_DIR: &str = "/var/spool/postfix/opendkim";
+const KEY_TABLE: &str = "/etc/dockpanel/dkim/key.table";
+const SIGNING_TABLE: &str = "/etc/dockpanel/dkim/signing.table";
+/// Ports the mail stack listens on once installed. Opened in the firewall by
+/// the installer — starting a listener the firewall drops is not an install.
+const MAIL_PORTS: &[&str] = &["25", "587", "465", "143", "993", "110", "995"];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -136,12 +149,25 @@ async fn mail_status() -> Result<Json<serde_json::Value>, ApiErr> {
     let opendkim_installed = is_installed("opendkim").await;
     let vmail_exists = Path::new(VMAIL_DIR).exists();
 
-    let installed = postfix_installed && dovecot_installed;
-    let running = postfix && dovecot;
+    // Packages present and services up is what apt gives you for free — its
+    // postinst starts all three. It is NOT evidence that this installer ran:
+    // for the whole life of the product `mail_install` aborted partway and
+    // this endpoint still answered installed+running, so a failed install was
+    // indistinguishable from a working one. Ask instead whether the
+    // configuration the mail stack actually depends on is on disk.
+    let configured = Path::new(OPENDKIM_CONF).exists()
+        && Path::new(&format!("{DKIM_KEYS_DIR}/trusted.hosts")).exists()
+        && tokio::fs::read_to_string("/etc/postfix/main.cf").await
+            .map(|c| c.contains("DockPanel mail configuration"))
+            .unwrap_or(false);
+
+    let installed = postfix_installed && dovecot_installed && configured;
+    let running = postfix && dovecot && configured;
 
     Ok(Json(serde_json::json!({
         "installed": installed,
         "running": running,
+        "configured": configured,
         "postfix": { "installed": postfix_installed, "running": postfix },
         "dovecot": { "installed": dovecot_installed, "running": dovecot },
         "opendkim": { "installed": opendkim_installed, "running": opendkim },
@@ -195,6 +221,12 @@ async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
 # DockPanel mail configuration
 virtual_mailbox_domains = /etc/postfix/virtual_domains
 virtual_mailbox_maps = hash:/etc/postfix/virtual_mailbox_maps
+# Nothing is delivered by the local transport. mydestination defaults to
+# include $myhostname, and when the panel host is also a hosted mail domain
+# that default silently outranks virtual_mailbox_domains: mail for a real
+# mailbox is handed to `local`, which has no such Unix user, and bounces
+# "unknown user". A virtual-mailbox host must claim nothing but localhost.
+mydestination = localhost
 virtual_alias_maps = hash:/etc/postfix/virtual_alias_maps
 virtual_mailbox_base = /var/vmail
 virtual_uid_maps = static:5000
@@ -232,17 +264,60 @@ non_smtpd_milters = unix:opendkim/opendkim.sock
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write main.cf: {e}")))?;
     }
 
-    // 5. Enable submission port (587) in master.cf
+    // 4b. HELO name. Left unset, Postfix uses the short OS hostname, which
+    // receivers score heavily against: on a stock cloud image the delivered
+    // mail earned HFILTER_HELO_5 + HFILTER_HOSTNAME_UNKNOWN + MID_RHS_NOT_FQDN
+    // — six spam points before any content was examined.
+    if let Some(host) = panel_server_name() {
+        let _ = safe_command("postconf").arg(format!("myhostname={host}")).output().await;
+        // Applied here too, not only in the block above: that block is appended
+        // once and skipped forever after, so an install that already has it
+        // would take the new myhostname and keep the dangerous default
+        // mydestination — the combination that bounces real mailboxes.
+        let _ = safe_command("postconf").arg("mydestination=localhost").output().await;
+        tracing::info!("Postfix myhostname set to {host}, mydestination narrowed to localhost");
+    }
+
+    // 4c. Serve the box's real certificate where it has one, so that clients
+    // which verify their peer can connect at all.
+    if let Some((cert, key)) = panel_tls_paths() {
+        let _ = safe_command("postconf").arg(format!("smtpd_tls_cert_file={cert}")).output().await;
+        let _ = safe_command("postconf").arg(format!("smtpd_tls_key_file={key}")).output().await;
+    }
+
+    // 5. Enable submission port (587) in master.cf.
+    // Test for an ACTIVE entry, not merely the string: the stock Ubuntu file
+    // ships the service commented out, and the old test matched that comment
+    // forever — so every re-run appended another live block and Postfix warned
+    // "duplicate master.cf entry for service submission". Since a failed
+    // install is retried by hand, re-running was the normal case.
     let master_cf = tokio::fs::read_to_string("/etc/postfix/master.cf").await.unwrap_or_default();
-    if !master_cf.contains("submission inet") || master_cf.contains("#submission inet") {
+    let has_active_submission = master_cf.lines().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.starts_with("submission") && t.contains("inet")
+    });
+    if !has_active_submission {
         let submission_config = "\nsubmission inet n - y - - smtpd\n  -o syslog_name=postfix/submission\n  -o smtpd_tls_security_level=encrypt\n  -o smtpd_sasl_auth_enable=yes\n  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject\n";
         let new_master = format!("{master_cf}\n{submission_config}");
         write_file_atomic("/etc/postfix/master.cf", &new_master).await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write master.cf: {e}")))?;
     }
 
-    // 6. Write Dovecot configuration for virtual users
-    let dovecot_config = r#"# DockPanel Dovecot configuration
+    // 6. Write Dovecot configuration for virtual users.
+    // `ssl = required` without a trusted certificate is not a working IMAPS
+    // service: Dovecot falls back to the distro snakeoil and every client that
+    // verifies its peer is turned away with "unknown ca" — including the
+    // Roundcube this product installs and points at ssl://<domain>:993. Where
+    // the box already holds a Let's Encrypt certificate for the panel host,
+    // serve that.
+    let dovecot_tls = match panel_tls_paths() {
+        Some((cert, key)) => {
+            tracing::info!("Dovecot will serve the panel's Let's Encrypt certificate");
+            format!("ssl = required\nssl_cert = <{cert}\nssl_key = <{key}\n")
+        }
+        None => "ssl = required\n".to_string(),
+    };
+    let dovecot_base = r#"# DockPanel Dovecot configuration
 protocols = imap pop3 lmtp
 
 mail_location = maildir:/var/vmail/%d/%n
@@ -281,41 +356,55 @@ service auth {
 }
 
 # SSL
-ssl = required
 "#;
+    let dovecot_config = format!("{dovecot_base}{dovecot_tls}");
 
-    write_file_atomic("/etc/dovecot/conf.d/99-dockpanel.conf", dovecot_config).await
+    write_file_atomic("/etc/dovecot/conf.d/99-dockpanel.conf", &dovecot_config).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot config: {e}")))?;
 
-    // 7. Create empty map files
-    write_file_atomic(POSTFIX_VIRTUAL_DOMAINS, "").await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_domains: {e}")))?;
-    write_file_atomic(POSTFIX_VIRTUAL_MAILBOX, "").await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_mailbox_maps: {e}")))?;
-    write_file_atomic(POSTFIX_VIRTUAL_ALIAS, "").await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_alias_maps: {e}")))?;
-    write_dovecot_users("").await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot users: {e}")))?;
+    // 7. Create the map files if they do not exist yet.
+    // Never truncate: these hold every hosted domain, every mailbox path and
+    // every password hash. Writing them unconditionally meant re-running the
+    // installer erased all mail routing on the box, and since the installer
+    // used to fail with a 500, re-running it was the ordinary thing to do.
+    for path in [POSTFIX_VIRTUAL_DOMAINS, POSTFIX_VIRTUAL_MAILBOX, POSTFIX_VIRTUAL_ALIAS] {
+        if !Path::new(path).exists() {
+            write_file_atomic(path, "").await
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write {path}: {e}")))?;
+        }
+    }
+    if !Path::new(DOVECOT_USERS).exists() {
+        write_dovecot_users("").await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot users: {e}")))?;
+    }
     let _ = safe_command("postmap").arg(POSTFIX_VIRTUAL_MAILBOX).output().await;
     let _ = safe_command("postmap").arg(POSTFIX_VIRTUAL_ALIAS).output().await;
 
-    // 8. Configure OpenDKIM
-    let opendkim_conf = "Syslog yes\nUMask 007\nSocket local:/var/spool/postfix/opendkim/opendkim.sock\nPidFile /run/opendkim/opendkim.pid\nOversignHeaders From\nTrustAnchorFile /usr/share/dns/root.key\nKeyTable /etc/dockpanel/dkim/key.table\nSigningTable refile:/etc/dockpanel/dkim/signing.table\nExternalIgnoreList /etc/dockpanel/dkim/trusted.hosts\nInternalHosts /etc/dockpanel/dkim/trusted.hosts\n";
-    write_file_atomic("/etc/opendkim.conf", opendkim_conf).await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write opendkim.conf: {e}")))?;
+    // 8. Configure OpenDKIM. Its config and the drop-in that points the daemon
+    // at it both live inside ReadWritePaths — writing the distro's
+    // /etc/opendkim.conf is refused under ProtectSystem=strict, and that single
+    // EROFS is what aborted this installer on every install ever made, taking
+    // the DKIM tables, the socket directory and step 9 down with it.
+    write_opendkim_config().await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to configure OpenDKIM: {e}")))?;
 
     let trusted_hosts = "127.0.0.1\nlocalhost\n";
-    write_file_atomic("/etc/dockpanel/dkim/trusted.hosts", trusted_hosts).await
+    write_file_atomic(&format!("{DKIM_KEYS_DIR}/trusted.hosts"), trusted_hosts).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write trusted.hosts: {e}")))?;
-    write_file_atomic("/etc/dockpanel/dkim/key.table", "").await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write key.table: {e}")))?;
-    write_file_atomic("/etc/dockpanel/dkim/signing.table", "").await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write signing.table: {e}")))?;
+
+    // Let Postfix open the 0770 milter socket. /etc/group is outside
+    // ReadWritePaths, so this takes the same systemd-run escape as the
+    // groupadd/useradd above (#54-A pattern).
+    let _ = safe_command_unsandboxed("gpasswd", &[]).args(["-a", "postfix", "opendkim"]).output().await;
 
     // Create opendkim socket directory in Postfix chroot
-    tokio::fs::create_dir_all("/var/spool/postfix/opendkim").await
+    tokio::fs::create_dir_all(OPENDKIM_SOCKET_DIR).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create opendkim socket dir: {e}")))?;
-    let _ = safe_command("chown").args(["opendkim:postfix", "/var/spool/postfix/opendkim"]).output().await;
+    let _ = safe_command("chown").args(["opendkim:postfix", OPENDKIM_SOCKET_DIR]).output().await;
+    // Drop any socket left by an earlier run. Once the daemon drops privileges
+    // it cannot remove a socket a differently-owned run left behind, and it
+    // refuses to start rather than reuse it ("socket cleanup failed").
+    let _ = tokio::fs::remove_file(format!("{OPENDKIM_SOCKET_DIR}/opendkim.sock")).await;
 
     // 9. Enable and start services
     if let Ok(out) = safe_command("systemctl").args(["enable", "postfix", "dovecot", "opendkim"]).output().await {
@@ -332,6 +421,17 @@ ssl = required
             tracing::warn!("Failed to execute systemctl restart {service}");
         }
     }
+
+    // 10. Bind whatever keys already exist to their domains. On a first install
+    // there are none and both tables are written empty; when mail is
+    // reinstalled on a box that already has domains, this restores signing
+    // without making the operator re-add each one.
+    if let Err(e) = rebuild_dkim_tables().await {
+        tracing::warn!("Failed to build DKIM tables: {e}");
+    }
+
+    // 11. A listener the firewall drops is not an installed service.
+    open_mail_ports().await;
 
     tracing::info!("Mail server installation complete");
 
@@ -411,6 +511,137 @@ async fn is_installed(package: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── OpenDKIM wiring ─────────────────────────────────────────────────────
+
+/// Render OpenDKIM's config and the systemd drop-in that makes the daemon read
+/// it from the DockPanel data dir instead of the distro path.
+///
+/// Both targets are inside the agent's ReadWritePaths; the distro path is not,
+/// which is why writing it aborted the whole installer before anything below
+/// step 8 could run.
+async fn write_opendkim_config() -> Result<(), String> {
+    // Run as the packaged `opendkim` user, which owns the keys. With UMask 007
+    // the milter socket is 0770 opendkim:opendkim, so Postfix reaches it by
+    // being a member of that group — the remedy Debian's own shipped config
+    // names in its comments. Adding postfix to the group is done by the caller.
+    let conf = format!(
+        "Syslog yes\nUserID opendkim\nUMask 007\n\
+         Socket local:{OPENDKIM_SOCKET_DIR}/opendkim.sock\n\
+         PidFile /run/opendkim/opendkim.pid\nOversignHeaders From\n\
+         TrustAnchorFile /usr/share/dns/root.key\n\
+         KeyTable {KEY_TABLE}\nSigningTable refile:{SIGNING_TABLE}\n\
+         ExternalIgnoreList {DKIM_KEYS_DIR}/trusted.hosts\n\
+         InternalHosts {DKIM_KEYS_DIR}/trusted.hosts\n"
+    );
+    write_file_atomic(OPENDKIM_CONF, &conf).await?;
+
+    tokio::fs::create_dir_all(OPENDKIM_DROPIN_DIR).await
+        .map_err(|e| format!("Failed to create {OPENDKIM_DROPIN_DIR}: {e}"))?;
+    // ExecStart must be cleared before being redefined, or systemd appends.
+    // No `-f`: the packaged unit is Type=forking, so a foreground daemon never
+    // returns and systemd fails the start on timeout.
+    let dropin = format!(
+        "[Service]\nExecStart=\nExecStart=/usr/sbin/opendkim -x {OPENDKIM_CONF}\n"
+    );
+    write_file_atomic(&format!("{OPENDKIM_DROPIN_DIR}/dockpanel.conf"), &dropin).await?;
+    let _ = safe_command("systemctl").arg("daemon-reload").output().await;
+    Ok(())
+}
+
+/// Rebuild `key.table` and `signing.table` from the keys actually present on
+/// disk, then restart OpenDKIM so it loads them.
+///
+/// Derived from the filesystem rather than accumulated incrementally, so it is
+/// idempotent and cannot drift from reality no matter which caller runs it —
+/// domain added, domain removed, or a re-run of the installer. Without these
+/// two tables OpenDKIM holds no keys and signs nothing, which is the state
+/// every install shipped in.
+async fn rebuild_dkim_tables() -> Result<(), String> {
+    let mut key_lines = Vec::new();
+    let mut signing_lines = Vec::new();
+
+    // Make the key tree reachable and owned by the daemon before listing it.
+    // Two things bite here and both are silent:
+    //   * /etc/dockpanel is 0700 root:root, so opendkim cannot even traverse to
+    //     a key whose own mode is perfect. 0710 with the group grants traverse
+    //     without making the directory listable or exposing api.env.
+    //   * dkim_generate's chown is best-effort and runs while `apt` may still
+    //     be creating the opendkim user, so keys can be left root-owned.
+    // Re-applying both here means every caller of this helper converges on a
+    // readable tree, instead of each one having to remember.
+    let _ = safe_command("chgrp").args(["opendkim", "/etc/dockpanel"]).output().await;
+    let _ = safe_command("chmod").args(["0710", "/etc/dockpanel"]).output().await;
+    let _ = safe_command("chown").args(["-R", "opendkim:opendkim", DKIM_KEYS_DIR]).output().await;
+    let _ = safe_command("chmod").args(["0750", DKIM_KEYS_DIR]).output().await;
+
+    let mut entries = match tokio::fs::read_dir(DKIM_KEYS_DIR).await {
+        Ok(e) => e,
+        Err(e) => return Err(format!("Failed to read {DKIM_KEYS_DIR}: {e}")),
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.path().is_dir() { continue; }
+        let domain = entry.file_name().to_string_lossy().to_string();
+        // Defence in depth: the domain came from a validated request, but this
+        // string is about to become a line in a config file.
+        if domain.is_empty()
+            || !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            continue;
+        }
+        let mut keys = match tokio::fs::read_dir(entry.path()).await {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        while let Ok(Some(kf)) = keys.next_entry().await {
+            let name = kf.file_name().to_string_lossy().to_string();
+            let Some(selector) = name.strip_suffix(".private") else { continue };
+            if selector.is_empty()
+                || !selector.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                continue;
+            }
+            let path = kf.path();
+            let path = path.to_string_lossy();
+            key_lines.push(format!("{selector}._domainkey.{domain} {domain}:{selector}:{path}"));
+            signing_lines.push(format!("*@{domain} {selector}._domainkey.{domain}"));
+        }
+    }
+
+    write_file_atomic(KEY_TABLE, &key_lines.join("\n")).await?;
+    write_file_atomic(SIGNING_TABLE, &signing_lines.join("\n")).await?;
+
+    // OpenDKIM reads both tables at startup only.
+    if let Ok(out) = safe_command("systemctl").args(["restart", "opendkim"]).output().await {
+        if !out.status.success() {
+            tracing::warn!("Failed to restart opendkim after table rebuild: {}",
+                String::from_utf8_lossy(&out.stderr));
+        }
+    }
+    tracing::info!("DKIM tables rebuilt: {} key(s) across {} entr(ies)",
+        key_lines.len(), signing_lines.len());
+    Ok(())
+}
+
+/// Allow the ports the mail stack listens on. `setup.sh` opens 80/443 and the
+/// panel port and nothing else, so without this the installer finishes with
+/// Postfix and Dovecot listening behind a firewall that drops every packet.
+async fn open_mail_ports() {
+    for port in MAIL_PORTS {
+        let _ = safe_command("ufw").args(["allow", &format!("{port}/tcp")]).output().await;
+    }
+    tracing::info!("Mail ports opened in firewall: {}", MAIL_PORTS.join(", "));
+}
+
+/// The panel's own Let's Encrypt certificate, when this box has one for the
+/// host the panel is served on. Dovecot and Postfix otherwise fall back to the
+/// distro's self-signed snakeoil, which any IMAP client that verifies its peer
+/// refuses — Roundcube among them.
+fn panel_tls_paths() -> Option<(String, String)> {
+    let host = panel_server_name()?;
+    let dir = format!("/etc/letsencrypt/live/{host}");
+    let cert = format!("{dir}/fullchain.pem");
+    let key = format!("{dir}/privkey.pem");
+    (Path::new(&cert).exists() && Path::new(&key).exists()).then_some((cert, key))
+}
+
 // ── DKIM key generation ─────────────────────────────────────────────────
 
 async fn dkim_generate(
@@ -472,6 +703,14 @@ async fn dkim_generate(
     let _ = safe_command("chmod").args(["600", &private_path]).output().await;
     let _ = safe_command("chown").args(["opendkim:opendkim", &private_path]).output().await;
 
+    // Bind the new key to its domain. Generating a keypair and publishing the
+    // public half in DNS is not DKIM: until the domain appears in OpenDKIM's
+    // tables nothing signs with it, and the DNS record verifies green while
+    // every message leaves unsigned.
+    if let Err(e) = rebuild_dkim_tables().await {
+        tracing::warn!("DKIM keys generated for {domain} but tables not rebuilt: {e}");
+    }
+
     tracing::info!("DKIM keys generated for {domain} (selector: {selector})");
 
     Ok(Json(serde_json::json!({
@@ -518,6 +757,11 @@ async fn domain_remove(
     // Remove DKIM keys
     let key_dir = format!("{DKIM_KEYS_DIR}/{domain}");
     let _ = tokio::fs::remove_dir_all(&key_dir).await;
+
+    // Same helper as the add path, so a removed domain stops being signed for.
+    if let Err(e) = rebuild_dkim_tables().await {
+        tracing::warn!("DKIM keys removed for {domain} but tables not rebuilt: {e}");
+    }
 
     // Note: we don't delete the maildir — that's destructive.
     // The sync_config will remove the domain from Postfix/Dovecot maps.
@@ -951,6 +1195,21 @@ async fn write_webmail_nginx(port: u16) -> Result<(), ApiErr> {
          \x20   sub_filter_types text/html application/json application/javascript text/javascript;\n\
          \x20   proxy_read_timeout 300s;\n\
          \x20   client_max_body_size 25M;\n\
+         \x20   # Roundcube's Elastic skin frames itself same-origin. The panel\n\
+         \x20   # vhost sends X-Frame-Options DENY and frame-ancestors 'none',\n\
+         \x20   # which this location inherits — the iframe is refused, the list\n\
+         \x20   # JS throws a SecurityError reaching into it, and the inbox\n\
+         \x20   # renders empty however much mail is really in it. Re-declare the\n\
+         \x20   # whole header set here (nginx add_header in a location replaces\n\
+         \x20   # the inherited set rather than adding to it) with framing\n\
+         \x20   # narrowed to same-origin, not opened up.\n\
+         \x20   add_header X-Content-Type-Options \"nosniff\" always;\n\
+         \x20   add_header X-Frame-Options \"SAMEORIGIN\" always;\n\
+         \x20   add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n\
+         \x20   add_header Permissions-Policy \"camera=(), microphone=(), geolocation=()\" always;\n\
+         \x20   add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;\n\
+         \x20   add_header Content-Security-Policy \"frame-ancestors 'self'\" always;\n\
+         \x20   add_header X-XSS-Protection \"1; mode=block\" always;\n\
          }}\n"
     );
     if let Err(e) = std::fs::write(WEBMAIL_NGINX_CONF, &block) {

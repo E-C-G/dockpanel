@@ -27,7 +27,17 @@ DockPanel installs a complete mail server stack with one click.
    - **Dovecot** -- IMAP/POP3 server for reading email
    - **OpenDKIM** -- DKIM signing for email authentication
 
-The installation takes about 30 seconds.
+The installation takes about 30 seconds. It also opens the mail ports (25, 587, 465, 143, 993,
+110, 995) in the firewall, sets Postfix's HELO name from your panel domain, and hands Dovecot
+your Let's Encrypt certificate if the box has one.
+
+### One thing DockPanel cannot do for you: reverse DNS
+
+Set a **PTR record** for your server's IP, pointing at your mail hostname. Only whoever owns
+the IP can do this -- your hosting provider, usually under "reverse DNS" in their control
+panel. Without it receivers add a spam score for an unknown sending host no matter how good
+your SPF, DKIM and DMARC are: on a freshly-installed test box, the missing PTR was worth 2.5
+points on its own once everything else was correct.
 
 ## Add a Mail Domain
 

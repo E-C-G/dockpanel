@@ -4,6 +4,51 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.36.0] - 2026-07-26
+
+### Fixed
+
+- **The mail server installer had never completed, on any install.** It aborted at
+  `Failed to write opendkim.conf: Read-only file system`: the agent runs
+  `ProtectSystem=strict`, and `/etc/opendkim.conf` is a bare file in `/etc` — the one
+  mail path the unit's `ReadWritePaths` does not cover. Everything after that line
+  never ran. OpenDKIM's config now lives at `/etc/dockpanel/opendkim.conf`, inside the
+  permitted paths, with a systemd drop-in pointing the daemon at it. The sandbox is not
+  widened.
+- **No outgoing message had ever been DKIM-signed.** OpenDKIM's `KeyTable` and
+  `SigningTable` were written empty and nothing ever populated them, so no domain was
+  bound to its key — while the generated key was published in DNS and verified green by
+  the panel's own DNS check. Adding or removing a mail domain now rebuilds both tables
+  from the keys on disk and reloads OpenDKIM. Verified on the wire between two real
+  domains: `dkim=pass`, and the receiving spam filter's score on the same message fell
+  from 9.74/15 to 1.59/15.
+- **The mail ports were never opened in the firewall.** Postfix and Dovecot were started
+  behind a UFW that allowed only 80, 443 and the panel, so no mail could arrive. The
+  installer now opens 25, 587, 465, 143, 993, 110 and 995.
+- **Postfix announced itself with a short hostname**, costing six spam points before any
+  content was examined. `myhostname` is now set from the panel domain, and
+  `mydestination` is narrowed to `localhost` so that a hosted mail domain is never
+  mistaken for a local one and bounced as "unknown user".
+- **Re-running the installer erased every hosted domain, mailbox and password** by
+  truncating the Postfix maps and the Dovecot users file. They are now created only when
+  absent. Re-running also appended a duplicate `submission` service each time, because
+  the guard matched the commented-out stock entry.
+- **Roundcube could not log in at all.** Dovecot required TLS but was never given the
+  Let's Encrypt certificate the box already held, so it served a self-signed one and
+  every IMAP client refused it with "unknown ca". Dovecot and Postfix now use the panel's
+  certificate when there is one.
+- **The panel's own `frame-ancestors 'none'` applied to the webmail it installs.** The
+  `/webmail/` location now allows same-origin framing, which Roundcube's skin requires.
+- **`mail_status` reported a failed installation as healthy**, because it asked only
+  whether the packages were present and the services up — both of which `apt` provides on
+  its own. It now also reports whether the configuration was actually written.
+
+### Known issue
+
+- The Roundcube message list can still render empty even though the mailbox has mail: a
+  frame is navigated to the panel root, whose stricter policy refuses it. Login, delivery
+  and IMAP are unaffected. Serving webmail on its own hostname avoids it.
+
 ## [2.35.0] - 2026-07-26
 
 ### Fixed
