@@ -932,6 +932,32 @@ build_frontend() {
         return
     fi
 
+    local dist_dir="$FRONTEND_DIR/dist"
+    local needs_build=0
+
+    # If dist doesn't exist at all, we must build
+    if [ ! -d "$dist_dir" ]; then
+        needs_build=1
+    else
+        # Compare the newest source file against the oldest file in dist,
+        # or simply check if any source file is newer than the build output.
+        # We look into src/ and package.json / vite.config.ts if they exist.
+        local newest_src
+        newest_src=$(find "$FRONTEND_DIR/src" "$FRONTEND_DIR/package.json" "$FRONTEND_DIR/vite.config.ts" 2>/dev/null -type f -printf '%T@\n' | sort -n | tail -1)
+
+        local oldest_dist
+        oldest_dist=$(find "$dist_dir" 2>/dev/null -type f -printf '%T@\n' | sort -n | head -1)
+
+        if [ -z "$newest_src" ] || [ -z "$oldest_dist" ] || (( $(echo "$newest_src > $oldest_dist" | bc -l 2>/dev/null || echo 1) )); then
+            needs_build=1
+        fi
+    fi
+
+    if [ "$needs_build" = "0" ]; then
+        log "Frontend sources unchanged — skipping build (using cached dist)"
+        return
+    fi
+
     log "Installing npm dependencies..."
     (cd "$FRONTEND_DIR" && npm ci --silent 2>/dev/null || npm install --silent 2>/dev/null)
 
@@ -1596,6 +1622,19 @@ provision_panel_ssl() {
     if ! command -v certbot &> /dev/null; then
         log "Certbot not found — skipping SSL"
         return
+    fi
+
+    # Check if a valid, non-expired certificate already exists for this domain
+    # to prevent redundant requests and hitting Let's Encrypt rate limits on rebuilds.
+    if [ -d "/etc/letsencrypt/live/${PANEL_DOMAIN}" ] && certbot certificates 2>/dev/null | grep -q "Certificate Name: ${PANEL_DOMAIN}"; then
+        if openssl x509 -checkend 2592000 -noout -in "/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem" 2>/dev/null; then
+            log "A valid, unexpired SSL certificate already exists for ${PANEL_DOMAIN}. Skipping provisioning."
+            PANEL_SSL_OK=1
+            normalize_panel_listen
+            return
+        else
+            info "The existing certificate for ${PANEL_DOMAIN} is nearing expiration or invalid. Renewing..."
+        fi
     fi
 
     if run "Provisioning Let's Encrypt certificate for ${PANEL_DOMAIN}" \
