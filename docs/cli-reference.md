@@ -359,8 +359,18 @@ dockpanel backup create example.com
 
 ```
 Creating backup for example.com...
-Backup created: example.com_2026-03-20_143022.tar.gz (45.2 MB)
+✓ Backup created
+  File:    example.com-20260320-143022.tar.gz
+  Size:    45.2 MB
+  Content: files only
+
+! This archive contains the site's files but NOT its databases.
+  The CLI talks to the agent directly and cannot resolve a site's databases.
+  Create the backup from the panel (or the panel API) to include them.
 ```
+
+CLI backups never include databases — the agent has no access to the panel's database records.
+Create the backup from the panel if you need one that holds the site's content.
 
 #### `dockpanel backup list`
 
@@ -376,8 +386,13 @@ dockpanel backup restore example.com example.com_2026-03-20_143022.tar.gz
 
 ```
 Restoring example.com from example.com_2026-03-20_143022.tar.gz...
-Restore complete.
+✓ Backup restored
+  Content: files only (this archive holds no database)
 ```
+
+Restoring an archive that carries database dumps **fails** from the CLI — it cannot supply the
+database credentials the agent needs, and it will not restore the files and call that success.
+Use the panel for those.
 
 #### `dockpanel backup delete`
 

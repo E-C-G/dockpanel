@@ -14,15 +14,28 @@ fn err(status: StatusCode, msg: &str) -> ApiErr {
     (status, Json(serde_json::json!({ "error": msg })))
 }
 
+/// Optional body for the create/restore routes, naming the databases that
+/// belong to the site. The agent cannot resolve these itself — it has no access
+/// to the panel's `databases` table — so the backend passes them down with
+/// decrypted credentials. Absent body ⇒ files only, exactly as before.
+#[derive(serde::Deserialize, Default)]
+struct SiteDbBody {
+    #[serde(default)]
+    databases: Vec<backups::DbSpec>,
+}
+
 /// POST /backups/{domain}/create — Create a backup.
 async fn create(
     Path(domain): Path<String>,
+    body: Option<Json<SiteDbBody>>,
 ) -> Result<Json<backups::BackupInfo>, ApiErr> {
     if !is_valid_domain(&domain) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
 
-    let info = backups::create_backup(&domain)
+    let databases = body.map(|Json(b)| b.databases).unwrap_or_default();
+
+    let info = backups::create_backup(&domain, &databases)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
     Ok(Json(info))
@@ -42,17 +55,53 @@ async fn list(
 }
 
 /// POST /backups/{domain}/restore/{filename} — Restore from backup.
+///
+/// A restore that put the files back but could not load a database is reported
+/// as a FAILURE (500) carrying the full report, not as a success with a
+/// footnote — the site's files have already been replaced and the operator has
+/// to know that.
 async fn restore(
     Path((domain, filename)): Path<(String, String)>,
+    body: Option<Json<SiteDbBody>>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     if !is_valid_domain(&domain) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
 
-    backups::restore_backup(&domain, &filename)
+    let databases = body.map(|Json(b)| b.databases).unwrap_or_default();
+
+    let report = backups::restore_backup(&domain, &filename, &databases)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
-    Ok(Json(serde_json::json!({ "success": true })))
+
+    let mut payload = serde_json::to_value(&report)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("success".into(), serde_json::Value::Bool(report.ok()));
+        if !report.ok() {
+            // Carry a plain-language summary under the key every client already
+            // reads for errors, so a caller that only knows how to print
+            // `error` still gets the reason instead of a bare HTTP 500.
+            let detail = report.databases_failed.iter()
+                .map(|f| format!("{}: {}", f.db_name, f.error))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let summary = if report.files_restored {
+                format!(
+                    "The site's files were restored, but {} database(s) were NOT: {detail}",
+                    report.databases_failed.len()
+                )
+            } else {
+                format!("Restore failed: {detail}")
+            };
+            obj.insert("error".into(), serde_json::Value::String(summary));
+        }
+    }
+
+    if !report.ok() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(payload)));
+    }
+    Ok(Json(payload))
 }
 
 /// GET /backups/{domain}/browse/{filename} — List files in a backup archive.

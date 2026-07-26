@@ -27,6 +27,10 @@ pub struct Backup {
     pub filename: String,
     pub size_bytes: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub databases_included: i32,
+    #[serde(default)]
+    pub databases_expected: i32,
 }
 
 /// Verify site ownership, return domain.
@@ -41,6 +45,72 @@ async fn get_site_domain(state: &AppState, site_id: Uuid, user_id: Uuid) -> Resu
 
     row.map(|(d,)| d)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))
+}
+
+/// The databases attached to a site, ready to hand to the agent.
+pub struct SiteDatabases {
+    /// Specs the agent can act on, with decrypted credentials.
+    pub specs: Vec<serde_json::Value>,
+    /// Databases that exist as rows but cannot safely be touched, and why.
+    /// Counted as expected so a backup missing them never reads as complete.
+    pub unavailable: Vec<(String, String)>,
+}
+
+impl SiteDatabases {
+    pub fn expected(&self) -> usize {
+        self.specs.len() + self.unavailable.len()
+    }
+}
+
+/// Resolve a site's databases and decrypt their credentials for the agent.
+///
+/// The agent has no access to the `databases` table, so this is the only place
+/// that can answer "what does backing up this site actually involve?".
+async fn site_databases(state: &AppState, site_id: Uuid) -> SiteDatabases {
+    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT name, engine, db_user, db_password_enc, container_id \
+         FROM databases WHERE site_id = $1 ORDER BY name",
+    )
+    .bind(site_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("Could not resolve databases for site {site_id}: {e}");
+        Vec::new()
+    });
+
+    let mut specs = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for (name, engine, db_user, password_enc, container_id) in rows {
+        // Mirror the get_db_info guard (v2.19.0 H1): a row with an EMPTY
+        // container_id has no confirmed container of its own, and resolving it
+        // by the non-unique name `dockpanel-db-{name}` could reach a container
+        // that is not this tenant's. Never dump one — but never drop it
+        // silently either; it is counted as expected and reported.
+        if container_id.as_deref().unwrap_or("").is_empty() {
+            unavailable.push((
+                name,
+                "database is not fully provisioned yet (no container), so it could not be backed up".to_string(),
+            ));
+            continue;
+        }
+
+        let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+            &password_enc,
+            &state.config.jwt_secret,
+        );
+
+        specs.push(serde_json::json!({
+            "container_name": format!("dockpanel-db-{name}"),
+            "db_name": name,
+            "db_type": engine,
+            "user": db_user,
+            "password": password,
+        }));
+    }
+
+    SiteDatabases { specs, unavailable }
 }
 
 /// POST /api/sites/{id}/backups — Create a backup (async with SSE).
@@ -59,6 +129,11 @@ pub async fn create(
         let mut logs = state.provision_logs.lock().unwrap_or_else(|e| e.into_inner());
         logs.insert(backup_id, (Vec::new(), tx, Instant::now()));
     }
+
+    let site_dbs = site_databases(&state, id).await;
+    let db_expected = site_dbs.expected() as i32;
+    let db_unavailable = site_dbs.unavailable.clone();
+    let agent_body = serde_json::json!({ "databases": site_dbs.specs });
 
     let logs = state.provision_logs.clone();
     let db = state.db.clone();
@@ -82,10 +157,26 @@ pub async fn create(
         emit("backup", "Creating backup", "in_progress", None);
 
         let agent_path = format!("/backups/{}/create", domain_clone);
-        match agent.post(&agent_path, None).await {
+        match agent.post(&agent_path, Some(agent_body)).await {
             Ok(result) => {
                 let filename = result.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let size_bytes = result.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+
+                let included: Vec<String> = result.get("databases_included")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let mut failed: Vec<String> = result.get("databases_failed")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|f| {
+                        let name = f.get("db_name")?.as_str()?;
+                        let why = f.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                        Some(format!("{name}: {why}"))
+                    }).collect())
+                    .unwrap_or_default();
+                // Databases we refused to hand to the agent are missing from the
+                // archive just the same, so they belong in the same report.
+                failed.extend(db_unavailable.iter().map(|(n, why)| format!("{n}: {why}")));
 
                 // Feature 13: Backup integrity chain — compute hash and link to previous
                 let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -100,19 +191,48 @@ pub async fn create(
                 };
 
                 let _ = sqlx::query(
-                    "INSERT INTO backups (site_id, filename, size_bytes, sha256_hash, previous_hash, chain_valid) VALUES ($1, $2, $3, $4, $5, TRUE)",
+                    "INSERT INTO backups (site_id, filename, size_bytes, sha256_hash, previous_hash, chain_valid, databases_included, databases_expected) \
+                     VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7)",
                 )
                 .bind(id)
                 .bind(&filename)
                 .bind(size_bytes)
                 .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
                 .bind(previous_hash.as_deref())
+                .bind(included.len() as i32)
+                .bind(db_expected)
                 .execute(&db)
                 .await;
 
                 emit("backup", "Creating backup", "done", None);
-                emit("complete", "Backup created", "done", Some(filename.clone()));
-                tracing::info!("Backup created: {filename} for {domain_clone}");
+
+                // Say what is actually in the archive. A backup missing a
+                // database the site has is NOT a clean success — the whole point
+                // of this path is that the user can tell before they need it.
+                if db_expected == 0 {
+                    emit("databases", "No databases attached to this site", "done", None);
+                } else if failed.is_empty() {
+                    emit("databases", &format!(
+                        "Databases included: {}", included.join(", ")
+                    ), "done", None);
+                } else {
+                    emit("databases", "Databases NOT included in this backup", "error",
+                        Some(failed.join("; ")));
+                }
+
+                if failed.is_empty() {
+                    emit("complete", "Backup created", "done", Some(filename.clone()));
+                } else {
+                    emit("complete", &format!(
+                        "Backup created WITHOUT {} of {} database(s) — restoring it will not bring their content back",
+                        failed.len(), db_expected
+                    ), "error", Some(filename.clone()));
+                }
+
+                tracing::info!(
+                    "Backup created: {filename} for {domain_clone} ({} of {db_expected} databases included)",
+                    included.len()
+                );
                 activity::log_activity(
                     &db, user_id, &email, "backup.create",
                     Some("backup"), Some(&domain_clone), Some(&filename), None,
@@ -120,6 +240,8 @@ pub async fn create(
 
                 fire_event(&db, "backup.created", serde_json::json!({
                     "site_id": id, "filename": &filename,
+                    "databases_included": included.len(),
+                    "databases_expected": db_expected,
                 }));
             }
             Err(e) => {
@@ -191,6 +313,11 @@ pub async fn restore(
         logs.insert(restore_id, (Vec::new(), tx, Instant::now()));
     }
 
+    let site_dbs = site_databases(&state, id).await;
+    let site_has_dbs = site_dbs.expected() > 0;
+    let agent_body = serde_json::json!({ "databases": site_dbs.specs });
+    let archive_has_dbs = backup.databases_included > 0;
+
     let logs = state.provision_logs.clone();
     let db = state.db.clone();
     let user_id = claims.sub;
@@ -211,12 +338,81 @@ pub async fn restore(
             }
         };
 
+        // Tell the operator BEFORE the destructive step what this archive can
+        // and cannot give back. An archive made before v2.34.0 has no database
+        // in it, and a site restored from one comes back with its old files and
+        // its current content — which is exactly the surprise this ship exists
+        // to remove.
+        if site_has_dbs && !archive_has_dbs {
+            emit("databases", "This backup contains files only", "error", Some(
+                "It was made before DockPanel included databases in site backups, or its database dump failed. \
+                 Your site's database will NOT be restored and its content will stay as it is now. \
+                 Restore the database separately from the Databases page if that is what you need."
+                    .to_string(),
+            ));
+        }
+
         emit("restore", "Restoring backup", "in_progress", None);
 
         let agent_path = format!("/backups/{}/restore/{}", domain_clone, filename);
-        match agent.post(&agent_path, None).await {
-            Ok(_) => {
-                emit("restore", "Restoring backup", "done", None);
+
+        // The agent answers 500 with a structured report when it restored the
+        // files but could not load a database — the body is the useful part.
+        let outcome = match agent.post(&agent_path, Some(agent_body)).await {
+            Ok(v) => Ok(v),
+            Err(crate::services::agent::AgentError::Status(_, body)) => {
+                match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(report) if report.get("files_restored").is_some() => Ok(report),
+                    _ => Err(crate::services::agent::AgentError::Status(500, body)),
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        match outcome {
+            Ok(report) => {
+                let files_restored = report.get("files_restored").and_then(|v| v.as_bool()).unwrap_or(true);
+                let restored: Vec<String> = report.get("databases_restored")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let failed: Vec<String> = report.get("databases_failed")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|f| {
+                        let name = f.get("db_name")?.as_str()?;
+                        let why = f.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                        Some(format!("{name}: {why}"))
+                    }).collect())
+                    .unwrap_or_default();
+
+                if !failed.is_empty() {
+                    // The dangerous state: files are already replaced.
+                    emit("restore", "Restore incomplete", "error", Some(format!(
+                        "The site's FILES have been restored, but {} database(s) could not be: {}. \
+                         The site is now running restored files against its previous database content.",
+                        failed.len(), failed.join("; ")
+                    )));
+                    emit("complete", "Restore failed — files restored, database not", "error", None);
+                    tracing::error!(
+                        "Restore incomplete for {domain_clone}: files_restored={files_restored}, database failures: {}",
+                        failed.join("; ")
+                    );
+                    activity::log_activity(
+                        &db, user_id, &email, "backup.restore_partial",
+                        Some("backup"), Some(&domain_clone), Some(&filename), None,
+                    ).await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&restore_id);
+                    return;
+                }
+
+                if restored.is_empty() {
+                    emit("restore", "Restoring backup", "done", None);
+                } else {
+                    emit("restore", &format!(
+                        "Restored files and {} database(s): {}", restored.len(), restored.join(", ")
+                    ), "done", None);
+                }
 
                 // Post-restore: reload services to pick up restored files
                 emit("services", "Reloading services", "in_progress", None);

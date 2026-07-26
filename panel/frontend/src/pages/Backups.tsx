@@ -10,6 +10,45 @@ interface Backup {
   filename: string;
   size_bytes: number;
   created_at: string;
+  /** Databases actually inside this archive. 0 for any backup made before v2.34.0. */
+  databases_included: number;
+  /** Databases the site had when the backup ran. */
+  databases_expected: number;
+}
+
+/** What a given archive can actually give back. Per-row, because the answer
+ *  differs between archives: older ones hold files only, and a restore that
+ *  silently returns a site without its content is the failure mode this whole
+ *  column exists to prevent. */
+function backupContents(b: Backup): { label: string; complete: boolean; title: string } {
+  if (b.databases_expected === 0 && b.databases_included === 0) {
+    return {
+      label: "Files",
+      complete: true,
+      title:
+        "This archive holds the site's files. No database was attached to the site when it was made.",
+    };
+  }
+  if (b.databases_included === 0) {
+    return {
+      label: "Files only",
+      complete: false,
+      title:
+        "This archive holds the site's files but NO database — restoring it will not bring back posts, pages, users or settings.",
+    };
+  }
+  if (b.databases_included < b.databases_expected) {
+    return {
+      label: `Files + ${b.databases_included}/${b.databases_expected} databases`,
+      complete: false,
+      title: `Only ${b.databases_included} of the site's ${b.databases_expected} databases are in this archive.`,
+    };
+  }
+  return {
+    label: `Files + ${b.databases_included} database${b.databases_included === 1 ? "" : "s"}`,
+    complete: true,
+    title: "This archive holds the site's files and its database content.",
+  };
 }
 
 interface Site {
@@ -173,15 +212,15 @@ export default function Backups() {
         <div>
           <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">Backups</h1>
           <p className="text-sm text-dark-200 mt-1 font-mono">{site?.domain}</p>
-          {/* A site backup is `tar` of the site directory and nothing else. For a
-              CMS that is a fraction of the site: restoring one returns the files
-              and not a single post, page, comment or setting. Saying so here is
-              not a nicety — someone who reads "Backup" as "my site is safe"
-              finds out otherwise at the worst possible moment. */}
+          {/* What an archive holds differs per archive: anything made before
+              v2.34.0 is files only. Stating the general rule here and the actual
+              contents per row is deliberate — someone who reads "Backup" as "my
+              site is safe" otherwise finds out at the worst possible moment. */}
           <p className="text-xs text-dark-300 mt-2 max-w-xl">
-            Contains this site&apos;s <strong className="text-dark-200">files only</strong>. Databases are
-            not included &mdash; back them up from the Databases page, or a restore here will bring back
-            the files without their content.
+            A backup contains this site&apos;s <strong className="text-dark-200">files and its
+            databases</strong>, so restoring one brings back its content too. The Contains column
+            shows what each archive actually holds &mdash; backups made before DockPanel included
+            databases are marked <strong className="text-dark-200">Files only</strong>.
           </p>
         </div>
         <button
@@ -371,7 +410,7 @@ export default function Backups() {
             </svg>
             <p className="text-dark-200 text-sm">No backups yet</p>
             <p className="text-dark-300 text-xs mt-1">
-              Create your first backup to protect your site files (databases are backed up separately)
+              Create your first backup to protect this site&apos;s files and database content
             </p>
           </div>
         ) : (
@@ -380,6 +419,9 @@ export default function Backups() {
               <tr className="bg-dark-900 border-b border-dark-500">
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3">
                   Filename
+                </th>
+                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3 w-48">
+                  Contains
                 </th>
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3 w-24">
                   Size
@@ -404,6 +446,28 @@ export default function Backups() {
                         {backup.filename}
                       </span>
                     </div>
+                  </td>
+                  <td className="px-5 py-4">
+                    {(() => {
+                      const c = backupContents(backup);
+                      return (
+                        <span
+                          title={c.title}
+                          className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${
+                            c.complete
+                              ? "bg-dark-700 text-dark-200 border-dark-500"
+                              : "bg-warn-500/10 text-warn-400 border-warn-500/20"
+                          }`}
+                        >
+                          {!c.complete && (
+                            <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+                            </svg>
+                          )}
+                          {c.label}
+                        </span>
+                      );
+                    })()}
                   </td>
                   <td className="px-5 py-4 text-sm text-dark-200 font-mono">
                     {formatSize(backup.size_bytes)}

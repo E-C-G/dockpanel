@@ -12,6 +12,19 @@ pub async fn cmd_backup_create(token: &str, domain: &str) -> Result<(), String> 
     println!("\x1b[32m✓\x1b[0m Backup created");
     println!("  File:    {filename}");
     println!("  Size:    {size_mb:.1} MB");
+    println!("  Content: files only");
+
+    // The CLI authenticates to the AGENT, which has no access to the panel's
+    // `databases` table and therefore cannot know which databases belong to
+    // this site or hold their credentials. A backup taken here is genuinely
+    // less complete than one taken from the panel, so say so — an archive that
+    // looks equivalent but silently lacks the site's content is the exact
+    // failure this path was built to end.
+    println!(
+        "\n\x1b[33m!\x1b[0m This archive contains the site's files but NOT its databases.\n  \
+         The CLI talks to the agent directly and cannot resolve a site's databases.\n  \
+         Create the backup from the panel (or the panel API) to include them."
+    );
 
     Ok(())
 }
@@ -57,14 +70,35 @@ pub async fn cmd_backup_list(token: &str, domain: &str, output: &str) -> Result<
 pub async fn cmd_backup_restore(token: &str, domain: &str, filename: &str) -> Result<(), String> {
     println!("Restoring {domain} from {filename}...");
 
+    // An archive that carries database dumps cannot be fully restored from
+    // here: the agent needs the site's database credentials and only the panel
+    // has them. The agent answers with a failure in that case rather than
+    // restoring the files and calling it done, so surface WHY and what to do.
     let result = client::agent_post_empty(
         &format!("/backups/{domain}/restore/{filename}"),
         token,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if e.contains("supplied no database credentials") || e.contains("database(s) were NOT") {
+            format!(
+                "{e}\n\nThis backup contains database dumps, and the CLI cannot restore them — it \
+                 talks to the agent directly and has no access to the site's database credentials. \
+                 Restore this backup from the panel instead."
+            )
+        } else {
+            e
+        }
+    })?;
 
     if result["success"].as_bool() == Some(true) {
         println!("\x1b[32m✓\x1b[0m Backup restored");
+        let dbs = result["databases_restored"].as_array().map(|a| a.len()).unwrap_or(0);
+        if dbs > 0 {
+            println!("  Databases restored: {dbs}");
+        } else if result["databases_in_archive"].as_u64().unwrap_or(0) == 0 {
+            println!("  Content: files only (this archive holds no database)");
+        }
     } else {
         let msg = result["message"].as_str().unwrap_or("Unknown error");
         return Err(format!("Failed to restore backup: {msg}"));

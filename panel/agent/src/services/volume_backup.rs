@@ -77,6 +77,7 @@ pub async fn backup_volume(
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         sha256,
+        ..Default::default()
     })
 }
 
@@ -165,7 +166,8 @@ pub fn list_volume_backups(container_name: &str) -> Result<Vec<BackupInfo>, Stri
             size_bytes: size,
             created_at: created,
             sha256: None,
-        });
+        ..Default::default()
+    });
     }
 
     backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));

@@ -102,22 +102,28 @@ has  "the tooltip no longer promises idleness it cannot measure" \
      'served no requests' "$APPS_UI"
 
 echo
-echo "D. A files-only backup does not call itself a backup of the site"
-# `create_backup` is `tar czf … -C <site_root> .` and nothing else, while the
-# panel's own `databases` table knows the site has one. Restoring a WordPress
-# site therefore returns its files and none of its content — verified on a real
-# box: the file marker came back, the deleted post did not.
-has  "the Backups page says files only" \
-     'files only' "$BACKUPS_UI"
+echo "D. A backup never overstates what it contains"
+# s259 found `create_backup` was `tar czf … -C <site_root> .` and nothing else,
+# while the panel's own `databases` table knew the site had one — so restoring a
+# WordPress site returned its files and none of its content (the file marker came
+# back, the deleted post did not), and the guide claimed the opposite.
+#
+# s260 CHANGED THE UNDERLYING FACT: site backups now carry a dump of each of the
+# site's databases, proven on a fresh box by the same drill (post came back).
+# What survives both eras is the invariant this section really pins — the docs
+# and the UI state what an archive actually holds, never more. The mechanics of
+# the new path are pinned in tests/site-backup-databases-pin-e2e.sh.
+has  "the Backups page still distinguishes an archive with no database" \
+     'Files only' "$BACKUPS_UI"
 has  "…and names the consequence rather than hinting at it" \
-     'without their content' "$BACKUPS_UI"
-has  "…and points at where databases ARE backed up" \
-     'Databases page' "$BACKUPS_UI"
-has  "the empty state no longer implies completeness" \
-     'databases are backed up separately' "$BACKUPS_UI"
-# The guide was the worst offender: it stated the database WAS included, twice,
-# and printed a sample restore transcript with a "Restoring database..." step
-# that no code has ever performed. A user who trusts that finds out at restore.
+     'will not bring back posts, pages, users or settings' "$BACKUPS_UI"
+has  "…and the empty state describes what a backup now protects" \
+     "files and database content" "$BACKUPS_UI"
+# The guide was the worst offender: it stated the database WAS included when it
+# was not, twice, and printed a sample restore transcript with a "Restoring
+# database..." step that no code performed. Those exact fabrications must stay
+# gone even now that the capability is real — the transcript has to match what
+# the CLI prints, and the CLI still cannot restore databases.
 hasnt "the guide no longer claims the database is in the tarball" \
      'includes the site files, database' "$BACKUPS_DOC"
 hasnt "…nor that a restore replaces the database" \
@@ -126,8 +132,10 @@ hasnt "…nor prints a restore step that never runs" \
      'Restoring database\.\.\.' "$BACKUPS_DOC"
 hasnt "…nor claims site backups carry the site's own database" \
      "Site backups include the site's own database" "$BACKUPS_DOC"
-has  "…and says plainly that they are not included" \
-     'Databases are not included' "$BACKUPS_DOC"
+has  "…and now states what IS included, because it finally is" \
+     'and a dump of every database attached to' "$BACKUPS_DOC"
+has  "…while calling out that older archives are not" \
+     'contain files only' "$BACKUPS_DOC"
 
 echo
 printf 'passed %d, failed %d\n' "$PASS" "$FAIL"

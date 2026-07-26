@@ -1,8 +1,64 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::safe_cmd::safe_command;
+use crate::services::database_backup;
 
 const BACKUP_DIR: &str = "/var/backups/dockpanel";
 const WEBROOT: &str = "/var/www";
+
+/// Where database dumps are staged while an archive is being built or unpacked.
+/// Must live under a path the agent unit lists in `ReadWritePaths`.
+const STAGING_ROOT: &str = "/var/backups/dockpanel/.staging";
+
+/// Directory inside the archive that holds everything DockPanel adds to a site
+/// backup beyond the webroot itself. Deliberately NOT under `./` so it is a
+/// distinct top-level member and can be extracted (and excluded) on its own.
+const PAYLOAD_DIR: &str = ".dockpanel-backup";
+
+/// Bump when the payload layout changes in a way a reader must know about.
+const MANIFEST_SCHEMA: u32 = 1;
+
+/// A database the panel wants dumped into (or restored from) a site backup.
+///
+/// The agent has no access to the panel's `databases` table, so the backend
+/// resolves the site's databases and passes their decrypted credentials here.
+#[derive(serde::Deserialize, Clone, Debug)]
+pub struct DbSpec {
+    pub container_name: String,
+    pub db_name: String,
+    pub db_type: String,
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// A database that could not be dumped or restored, and why. Never swallowed —
+/// a backup that silently lost a database is the defect this whole path exists
+/// to close.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct DbFailure {
+    pub db_name: String,
+    pub error: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ManifestDb {
+    pub db_name: String,
+    pub db_type: String,
+    /// File name inside `<PAYLOAD_DIR>/db/`.
+    pub file: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct Manifest {
+    pub schema: u32,
+    pub domain: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub databases: Vec<ManifestDb>,
+}
 
 #[derive(serde::Serialize, Default)]
 pub struct BackupInfo {
@@ -11,6 +67,81 @@ pub struct BackupInfo {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Databases whose dump is inside this archive. Empty (and omitted) for a
+    /// files-only backup, which is what every archive made before v2.34.0 is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases_included: Vec<String>,
+    /// Databases the panel asked for that are NOT in the archive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases_failed: Vec<DbFailure>,
+}
+
+/// What a restore actually did. `ok()` is the only thing callers should treat
+/// as success — a restore that put the files back but not the database is a
+/// failure with a partially-changed site, not a success with a footnote.
+#[derive(serde::Serialize, Default)]
+pub struct RestoreReport {
+    pub files_restored: bool,
+    pub databases_in_archive: usize,
+    pub databases_restored: Vec<String>,
+    pub databases_failed: Vec<DbFailure>,
+}
+
+impl RestoreReport {
+    pub fn ok(&self) -> bool {
+        self.files_restored && self.databases_failed.is_empty()
+    }
+}
+
+/// Create a staging directory that only root can read. The dumps inside are the
+/// site's entire content in plaintext.
+fn make_staging(tag: &str) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(format!("{STAGING_ROOT}/{tag}"));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create staging dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        // The parent is shared by every staged backup; keep it closed too.
+        let _ = std::fs::set_permissions(
+            PathBuf::from(STAGING_ROOT),
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
+    Ok(dir)
+}
+
+/// Dump one database and move it into the archive payload, reusing the hardened
+/// per-engine dump paths rather than re-implementing them.
+async fn stage_one_dump(spec: &DbSpec, dest_dir: &Path) -> Result<ManifestDb, String> {
+    let info = match spec.db_type.as_str() {
+        "mysql" | "mariadb" => {
+            database_backup::dump_mysql(&spec.container_name, &spec.db_name, &spec.user, &spec.password).await?
+        }
+        "postgres" | "postgresql" => {
+            database_backup::dump_postgres(&spec.container_name, &spec.db_name, &spec.user, &spec.password).await?
+        }
+        "mongo" | "mongodb" => {
+            database_backup::dump_mongo(&spec.container_name, &spec.db_name).await?
+        }
+        other => return Err(format!("Unsupported database engine '{other}'")),
+    };
+
+    // dump_* writes into the per-database backup tree; move it into the archive
+    // payload so it does not also surface as a standalone database backup.
+    let src = database_backup::get_backup_path(&spec.db_name, &info.filename)?;
+    let dest = dest_dir.join(&info.filename);
+    std::fs::rename(&src, &dest)
+        .map_err(|e| format!("Failed to stage dump for {}: {e}", spec.db_name))?;
+
+    Ok(ManifestDb {
+        db_name: spec.db_name.clone(),
+        db_type: spec.db_type.clone(),
+        file: info.filename,
+        size_bytes: info.size_bytes,
+        sha256: info.sha256,
+    })
 }
 
 /// Validate backup filename (prevent path traversal).
@@ -26,8 +157,12 @@ fn backup_dir(domain: &str) -> PathBuf {
     PathBuf::from(format!("{BACKUP_DIR}/{domain}"))
 }
 
-/// Create a backup of the site's webroot.
-pub async fn create_backup(domain: &str) -> Result<BackupInfo, String> {
+/// Create a backup of the site's webroot, plus a dump of each database the panel
+/// passes in.
+///
+/// With an empty `databases` slice this produces byte-for-byte the archive it
+/// always did, so nothing about existing backups or callers changes.
+pub async fn create_backup(domain: &str, databases: &[DbSpec]) -> Result<BackupInfo, String> {
     let site_root = PathBuf::from(format!("{WEBROOT}/{domain}"));
     if !site_root.exists() {
         return Err(format!("Site root does not exist: {}", site_root.display()));
@@ -48,18 +183,96 @@ pub async fn create_backup(domain: &str) -> Result<BackupInfo, String> {
         .to_str()
         .ok_or_else(|| "Invalid site root path encoding".to_string())?;
 
-    let output = tokio::time::timeout(
+    // ── Stage database dumps into the archive payload ───────────────────────
+    let mut staging: Option<PathBuf> = None;
+    let mut databases_included: Vec<String> = Vec::new();
+    let mut databases_failed: Vec<DbFailure> = Vec::new();
+
+    if !databases.is_empty() {
+        if site_root.join(PAYLOAD_DIR).exists() {
+            // The site itself owns a path we would have to shadow. Refuse the
+            // payload rather than produce an archive whose restore is ambiguous.
+            for spec in databases {
+                databases_failed.push(DbFailure {
+                    db_name: spec.db_name.clone(),
+                    error: format!(
+                        "site root contains a reserved '{PAYLOAD_DIR}' path; database not included"
+                    ),
+                });
+            }
+        } else {
+            let stage = make_staging(&format!("{domain}-{timestamp}"))?;
+            let db_dir = stage.join(PAYLOAD_DIR).join("db");
+            std::fs::create_dir_all(&db_dir)
+                .map_err(|e| format!("Failed to create payload dir: {e}"))?;
+
+            let mut manifest_dbs: Vec<ManifestDb> = Vec::new();
+            for spec in databases {
+                match stage_one_dump(spec, &db_dir).await {
+                    Ok(entry) => {
+                        databases_included.push(spec.db_name.clone());
+                        manifest_dbs.push(entry);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Backup for {domain}: database {} not included: {e}", spec.db_name);
+                        databases_failed.push(DbFailure {
+                            db_name: spec.db_name.clone(),
+                            error: e,
+                        });
+                    }
+                }
+            }
+
+            let manifest = Manifest {
+                schema: MANIFEST_SCHEMA,
+                domain: domain.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                databases: manifest_dbs,
+            };
+            let manifest_json = serde_json::to_string_pretty(&manifest)
+                .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
+            std::fs::write(stage.join(PAYLOAD_DIR).join("manifest.json"), manifest_json)
+                .map_err(|e| format!("Failed to write manifest: {e}"))?;
+
+            staging = Some(stage);
+        }
+    }
+
+    let mut tar_args: Vec<String> = vec![
+        "czf".into(),
+        filepath_str.into(),
+        "-C".into(),
+        site_root_str.into(),
+        ".".into(),
+    ];
+    if let Some(stage) = &staging {
+        let stage_str = stage
+            .to_str()
+            .ok_or_else(|| "Invalid staging path encoding".to_string())?;
+        tar_args.push("-C".into());
+        tar_args.push(stage_str.into());
+        tar_args.push(PAYLOAD_DIR.into());
+    }
+
+    let tar_result = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("tar")
-            .args(["czf", filepath_str, "-C", site_root_str, "."])
-            .output(),
+        safe_command("tar").args(&tar_args).output(),
     )
-    .await
-    .map_err(|_| "Backup timed out (5 minutes)".to_string())?
-    .map_err(|e| format!("Failed to run tar: {e}"))?;
+    .await;
+
+    // The staged dumps are a full plaintext copy of the site's data — remove
+    // them whatever happened to tar.
+    if let Some(stage) = &staging {
+        let _ = std::fs::remove_dir_all(stage);
+    }
+
+    let output = tar_result
+        .map_err(|_| "Backup timed out (5 minutes)".to_string())?
+        .map_err(|e| format!("Failed to run tar: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        std::fs::remove_file(&filepath).ok();
         return Err(format!("Backup failed: {stderr}"));
     }
 
@@ -78,13 +291,21 @@ pub async fn create_backup(domain: &str) -> Result<BackupInfo, String> {
     // Feature 13: Compute SHA256 hash of the backup file for integrity chain
     let sha256 = compute_file_sha256(filepath_str).await;
 
-    tracing::info!("Backup created: {filename} ({} bytes, hash: {})", meta.len(), sha256.as_deref().unwrap_or("N/A"));
+    tracing::info!(
+        "Backup created: {filename} ({} bytes, hash: {}, databases: {} included / {} failed)",
+        meta.len(),
+        sha256.as_deref().unwrap_or("N/A"),
+        databases_included.len(),
+        databases_failed.len()
+    );
 
     Ok(BackupInfo {
         filename,
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         sha256,
+        databases_included,
+        databases_failed,
     })
 }
 
@@ -134,6 +355,8 @@ pub fn list_backups(domain: &str) -> Result<Vec<BackupInfo>, String> {
             size_bytes: size,
             created_at: created,
             sha256: None,
+            databases_included: Vec::new(),
+            databases_failed: Vec::new(),
         });
     }
 
@@ -141,8 +364,71 @@ pub fn list_backups(domain: &str) -> Result<Vec<BackupInfo>, String> {
     Ok(backups)
 }
 
-/// Restore a backup to the site's webroot.
-pub async fn restore_backup(domain: &str, filename: &str) -> Result<(), String> {
+/// Extract the DockPanel payload out of an archive into `stage`, if it has one.
+///
+/// Returns `Ok(None)` for an archive that predates the payload (every archive
+/// made before v2.34.0) — that is a normal, expected shape, not an error.
+async fn extract_payload(archive: &str, stage: &Path) -> Result<Option<Manifest>, String> {
+    let stage_str = stage
+        .to_str()
+        .ok_or_else(|| "Invalid staging path encoding".to_string())?;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        safe_command("tar")
+            .args([
+                "xzf", archive,
+                "--no-same-owner", "--no-same-permissions",
+                "-C", stage_str,
+                PAYLOAD_DIR,
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| "Reading backup payload timed out (5 minutes)".to_string())?
+    .map_err(|e| format!("Failed to run tar: {e}"))?;
+
+    let manifest_path = stage.join(PAYLOAD_DIR).join("manifest.json");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // GNU tar's way of saying "this archive simply doesn't have that member".
+        if stderr.contains("Not found in archive") || stderr.contains("not found in archive") {
+            return Ok(None);
+        }
+        return Err(format!("Failed to read backup payload: {stderr}"));
+    }
+
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Failed to read backup manifest: {e}"))?;
+    let manifest: Manifest = serde_json::from_str(&raw)
+        .map_err(|e| format!("Backup manifest is unreadable: {e}"))?;
+
+    if manifest.schema > MANIFEST_SCHEMA {
+        return Err(format!(
+            "Backup was made by a newer DockPanel (manifest schema {}, this agent understands {MANIFEST_SCHEMA}). Update this server before restoring it.",
+            manifest.schema
+        ));
+    }
+
+    Ok(Some(manifest))
+}
+
+/// Restore a backup to the site's webroot, and restore any databases the
+/// archive carries.
+///
+/// Files are restored first and databases last: the per-engine restore paths
+/// roll back on failure, so a database that fails to load leaves the live data
+/// as it was rather than half-overwritten.
+pub async fn restore_backup(
+    domain: &str,
+    filename: &str,
+    databases: &[DbSpec],
+) -> Result<RestoreReport, String> {
     if !is_safe_filename(filename) {
         return Err("Invalid backup filename".into());
     }
@@ -163,11 +449,51 @@ pub async fn restore_backup(domain: &str, filename: &str) -> Result<(), String> 
         .to_str()
         .ok_or_else(|| "Invalid site root path encoding".to_string())?;
 
-    // Full overwrite ensures a clean restore; --no-same-owner prevents uid/gid hijacking
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let stage = make_staging(&format!("restore-{domain}-{timestamp}"))?;
+
+    let result = restore_inner(
+        domain, filename, filepath_str, site_root_str, &site_root, &stage, databases,
+    )
+    .await;
+
+    // The staged dumps are the site's data in plaintext — never leave them behind.
+    let _ = std::fs::remove_dir_all(&stage);
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_inner(
+    domain: &str,
+    filename: &str,
+    filepath_str: &str,
+    site_root_str: &str,
+    site_root: &Path,
+    stage: &Path,
+    databases: &[DbSpec],
+) -> Result<RestoreReport, String> {
+    let mut report = RestoreReport::default();
+
+    // 1. Pull the database payload out FIRST, so it never lands in the webroot.
+    let manifest = extract_payload(filepath_str, stage).await?;
+    let manifest_dbs = manifest.map(|m| m.databases).unwrap_or_default();
+    report.databases_in_archive = manifest_dbs.len();
+
+    // 2. Restore the files. Full overwrite ensures a clean restore;
+    //    --no-same-owner prevents uid/gid hijacking. The payload is excluded so
+    //    a site restored from a v1 archive does not gain a .dockpanel-backup
+    //    directory full of database dumps under its document root.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
         safe_command("tar")
-            .args(["xzf", filepath_str, "--no-same-owner", "--no-same-permissions", "-C", site_root_str])
+            .args([
+                "xzf", filepath_str,
+                "--no-same-owner", "--no-same-permissions",
+                "--exclude", PAYLOAD_DIR,
+                "--exclude", &format!("{PAYLOAD_DIR}/*"),
+                "-C", site_root_str,
+            ])
             .output(),
     )
     .await
@@ -180,13 +506,87 @@ pub async fn restore_backup(domain: &str, filename: &str) -> Result<(), String> 
     }
 
     // Verify the restore produced a non-empty site directory
-    let entries = std::fs::read_dir(&site_root).map(|d| d.count()).unwrap_or(0);
+    let entries = std::fs::read_dir(site_root).map(|d| d.count()).unwrap_or(0);
     if entries == 0 {
         return Err("Restore completed but site directory is empty".to_string());
     }
+    report.files_restored = true;
 
-    tracing::info!("Backup restored: {filename} for {domain} ({entries} entries)");
-    Ok(())
+    // 3. Restore each database the archive carries.
+    let db_dir = stage.join(PAYLOAD_DIR).join("db");
+    for entry in &manifest_dbs {
+        let Some(spec) = databases.iter().find(|s| s.db_name == entry.db_name) else {
+            // Two different situations, and telling them apart matters to whoever
+            // reads the message: the caller sent no credentials at all (the CLI
+            // authenticates to this agent and cannot resolve them), or the site
+            // genuinely no longer has that database.
+            let error = if databases.is_empty() {
+                format!(
+                    "this archive contains a dump of '{}', but the caller supplied no database credentials, so it could not be restored",
+                    entry.db_name
+                )
+            } else {
+                format!(
+                    "the archive contains a dump of '{}' but no such database is attached to this site now; restore it from the Databases page",
+                    entry.db_name
+                )
+            };
+            report.databases_failed.push(DbFailure { db_name: entry.db_name.clone(), error });
+            continue;
+        };
+
+        let dump_path = db_dir.join(&entry.file);
+        if !dump_path.exists() {
+            report.databases_failed.push(DbFailure {
+                db_name: entry.db_name.clone(),
+                error: "the manifest lists this database but its dump is missing from the archive".into(),
+            });
+            continue;
+        }
+        let Some(dump_str) = dump_path.to_str() else {
+            report.databases_failed.push(DbFailure {
+                db_name: entry.db_name.clone(),
+                error: "Invalid dump path encoding".into(),
+            });
+            continue;
+        };
+
+        let outcome = match spec.db_type.as_str() {
+            "mysql" | "mariadb" => {
+                database_backup::restore_mysql(
+                    &spec.container_name, &spec.db_name, &spec.user, &spec.password, dump_str,
+                ).await
+            }
+            "postgres" | "postgresql" => {
+                database_backup::restore_postgres(
+                    &spec.container_name, &spec.db_name, &spec.user, &spec.password, dump_str,
+                ).await
+            }
+            "mongo" | "mongodb" => {
+                database_backup::restore_mongo(&spec.container_name, &spec.db_name, dump_str).await
+            }
+            other => Err(format!("Unsupported database engine '{other}'")),
+        };
+
+        match outcome {
+            Ok(()) => report.databases_restored.push(entry.db_name.clone()),
+            Err(e) => {
+                tracing::error!("Restore for {domain}: database {} failed: {e}", entry.db_name);
+                report.databases_failed.push(DbFailure {
+                    db_name: entry.db_name.clone(),
+                    error: e,
+                });
+            }
+        }
+    }
+
+    tracing::info!(
+        "Backup restored: {filename} for {domain} ({entries} entries, databases: {} restored / {} failed of {} in archive)",
+        report.databases_restored.len(),
+        report.databases_failed.len(),
+        report.databases_in_archive
+    );
+    Ok(report)
 }
 
 /// List files in a backup archive (max 500 entries).
@@ -280,6 +680,196 @@ pub async fn restore_single_file(domain: &str, filename: &str, file_path: &str) 
 
     tracing::info!("Single file restored from {filename}: {file_path} for {domain}");
     Ok(())
+}
+
+#[cfg(test)]
+mod db_payload_tests {
+    use super::*;
+
+    /// Creates `/var/www/<domain>` and removes both it and the backup dir on drop,
+    /// so a failing assertion cannot leave state behind on a real box.
+    struct TestSite(String);
+
+    impl TestSite {
+        fn new(tag: &str) -> Self {
+            let domain = format!("dp-pin-{tag}.invalid");
+            let root = PathBuf::from(format!("{WEBROOT}/{domain}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create test site root");
+            std::fs::write(root.join("index.html"), b"<h1>marker</h1>").expect("write marker");
+            TestSite(domain)
+        }
+        fn domain(&self) -> &str { &self.0 }
+        fn root(&self) -> PathBuf { PathBuf::from(format!("{WEBROOT}/{}", self.0)) }
+    }
+
+    impl Drop for TestSite {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.root());
+            let _ = std::fs::remove_dir_all(backup_dir(&self.0));
+        }
+    }
+
+    fn members(archive: &Path) -> String {
+        let out = std::process::Command::new("tar")
+            .args(["tzf", archive.to_str().unwrap()])
+            .output()
+            .expect("tar tzf");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn spec(db_name: &str, db_type: &str) -> DbSpec {
+        DbSpec {
+            // A container that does not exist, so the dump fails without needing
+            // a live database — what is under test is how the failure is REPORTED.
+            container_name: format!("dp-pin-absent-{db_name}"),
+            db_name: db_name.to_string(),
+            db_type: db_type.to_string(),
+            user: "pinuser".into(),
+            password: "pinpass".into(),
+        }
+    }
+
+    /// A site with no databases must produce exactly the archive it always did.
+    #[tokio::test]
+    async fn no_databases_produces_a_files_only_archive() {
+        let site = TestSite::new("nodb");
+        let info = create_backup(site.domain(), &[]).await.expect("backup");
+        let archive = backup_dir(site.domain()).join(&info.filename);
+
+        let listing = members(&archive);
+        assert!(listing.contains("./index.html"), "site files must be in the archive: {listing}");
+        assert!(
+            !listing.contains(PAYLOAD_DIR),
+            "an archive for a site with no databases must carry no payload dir: {listing}"
+        );
+        assert!(info.databases_included.is_empty());
+        assert!(info.databases_failed.is_empty());
+    }
+
+    /// A database that cannot be dumped is REPORTED, never silently dropped.
+    /// This is the whole thesis of the ship: a backup missing the site's content
+    /// must not be indistinguishable from a complete one.
+    #[tokio::test]
+    async fn a_failed_dump_is_reported_not_swallowed() {
+        let site = TestSite::new("faildump");
+        let info = create_backup(site.domain(), &[spec("pinmissing", "postgres")])
+            .await
+            .expect("backup still succeeds for the files");
+
+        assert!(
+            info.databases_included.is_empty(),
+            "a database that could not be dumped must not be listed as included"
+        );
+        assert_eq!(info.databases_failed.len(), 1, "the failure must be reported");
+        assert_eq!(info.databases_failed[0].db_name, "pinmissing");
+        assert!(
+            !info.databases_failed[0].error.is_empty(),
+            "the report must say WHY the database is missing"
+        );
+    }
+
+    /// A site that already owns the reserved path is refused rather than shadowed.
+    #[tokio::test]
+    async fn reserved_path_collision_refuses_the_payload() {
+        let site = TestSite::new("collide");
+        std::fs::create_dir_all(site.root().join(PAYLOAD_DIR)).expect("collide dir");
+
+        let info = create_backup(site.domain(), &[spec("pincollide", "postgres")])
+            .await
+            .expect("backup");
+
+        assert_eq!(info.databases_failed.len(), 1);
+        assert!(
+            info.databases_failed[0].error.contains("reserved"),
+            "the collision must be named as the reason: {}",
+            info.databases_failed[0].error
+        );
+    }
+
+    /// Restoring a pre-v2.34.0 archive must still work, and report honestly that
+    /// it carried no database.
+    #[tokio::test]
+    async fn restoring_a_files_only_archive_still_works() {
+        let site = TestSite::new("oldarchive");
+        let info = create_backup(site.domain(), &[]).await.expect("backup");
+        std::fs::remove_file(site.root().join("index.html")).expect("delete marker");
+
+        let report = restore_backup(site.domain(), &info.filename, &[])
+            .await
+            .expect("restore");
+
+        assert!(report.files_restored);
+        assert_eq!(report.databases_in_archive, 0);
+        assert!(report.ok(), "a files-only archive restores cleanly");
+        assert!(site.root().join("index.html").exists(), "the file marker must come back");
+    }
+
+    /// The payload must never be extracted into the document root — the dumps are
+    /// the site's entire content in plaintext and the webroot is served publicly.
+    /// It must also count as a failure when its database cannot be restored.
+    #[tokio::test]
+    async fn payload_never_lands_in_the_webroot_and_a_missing_target_fails() {
+        let site = TestSite::new("payload");
+
+        // Hand-build a v1 archive: site files plus a payload naming one database.
+        let stage = std::env::temp_dir().join("dp-pin-payload-stage");
+        let _ = std::fs::remove_dir_all(&stage);
+        std::fs::create_dir_all(stage.join(PAYLOAD_DIR).join("db")).expect("stage");
+        std::fs::write(stage.join(PAYLOAD_DIR).join("db").join("pinwp.sql.gz"), b"not-a-real-dump")
+            .expect("dump");
+        let manifest = serde_json::json!({
+            "schema": 1, "domain": site.domain(), "created_at": "2026-07-26T00:00:00Z",
+            "databases": [{
+                "db_name": "pinwp", "db_type": "postgres",
+                "file": "pinwp.sql.gz", "size_bytes": 15
+            }]
+        });
+        std::fs::write(
+            stage.join(PAYLOAD_DIR).join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        ).expect("manifest");
+
+        std::fs::create_dir_all(backup_dir(site.domain())).expect("backup dir");
+        let archive = backup_dir(site.domain()).join("handmade-20260726-000000.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "czf", archive.to_str().unwrap(),
+                "-C", site.root().to_str().unwrap(), ".",
+                "-C", stage.to_str().unwrap(), PAYLOAD_DIR,
+            ])
+            .status()
+            .expect("tar");
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(&stage);
+
+        // Restore with NO matching database configured on the site.
+        let report = restore_backup(site.domain(), "handmade-20260726-000000.tar.gz", &[])
+            .await
+            .expect("restore runs");
+
+        assert!(report.files_restored, "files must still be restored");
+        assert_eq!(report.databases_in_archive, 1, "the manifest must be read");
+        assert_eq!(report.databases_failed.len(), 1, "an unrestorable database is a failure");
+        assert!(
+            !report.ok(),
+            "a restore that could not put the database back is NOT a success"
+        );
+        assert!(
+            !site.root().join(PAYLOAD_DIR).exists(),
+            "database dumps must never be extracted into the document root"
+        );
+    }
+
+    #[test]
+    fn report_ok_requires_both_halves() {
+        let mut r = RestoreReport { files_restored: true, ..Default::default() };
+        assert!(r.ok());
+        r.databases_failed.push(DbFailure { db_name: "x".into(), error: "boom".into() });
+        assert!(!r.ok(), "files restored + database failed is a FAILURE");
+        let r2 = RestoreReport { files_restored: false, ..Default::default() };
+        assert!(!r2.ok());
+    }
 }
 
 /// Delete a backup file.

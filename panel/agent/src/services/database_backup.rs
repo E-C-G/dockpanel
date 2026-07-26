@@ -140,6 +140,7 @@ pub async fn dump_mysql(
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         sha256,
+        ..Default::default()
     })
 }
 
@@ -250,6 +251,7 @@ pub async fn dump_postgres(
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         sha256,
+        ..Default::default()
     })
 }
 
@@ -342,6 +344,7 @@ pub async fn dump_mongo(
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         sha256,
+        ..Default::default()
     })
 }
 
@@ -378,7 +381,14 @@ pub async fn restore_mysql(
             "exec", "-i",
             "-e", &format!("MYSQL_PWD={password}"),
             container_name,
-            "mysql", "-u", user, db_name,
+            // `mariadb`, NOT `mysql`: the panel provisions `mariadb:11`, and
+            // MariaDB 11 dropped the mysql-named client symlinks, so `mysql`
+            // does not exist in the container at all. Every sibling call site
+            // (database.rs, backup_drill.rs, backup_verify.rs) already invokes
+            // `mariadb`; this one did not, so restoring a MySQL/MariaDB dump
+            // failed on every install with "executable file not found" while
+            // the DUMP half — which correctly calls `mariadb-dump` — worked.
+            "mariadb", "-u", user, db_name,
         ])
         .stdin(gunzip_stdout.into_owned_fd().map_err(|_| "Failed to get fd")?)
         .stdout(std::process::Stdio::piped())
@@ -401,6 +411,17 @@ pub async fn restore_mysql(
             }
             if !docker_output.status.success() {
                 let stderr = String::from_utf8_lossy(&docker_output.stderr);
+                let stderr = stderr.trim();
+                // Never report a bare "restore failed:" with nothing after it —
+                // a failure with no reason is unactionable, and this path can
+                // fail with empty stderr (e.g. the client binary is missing and
+                // the runtime writes nothing we captured).
+                if stderr.is_empty() {
+                    return Err(format!(
+                        "MySQL restore failed: the mariadb client exited with {} and produced no error output",
+                        docker_output.status
+                    ));
+                }
                 return Err(format!("MySQL restore failed: {stderr}"));
             }
             Ok(())
@@ -579,7 +600,8 @@ pub fn list_db_backups(db_name: &str) -> Result<Vec<BackupInfo>, String> {
             size_bytes: size,
             created_at: created,
             sha256: None,
-        });
+        ..Default::default()
+    });
     }
 
     backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));

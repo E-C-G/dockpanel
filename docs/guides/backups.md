@@ -9,15 +9,34 @@
 3. Select the site to back up
 4. Click **Create**
 
-The backup contains the site's directory — its files, and nothing else. It is saved as a
-compressed tarball in `/var/backups/dockpanel/`.
+The backup contains the site's directory — its files — **and a dump of every database attached to
+the site**. It is saved as a single compressed tarball in `/var/backups/dockpanel/`.
 
-> **Databases are not included.** For a CMS such as WordPress, almost everything you think of as
-> "the site" — posts, pages, comments, users, settings — lives in the database, not in these
-> files. A site backup will not bring any of it back. Back databases up separately (see
-> [Database Backups](#database-backups) below) and keep both if you want to be able to restore
-> the site as it was. The site's Nginx configuration is not in the tarball either; the panel
-> rewrites it from its own records.
+For a CMS such as WordPress, almost everything you think of as "the site" — posts, pages,
+comments, users, settings — lives in the database rather than in the files, so a backup that
+holds only files cannot bring the site back. Since v2.34.0 both halves travel in the same archive
+and are restored together.
+
+> **Backups made before v2.34.0 contain files only.** Nothing rewrites an archive that already
+> exists, so any backup taken by an earlier version holds no database. The Backups page marks
+> those **Files only**, and restoring one warns you before it starts. Take a fresh backup if you
+> want one that includes your content.
+
+The site's Nginx configuration is not in the tarball; the panel rewrites it from its own records.
+
+### What is inside the archive
+
+```
+./                             the site's document root, exactly as it is on disk
+.dockpanel-backup/manifest.json  what this archive holds
+.dockpanel-backup/db/*.sql.gz    one compressed dump per database
+```
+
+The `.dockpanel-backup` directory is DockPanel's own; it is extracted separately during a restore
+and never lands in your document root.
+
+A database that could not be dumped is **not** silently skipped: the backup reports which ones are
+missing, the Backups page shows the archive as incomplete, and a restore tells you before it runs.
 
 ### From the CLI
 
@@ -28,9 +47,20 @@ dockpanel backup create example.com
 Sample output:
 
 ```
-Backup created: example.com_2026-03-20_143022.tar.gz (45.2 MB)
-Location: /var/backups/dockpanel/example.com/example.com_2026-03-20_143022.tar.gz
+Creating backup for example.com...
+✓ Backup created
+  File:    example.com-20260320-143022.tar.gz
+  Size:    45.2 MB
+  Content: files only
+
+! This archive contains the site's files but NOT its databases.
+  The CLI talks to the agent directly and cannot resolve a site's databases.
+  Create the backup from the panel (or the panel API) to include them.
 ```
+
+> **CLI backups are files only.** The CLI authenticates to the agent, and the agent has no access
+> to the panel's database records — it cannot know which databases belong to a site or hold their
+> credentials. Only the panel can assemble a complete backup.
 
 ### List Backups
 
@@ -99,11 +129,21 @@ Once a destination is configured, edit your backup schedule and select it as the
 3. Click **Restore**
 4. Confirm the restore
 
-The restore replaces the site's files with the backup contents. It does **not** touch the
-database, so a site restored after a database problem comes back with its files intact and its
-content unchanged — restore the database separately if that is what went wrong. The current
-state is not automatically backed up before restore -- create a manual backup first if you want
-a safety net.
+The restore replaces the site's files with the backup contents, then loads each database dump the
+archive carries **over the live database**, dropping and recreating its tables. The current state
+is not automatically backed up before a restore — create a manual backup first if you want a
+safety net.
+
+Files are restored first and databases last. A database load that fails rolls back, so the live
+data is left as it was rather than half-overwritten.
+
+Two outcomes are reported honestly rather than as a success:
+
+- **The archive has no database** (it was made before v2.34.0, or its dump failed) and the site
+  has one. You are told before the restore starts that the content will not come back.
+- **The files were restored but a database could not be.** This is called out as a failure, not a
+  success with a footnote — the site is at that point running restored files against its previous
+  content, and you need to know that.
 
 ### From the CLI
 
@@ -115,10 +155,14 @@ Sample output:
 
 ```
 Restoring example.com from example.com_2026-03-20_143022.tar.gz...
-  [1/2] Extracting files...
-  [2/2] Reloading services...
-Restore complete.
+✓ Backup restored
+  Content: files only (this archive holds no database)
 ```
+
+> **The CLI cannot restore databases.** It authenticates to the agent, which has no access to the
+> panel's database records and so cannot be given the site's database credentials. Restoring an
+> archive that carries database dumps therefore **fails** from the CLI rather than restoring the
+> files and reporting success. Use the panel for those.
 
 ## Delete a Backup
 

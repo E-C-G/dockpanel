@@ -4,6 +4,42 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.34.0] - 2026-07-26
+
+### Added
+
+- **Site backups now contain the site's databases.** A backup was a `tar` of the document root and
+  nothing else, so restoring a WordPress site returned its files and not one post, page, comment or
+  setting — and the panel reported it as a success. Each of the site's databases is now dumped into
+  the same archive, under `.dockpanel-backup/db/`, alongside a manifest describing what is inside.
+  Restoring puts the files back and then loads each dump over the live database. Verified on a fresh
+  server the way the gap was found: a published post was deleted and came back.
+
+### Fixed
+
+- **Restoring a MySQL or MariaDB database never worked.** The restore ran `mysql` inside the
+  database container, but DockPanel provisions `mariadb:11`, which no longer ships the mysql-named
+  client symlinks — so every restore failed with "executable file not found" while the *dump* half,
+  which correctly calls `mariadb-dump`, worked fine. Every sibling call site in the codebase already
+  used `mariadb`; this one did not. Affected the Databases page, the backup orchestrator, and
+  scheduled restores.
+- **A restore that lost your database no longer reports success.** Files restored + database not is
+  now a failure that names what happened, because at that point the site is running restored files
+  against its previous content. A backup that could not dump a database says so at creation time and
+  is marked incomplete in the backups list, so "is my content in here?" is answerable before you
+  need the answer. A database restore that fails with no error output reports the exit status
+  instead of a bare "restore failed:".
+- **Restoring an older backup warns first.** Archives made before 2.34.0 hold no database. Restoring
+  one onto a site that has one now says so before it starts rather than quietly leaving the content
+  as it was.
+
+### Changed
+
+- The `dockpanel backup` CLI states that its archives contain files only, and why: it authenticates
+  to the agent, which has no access to the panel's database records. Restoring an archive that
+  carries database dumps fails from the CLI rather than restoring the files and calling it done. The
+  documented sample output for both commands now matches what the CLI actually prints.
+
 ## [2.33.0] - 2026-07-26
 
 ### Fixed
