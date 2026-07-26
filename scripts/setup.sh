@@ -475,8 +475,12 @@ install_docker() {
         case "$DOCKER_OS_ID" in
             rocky|almalinux|centos|rhel|ol)
                 docker_repo_rhel_clone
-                # --allowerasing: the stock images ship podman's `runc`, which
-                # containerd.io replaces; without it dnf aborts the transaction.
+                # --allowerasing is precautionary, not load-bearing: a stock
+                # rockylinux:9 has no conflicting runtime and installs fine
+                # without it (checked). It is here because RHEL-family CLOUD
+                # images commonly preinstall podman/runc, which containerd.io
+                # obsoletes — and dnf aborts the whole transaction on a conflict
+                # rather than substituting.
                 run "Installing Docker (docker-ce, el-clone repo)" \
                     bash -c 'dnf install -y --allowerasing docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
                 ;;
