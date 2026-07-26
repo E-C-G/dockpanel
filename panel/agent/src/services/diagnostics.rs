@@ -549,11 +549,15 @@ async fn check_log_patterns() -> Vec<DiagnosticFinding> {
         }
     }
 
-    // Check auth.log for brute force patterns (last 500 lines)
+    // Check SSH logs for brute force patterns (last 2 hours)
     if let Ok(Ok(output)) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        safe_command("tail")
-            .args(["-n", "500", "/var/log/auth.log"])
+        safe_command("journalctl")
+            .args([
+                "-u", "ssh",
+                "--since", "2 hours ago",
+                "--no-pager",
+            ])
             .output(),
     )
     .await
@@ -569,7 +573,7 @@ async fn check_log_patterns() -> Vec<DiagnosticFinding> {
                 id: "log-ssh-bruteforce".into(),
                 category: "logs".into(),
                 severity: "critical".into(),
-                title: format!("{failed_ssh} failed SSH login attempts in recent logs"),
+                title: format!("{failed_ssh} failed SSH login attempts in the last 2 hours"),
                 description: "Possible brute force attack. Ensure fail2ban is active.".into(),
                 fix_available: true,
                 fix_id: Some("restart-service:fail2ban".into()),
@@ -579,7 +583,7 @@ async fn check_log_patterns() -> Vec<DiagnosticFinding> {
                 id: "log-ssh-failures".into(),
                 category: "logs".into(),
                 severity: "warning".into(),
-                title: format!("{failed_ssh} failed SSH login attempts in recent logs"),
+                title: format!("{failed_ssh} failed SSH login attempts in the last 2 hours"),
                 description: "Monitor for brute force patterns.".into(),
                 fix_available: false,
                 fix_id: None,
