@@ -48,23 +48,48 @@ struct InstallResponse {
 
 /// Check if a PHP-FPM version is installed.
 ///
-/// On RPM boxes there is one `php-fpm` package rather than one per version,
-/// so `services::pkg` collapses every `php{v}-fpm` onto it — a `true` there
-/// means "some PHP-FPM is installed". `socket_exists` below is what actually
-/// distinguishes the versions on either family.
+/// On RPM boxes there is one `php-fpm` package rather than one per version, so
+/// `services::pkg::is_installed` collapses every `php{v}-fpm` onto it — a
+/// `true` there means "some PHP-FPM is installed", which is the wrong question
+/// for a page that lists five versions.
+///
+/// Asking it anyway reported **every** offered version as installed on a RHEL
+/// box. So on that family the real installed version is read from the package
+/// database and compared; on apt the per-version packages answer directly.
 async fn is_installed(version: &str) -> bool {
+    if let Some(actual) = crate::services::pkg::installed_php_version().await {
+        return actual == version;
+    }
     crate::services::pkg::is_installed(&format!("php{version}-fpm")).await
 }
 
-/// Check if a PHP-FPM socket file exists.
-fn socket_exists(version: &str) -> bool {
-    std::path::Path::new(&format!("/run/php/php{version}-fpm.sock")).exists()
+/// Check if a PHP-FPM socket file exists for THIS version.
+///
+/// The two families put it in different places, and only the Debian one was
+/// ever checked: RHEL's php-fpm listens on `/run/php-fpm/www.sock` — one
+/// socket, unversioned, like the package and the unit.
+///
+/// That unversioned path is why this takes the trouble to confirm the version
+/// first. A bare `exists()` on it would answer `true` for every version in the
+/// list the moment any PHP was running — the same collapse the caller above
+/// just had to undo, one layer down.
+async fn socket_exists(version: &str) -> bool {
+    if std::path::Path::new(&format!("/run/php/php{version}-fpm.sock")).exists() {
+        return true;
+    }
+    match crate::services::pkg::installed_php_version().await {
+        Some(actual) => {
+            actual == version && std::path::Path::new("/run/php-fpm/www.sock").exists()
+        }
+        None => false,
+    }
 }
 
 /// Check if PHP-FPM service is active.
 async fn is_fpm_running(version: &str) -> bool {
+    let unit = crate::services::pkg::service_name(&format!("php{version}-fpm")).await;
     safe_command("systemctl")
-        .args(["is-active", "--quiet", &format!("php{version}-fpm")])
+        .args(["is-active", "--quiet", &unit])
         .output()
         .await
         .map(|o| o.status.success())
@@ -78,7 +103,7 @@ async fn list_versions() -> Json<PhpListResponse> {
     for &v in ALLOWED_VERSIONS {
         let installed = is_installed(v).await;
         let fpm_running = if installed {
-            is_fpm_running(v).await || socket_exists(v)
+            is_fpm_running(v).await || socket_exists(v).await
         } else {
             false
         };
@@ -92,6 +117,61 @@ async fn list_versions() -> Json<PhpListResponse> {
     }
 
     Json(PhpListResponse { versions })
+}
+
+/// Install a PHP version on the RHEL family by selecting its module stream.
+///
+/// The version is chosen BEFORE the install, because `dnf install php-fpm` with
+/// no stream enabled resolves to the non-modular base package — PHP 8.0 on
+/// Rocky 9, older than every stream the box offers and long end-of-life, with
+/// nothing in the UI to say so.
+async fn install_version_rpm(
+    version: &str,
+) -> Result<Json<InstallResponse>, (StatusCode, Json<InstallResponse>)> {
+    use crate::services::pkg;
+
+    let fail = |msg: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(InstallResponse { success: false, message: msg, version: version.to_string() }),
+        )
+    };
+
+    tracing::info!("Installing PHP {version} from its module stream");
+    pkg::enable_php_stream(version)
+        .await
+        .map_err(|e| fail(format!("Could not select PHP {version}: {e}")))?;
+
+    let core = [
+        format!("php{version}-fpm"),
+        format!("php{version}-cli"),
+    ];
+    let core_refs: Vec<&str> = core.iter().map(String::as_str).collect();
+    pkg::install(&core_refs)
+        .await
+        .map_err(|e| fail(format!("PHP {version} install failed: {e}")))?;
+
+    let exts: Vec<String> = COMMON_EXTENSIONS
+        .iter()
+        .map(|e| format!("php{version}-{e}"))
+        .collect();
+    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+    let skipped = pkg::install_available(&ext_refs)
+        .await
+        .map_err(|e| fail(format!("PHP {version} extension install failed: {e}")))?;
+    if !skipped.is_empty() {
+        tracing::info!("PHP {version}: no candidate for {}", skipped.join(" "));
+    }
+
+    let unit = pkg::service_name(&format!("php{version}-fpm")).await;
+    let _ = safe_command("systemctl").args(["enable", &unit]).output().await;
+    let _ = safe_command("systemctl").args(["restart", &unit]).output().await;
+
+    Ok(Json(InstallResponse {
+        success: true,
+        message: format!("PHP {version} installed and started"),
+        version: version.to_string(),
+    }))
 }
 
 /// POST /php/install — Install a PHP version with common extensions.
@@ -118,6 +198,32 @@ async fn install_version(
             message: format!("PHP {version} is already installed"),
             version: version.to_string(),
         }));
+    }
+
+    // The RHEL family selects a PHP version by enabling a module stream, not by
+    // installing a versioned package, so everything below this point — the
+    // apt-cache probe, deb.sury.org, ppa:ondrej/php — is Debian machinery.
+    // This whole file had NO family guard before s266, so on a RHEL box every
+    // handler here failed with a raw "Failed to find executable apt-get": the
+    // same defect s265 fixed in the service installers and did not reach here.
+    let streams = crate::services::pkg::php_streams().await;
+    if !streams.is_empty() {
+        if !streams.iter().any(|s| s == version) {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(InstallResponse {
+                    success: false,
+                    message: format!(
+                        "PHP {version} is not offered by this system's package repositories. \
+                         Available versions here: {}. (Other versions would need the third-party \
+                         remi repository, which DockPanel does not configure.)",
+                        streams.join(", ")
+                    ),
+                    version: version.to_string(),
+                }),
+            ));
+        }
+        return install_version_rpm(version).await;
     }
 
     // Ensure php{version}-fpm is available from some apt source. On Debian 13
@@ -332,21 +438,46 @@ async fn list_extensions(Path(version): Path<String>) -> Result<Json<serde_json:
         .map(|l| l.trim().to_lowercase())
         .collect();
 
-    // List available (installable) extensions
-    let avail_output = safe_command("apt-cache")
-        .args(["search", &format!("php{version}-")])
-        .output().await;
+    // List available (installable) extensions. The query differs per family and
+    // so does the prefix to strip: Debian's packages are `php8.3-gd`, the RHEL
+    // family's are `php-gd`. Asking apt-cache on a dnf box does not error
+    // loudly — `.ok()` swallows it and the operator simply sees an empty list
+    // of extensions they could install, with nothing saying why.
+    let rpm = crate::services::pkg::manager().await == crate::services::pkg::PkgMgr::Rpm;
+    let (prefix, avail_output) = if rpm {
+        (
+            "php-".to_string(),
+            safe_command("dnf")
+                .args(["-q", "list", "--available", "php-*"])
+                .output()
+                .await,
+        )
+    } else {
+        (
+            format!("php{version}-"),
+            safe_command("apt-cache")
+                .args(["search", &format!("php{version}-")])
+                .output()
+                .await,
+        )
+    };
 
-    let available: Vec<String> = avail_output.ok()
+    let mut available: Vec<String> = avail_output.ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines()
             .filter_map(|l| {
                 let pkg = l.split_whitespace().next()?;
-                let ext = pkg.strip_prefix(&format!("php{version}-"))?;
-                if ["common", "cli", "fpm", "dev", "dbg"].contains(&ext) { return None; }
+                // dnf prints `php-gd.x86_64`; apt-cache prints a bare name.
+                let pkg = pkg.split('.').next().unwrap_or(pkg);
+                let ext = pkg.strip_prefix(prefix.as_str())?;
+                if ext.is_empty() || ["common", "cli", "fpm", "dev", "dbg", "devel"].contains(&ext) {
+                    return None;
+                }
                 Some(ext.to_string())
             })
             .collect())
         .unwrap_or_default();
+    available.sort();
+    available.dedup();
 
     Ok(Json(serde_json::json!({ "installed": extensions, "available": available, "version": version })))
 }
@@ -367,25 +498,13 @@ async fn install_extension(Json(body): Json<serde_json::Value>) -> Result<Json<s
     let package = format!("php{version}-{extension}");
     tracing::info!("Installing PHP extension: {package}");
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        safe_command_unsandboxed("apt-get", &[])
-            .args(["install", "-y", &package])
-            .output()
-    ).await
-        .map_err(|_| php_api_err(StatusCode::GATEWAY_TIMEOUT, "Install timed out"))?
-        .map_err(|e| php_api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
+    crate::services::pkg::install(&[&package])
+        .await
+        .map_err(|e| php_api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Install failed: {e}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = &stderr[..200.min(stderr.len())];
-        return Err(php_api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Install failed: {msg}")));
-    }
-
-    // Restart PHP-FPM
-    let _ = safe_command("systemctl")
-        .args(["restart", &format!("php{version}-fpm")])
-        .output().await;
+    // Restart PHP-FPM under whichever unit name this family uses.
+    let unit = crate::services::pkg::service_name(&format!("php{version}-fpm")).await;
+    let _ = safe_command("systemctl").args(["restart", &unit]).output().await;
 
     tracing::info!("PHP extension installed: {package}");
     Ok(Json(serde_json::json!({ "ok": true, "package": package })))
@@ -418,23 +537,25 @@ async fn uninstall_version(
     }
 
     // 1. Stop and disable FPM service
-    let _ = safe_command("systemctl")
-        .args(["stop", &format!("php{version}-fpm")])
-        .output()
-        .await;
-    let _ = safe_command("systemctl")
-        .args(["disable", &format!("php{version}-fpm")])
-        .output()
-        .await;
+    let unit = crate::services::pkg::service_name(&format!("php{version}-fpm")).await;
+    let _ = safe_command("systemctl").args(["stop", &unit]).output().await;
+    let _ = safe_command("systemctl").args(["disable", &unit]).output().await;
 
-    // 2. Purge all php{version}-* packages
+    // 2. Purge all PHP packages for this version. The glob is family-specific
+    // and stays out of `pkg::remove`, which translates package NAMES — a glob
+    // is not a name, and putting one through the map yields a pattern matching
+    // nothing. Debian's packages are versioned; the RHEL family's are not, so
+    // removing "this version" there means removing PHP.
     tracing::info!("Uninstalling PHP {version}...");
+    let purge_cmd = if crate::services::pkg::manager().await == crate::services::pkg::PkgMgr::Rpm {
+        "dnf remove -y 'php-*' 2>&1".to_string()
+    } else {
+        format!("apt-get purge -y php{version}-* 2>&1")
+    };
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
         safe_command_unsandboxed("bash", &[])
-            .args(["-c", &format!(
-                "apt-get purge -y php{version}-* 2>&1"
-            )])
+            .args(["-c", &purge_cmd])
             .output(),
     )
     .await;
@@ -476,14 +597,17 @@ async fn uninstall_version(
         ));
     }
 
-    // 3. Autoremove
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        safe_command_unsandboxed("bash", &[])
-            .args(["-c", "apt-get autoremove -y 2>&1"])
-            .output(),
-    )
-    .await;
+    // 3. Autoremove. apt leaves orphans behind after a purge; dnf's `remove`
+    // already takes unused dependencies with it, so there is nothing to call.
+    if crate::services::pkg::manager().await != crate::services::pkg::PkgMgr::Rpm {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            safe_command_unsandboxed("bash", &[])
+                .args(["-c", "apt-get autoremove -y 2>&1"])
+                .output(),
+        )
+        .await;
+    }
 
     tracing::info!("PHP {version} uninstalled");
 

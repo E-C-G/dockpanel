@@ -238,13 +238,171 @@ else
 fi
 
 echo
-echo "── 7. An apt-only installer says so ──"
+echo "── 7. The refusals that remain are TRUE, and the one that must remain does ──"
 
-if grep -q 'apt_only_reason' panel/agent/src/services/pkg.rs 2>/dev/null && \
-   grep -q 'apt_only_reason' panel/agent/src/routes/service_installer.rs; then
-  ok "optional-service installers refuse with a stated limitation on non-apt boxes"
+# s266 gave most optional-service installers a real dnf path, so the blanket
+# apt-only refusal is gone. A refusal that has stopped being true is worse than
+# no refusal, so the rename must be COMPLETE — a surviving call would be a
+# handler still claiming a limitation the code below it no longer has.
+if grep -rq 'apt_only_reason' panel/agent/src 2>/dev/null; then
+  bad "apt_only_reason still has callers — s266 replaced it, so any survivor is a handler refusing for a reason that is no longer true"
 else
-  bad "the apt-only guard is gone — on the RHEL family these endpoints fail with 'Failed to find executable apt-get', which tells the operator nothing"
+  ok "the blanket apt-only refusal is gone everywhere, not just where it was convenient"
+fi
+
+# Extract a top-level Rust fn body: from its signature to the closing brace in
+# column 0. Used below so assertions are about CALL SITES rather than about a
+# symbol existing somewhere in the file — s265 shipped two pins that checked a
+# function was *defined* and would have sat green through the exact regression
+# they named.
+fn_body() { awk -v pat="fn $2(" 'index($0, pat) { inside=1 } inside { print; if ($0 == "}") exit }' "$1"; }
+
+SI=panel/agent/src/routes/service_installer.rs
+PKG=panel/agent/src/services/pkg.rs
+PHP=panel/agent/src/routes/php.rs
+
+# THE ONE REFUSAL THAT MUST SURVIVE. UFW is installable from EPEL, so "the
+# package exists" is true and beside the point: the RHEL family boots with
+# firewalld enforcing, and s265's outage was setup.sh installing ufw beside it
+# and opening 80/443 in the filter nobody consults — panel unreachable, ACME
+# challenge unfetchable, no certificate. Giving this button a dnf path would
+# make that outage reachable by one click.
+UFW_BODY=$(fn_body "$SI" install_ufw)
+if printf '%s' "$UFW_BODY" | grep -q 'ufw_refusal_reason'; then
+  ok "install_ufw still asks whether UFW is the right firewall for this box"
+else
+  bad "install_ufw no longer calls ufw_refusal_reason — on the RHEL family this reinstates the s265 two-firewalls outage, with the panel unreachable and no certificate"
+fi
+
+# Positional: the refusal must come BEFORE the install, or it refuses nothing.
+refuse_ln=$(printf '%s\n' "$UFW_BODY" | grep -n 'ufw_refusal_reason' | head -1 | cut -d: -f1)
+inst_ln=$(printf '%s\n'  "$UFW_BODY" | grep -n 'pkg::install'        | head -1 | cut -d: -f1)
+if [ -n "$refuse_ln" ] && [ -n "$inst_ln" ] && [ "$refuse_ln" -lt "$inst_ln" ]; then
+  ok "install_ufw refuses before it installs, not after"
+elif [ -z "$inst_ln" ]; then
+  bad "install_ufw no longer installs anything — this pin can no longer see the ordering it exists to protect"
+else
+  bad "install_ufw installs UFW before deciding whether it should — the guard runs too late to prevent anything"
+fi
+
+# The refusal must be driven by what is RUNNING, not by the package database.
+if fn_body "$PKG" ufw_refusal_reason | grep -q 'firewall::detect'; then
+  ok "the UFW refusal is decided by the firewall actually running, not by the distro name"
+else
+  bad "ufw_refusal_reason no longer consults firewall::detect — it is guessing from the package manager instead of from what holds the rules"
+fi
+
+echo
+echo "── 8. Package operations dispatch on the real manager ──"
+
+# Every optional-service installer must go through the abstraction. Counting
+# guarded-vs-total positionally means adding a NEW installer that shells apt
+# directly fails this, rather than the pin passing because the others are fine.
+INSTALLERS='install_php install_certbot install_fail2ban install_powerdns install_redis install_nodejs install_waf install_cloudflared'
+total=0 routed=0 unrouted=''
+for f in $INSTALLERS; do
+  total=$((total+1))
+  body=$(fn_body "$SI" "$f")
+  if printf '%s' "$body" | grep -qE 'pkg::(install|install_available|add_repo)'; then
+    routed=$((routed+1))
+  else
+    unrouted="$unrouted $f"
+  fi
+done
+if [ "$routed" -eq "$total" ]; then
+  ok "all $total optional-service installers install through services::pkg ($routed/$total)"
+else
+  bad "these installers bypass services::pkg and will fail on any non-apt box:$unrouted ($routed/$total routed)"
+fi
+
+# THE END-OF-LIFE PHP PIN. `dnf install php-fpm` with no stream enabled resolves
+# to the non-modular base package — PHP 8.0.30 on Rocky 9, older than every
+# stream the box offers and end-of-life since 2023 — while the Services page
+# reports PHP installed and running. The stream must be selected FIRST.
+PHP_BODY=$(fn_body "$SI" install_php)
+stream_ln=$(printf '%s\n' "$PHP_BODY" | grep -n 'enable_php_stream' | head -1 | cut -d: -f1)
+pinst_ln=$(printf '%s\n'  "$PHP_BODY" | grep -n 'pkg::install'      | head -1 | cut -d: -f1)
+if [ -n "$stream_ln" ] && [ -n "$pinst_ln" ] && [ "$stream_ln" -lt "$pinst_ln" ]; then
+  ok "install_php selects the PHP module stream before installing, not after"
+else
+  bad "install_php installs PHP without first enabling a module stream — on Rocky 9 that silently installs end-of-life PHP 8.0 while reporting success"
+fi
+
+# A package name and a systemd unit name are different strings that merely
+# coincide on Debian. Translating one and not the other installs the right
+# package and then enables a unit that is not there.
+REDIS_BODY=$(fn_body "$SI" install_redis)
+if printf '%s' "$REDIS_BODY" | grep -q 'service_name' && \
+   ! printf '%s' "$REDIS_BODY" | grep -qE '"(enable|start)", *"redis-server"'; then
+  ok "install_redis enables the translated unit name, not the hardcoded Debian one"
+else
+  bad "install_redis enables a hardcoded redis-server unit — that unit does not exist on the RHEL family, so Redis installs and never starts"
+fi
+
+# php.rs was the surface s265's refusal layer never reached: no family guard at
+# all, so every handler failed with a raw "Failed to find executable apt-get".
+if fn_body "$PHP" install_version | grep -q 'php_streams'; then
+  ok "php.rs install_version branches on the package family before reaching apt machinery"
+else
+  bad "php.rs install_version has no family guard — on the RHEL family it falls through to apt-cache/ppa:ondrej and fails with 'Failed to find executable apt-get'"
+fi
+
+# The PHP page must not report every offered version as installed just because
+# the RPM family collapses them onto one package.
+if grep -q 'installed_php_version' "$PHP"; then
+  ok "php.rs distinguishes PHP versions on a family that ships only one package"
+else
+  bad "php.rs asks the collapsed package query per version — on the RHEL family that reports ALL offered versions as installed"
+fi
+
+# A missing file that SKIPS is worse than one that fails: the PowerDNS schema
+# path is distro-specific, and both old branches were [ -f ]-guarded, so a miss
+# left an empty database behind a successful install.
+if fn_body "$SI" install_powerdns | grep -q 'schema not found'; then
+  ok "the PowerDNS SQLite schema load fails loudly when no known schema path matches"
+else
+  bad "the PowerDNS schema load can silently skip — the install reports success, pdns starts, and the DNS server answers nothing"
+fi
+
+# Name-map completeness for the entries that were missing and would fail
+# SILENTLY (the extension loop tolerates absent packages by design, so an
+# unmapped name is skipped without erroring).
+#
+# This asserts the ARROW, inside the mapping functions only. The first version
+# of this check grepped the whole file for the package name and PASSED the
+# mutation test — the string still appeared in a doc comment and in the unit
+# tests after the match arm was deleted. A pin that matches its own prose is
+# the source-pin trap, and it would have sat green through the regression it
+# names.
+# Flattened to one line: a multi-name arm puts its target on the NEXT line
+# ("a" | "b" | "c" => {\n "target"\n }), which a line-oriented match cannot see.
+MAPS=$( { fn_body "$PKG" rpm_name; fn_body "$PKG" php_rpm_name; } | grep -v '^\s*//' | tr '\n' ' ')
+map_missing=''
+while IFS='|' read -r from to; do
+  [ -z "$from" ] && continue
+  printf '%s' "$MAPS" | grep -qE "\"$from\"[^=]*=>[^,]*\"$to\"" || map_missing="$map_missing $from"
+done <<'ARROWS'
+pdns-backend-pgsql|pdns-backend-postgresql
+pdns-backend-sqlite3|pdns-backend-sqlite
+libnginx-mod-http-modsecurity|nginx-mod-modsecurity
+mysql|php-mysqlnd
+zip|php-pecl-zip
+ARROWS
+if [ -z "$map_missing" ]; then
+  ok "the RPM name map still translates the packages whose Debian spellings match nothing there"
+else
+  bad "these names no longer map, and an unmapped name is SKIPPED rather than erroring, so the capability goes missing in silence:$map_missing"
+fi
+
+# NodeSource and Cloudflare both publish per-family repos. The agent used to
+# fetch the deb script on every distro while setup.sh already branched.
+ADDREPO=$(fn_body "$PKG" add_repo)
+if printf '%s' "$ADDREPO" | grep -q 'rpm.nodesource.com' && \
+   printf '%s' "$ADDREPO" | grep -q 'deb.nodesource.com' && \
+   ! grep -q 'deb.nodesource.com' "$SI"; then
+  ok "the NodeSource repo is chosen per family, and no installer hardcodes the deb one"
+else
+  bad "the NodeSource repo choice is not family-branched — an RPM box gets the Debian setup script, which is the half-migration s265 deliberately left alone"
 fi
 
 echo

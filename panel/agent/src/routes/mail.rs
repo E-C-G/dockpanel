@@ -176,34 +176,43 @@ async fn mail_status() -> Result<Json<serde_json::Value>, ApiErr> {
 }
 
 async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
-    // The mail stack is installed with apt below. Say so plainly rather than
-    // letting the operator read "Failed to find executable apt-get".
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing the mail server").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing the mail server").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
+    // The packages resolve on the RHEL family, but nothing past them has been
+    // driven there. Refusing is the honest answer until it has been — see the
+    // reason's own comment for why a half-configured mail stack is worse than
+    // an absent one.
+    if let Some(why) = pkg::mail_refusal_reason().await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Starting mail server installation...");
 
     // 1. Install packages.
-    // Must be unsandboxed so apt can write /var/lib/dpkg/lock-frontend (the
-    // agent unit's ProtectSystem=strict makes /var/lib/dpkg read-only inside
-    // the namespace, which leaves apt with "Not using locking for read only
-    // lock file" warnings followed by chown failures). Same #54-A pattern
-    // applied to vmail useradd/groupadd below — the apt-get call was missed.
-    // (issue #57 follow-up from WiskeyPapa, v2.8.19)
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        safe_command_unsandboxed("apt-get", &[])
-            .args(["-o", "Dpkg::Options::=--force-confnew", "install", "-y",
-                   "postfix", "dovecot-imapd", "dovecot-pop3d", "dovecot-lmtpd", "opendkim", "opendkim-tools"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Mail package installation timed out (300s)"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Package install failed: {}", stderr.chars().take(200).collect::<String>())));
-    }
+    // The transaction runs unsandboxed so the package manager can take its own
+    // locks — the agent unit's ProtectSystem=strict makes /var/lib/dpkg
+    // read-only inside the namespace, which left apt with "Not using locking
+    // for read only lock file" warnings followed by chown failures. Same #54-A
+    // pattern as the vmail useradd/groupadd below. (issue #57 follow-up from
+    // WiskeyPapa, v2.8.19.)
+    //
+    // Debian splits Dovecot into one package per protocol while the RHEL family
+    // ships a single `dovecot`, so all three names collapse to one there —
+    // handled by the name map rather than by branching here.
+    pkg::install(&[
+        "postfix",
+        "dovecot-imapd",
+        "dovecot-pop3d",
+        "dovecot-lmtpd",
+        "opendkim",
+        "opendkim-tools",
+    ])
+    .await
+    .map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Package install failed: {e}"))
+    })?;
 
     // 2. Create vmail user (uid/gid 5000).
     // groupadd/useradd write /etc/passwd, /etc/shadow, /etc/group — all too

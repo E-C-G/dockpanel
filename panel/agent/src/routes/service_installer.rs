@@ -105,60 +105,98 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── PHP installer ───────────────────────────────────────────────────────
 
 async fn install_php() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing PHP").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing PHP").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing PHP...");
 
-    // Detect best PHP version available
-    let version = detect_available_php().await.unwrap_or_else(|| "8.3".to_string());
+    // Version selection is the one part that genuinely differs by family.
+    // apt picks a version out of the archive; dnf resolves `php-fpm` to the
+    // NON-modular base package unless a module stream is enabled first — which
+    // on Rocky 9 means PHP 8.0, older than every stream the box offers and
+    // end-of-life since 2023, installed silently under a green status (s266).
+    let streams = pkg::php_streams().await;
+    let version = if streams.is_empty() {
+        detect_available_php().await.unwrap_or_else(|| "8.3".to_string())
+    } else {
+        // Honour the distro's newest stream. `detect_available_php` probes
+        // apt-cache and cannot answer here, so it is not consulted.
+        let chosen = streams[0].clone();
+        pkg::enable_php_stream(&chosen).await.map_err(|e| {
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not select PHP {chosen}: {e}"))
+        })?;
+        chosen
+    };
 
-    // Core first (must succeed), then only the extensions this apt source
-    // has a real install candidate for — newer PHP releases build some in
-    // (8.5 absorbed opcache), and one candidate-less package name fails the
-    // entire apt transaction.
-    let install_cmd = format!(
-        "set -e; export DEBIAN_FRONTEND=noninteractive; \
-         apt-get -o Dpkg::Options::=--force-confnew install -y php{v}-fpm php{v}-cli; \
-         avail=''; \
-         for e in mysql pgsql sqlite3 curl gd mbstring xml zip bcmath intl readline opcache; do \
-             p=\"php{v}-$e\"; \
-             c=$(apt-cache policy \"$p\" 2>/dev/null | sed -n 's/^  Candidate: //p'); \
-             if [ -n \"$c\" ] && [ \"$c\" != '(none)' ]; then avail=\"$avail $p\"; fi; \
-         done; \
-         if [ -n \"$avail\" ]; then apt-get -o Dpkg::Options::=--force-confnew install -y $avail; fi",
-        v = version
-    );
+    // Core first (must succeed), then only the extensions this box has a real
+    // candidate for. Both families need that split: one uninstallable name
+    // fails the ENTIRE transaction on apt (Lesson #73) and equally on dnf,
+    // which answers a missing package with "Unable to find a match" and
+    // installs nothing.
+    let core = [format!("php{version}-fpm"), format!("php{version}-cli")];
+    let core_refs: Vec<&str> = core.iter().map(String::as_str).collect();
+    pkg::install(&core_refs).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PHP install failed: {e}"))
+    })?;
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", &install_cmd])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PHP install timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PHP install failed: {}", stderr.chars().take(300).collect::<String>())));
+    let exts: Vec<String> = [
+        "mysql", "pgsql", "sqlite3", "curl", "gd", "mbstring",
+        "xml", "zip", "bcmath", "intl", "readline", "opcache",
+    ]
+    .iter()
+    .map(|e| format!("php{version}-{e}"))
+    .collect();
+    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+    let skipped = pkg::install_available(&ext_refs).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PHP extension install failed: {e}"))
+    })?;
+    if !skipped.is_empty() {
+        // Not a failure: newer PHP builds some of these in (8.5 absorbed
+        // opcache) and the RHEL family provides curl/sqlite3/json from
+        // php-common. Logged so an operator asking "where is my zip extension"
+        // has an answer.
+        tracing::info!("PHP extensions with no candidate here, skipped: {}", skipped.join(" "));
     }
 
-    // Enable and start PHP-FPM
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["enable", &format!("php{version}-fpm")]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["start", &format!("php{version}-fpm")]).output()).await;
+    // The UNIT name is a separate translation from the PACKAGE name — on the
+    // RHEL family the package set is unversioned and so is the unit, so
+    // enabling `php8.3-fpm` there would enable nothing at all.
+    let unit = pkg::service_name(&format!("php{version}-fpm")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["enable", &unit]).output()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["start", &unit]).output()).await;
 
-    tracing::info!("PHP {version} installed");
+    tracing::info!("PHP {version} installed (unit {unit})");
     Ok(ok(&format!("PHP {version} with FPM installed and started")))
 }
 
 // ── Certbot installer ───────────────────────────────────────────────────
 
 async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Certbot").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing Certbot").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing Certbot...");
+
+    // On the RHEL family EPEL packages certbot and its nginx plugin directly.
+    // The snap-then-pip ladder below is a Debian/Ubuntu strategy for getting a
+    // 4.x certbot with ARI support; snap is not the idiomatic route here, and
+    // the whole ladder was unreachable anyway because the guard refused before
+    // any of it ran — this refusal was over-broad, since its only apt call is
+    // `python3-venv` inside the *fallback*.
+    if pkg::manager().await == pkg::PkgMgr::Rpm {
+        pkg::install(&["certbot", "python3-certbot-nginx"]).await.map_err(|e| {
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Certbot install failed: {e}"))
+        })?;
+        // EPEL ships a renewal timer with the package.
+        let _ = tokio::time::timeout(Duration::from_secs(30),
+            safe_command("systemctl").args(["enable", "--now", "certbot-renew.timer"]).output()).await;
+        tracing::info!("Certbot installed from EPEL with the nginx plugin");
+        return Ok(ok("Certbot installed with the nginx plugin and automatic renewal"));
+    }
 
     // Remove old apt-based certbot first (if present) to avoid conflicts
     let _ = tokio::time::timeout(
@@ -237,39 +275,54 @@ async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
 
 // ── UFW installer ───────────────────────────────────────────────────────
 
+/// Install UFW — on Debian/Ubuntu only, **deliberately**.
+///
+/// This is the one installer s266 did NOT give a `dnf` path, and the reason is
+/// the s265 outage: the RHEL family boots with **firewalld** enforcing, and
+/// installing UFW beside it produces two rule sets where the one nobody
+/// configured is the one the kernel consults. That is how a box ended up with
+/// 80/443 "open" in ufw, unreachable in practice, and no certificate — because
+/// Let's Encrypt could not fetch the ACME challenge either.
+///
+/// UFW *is* installable from EPEL, so "the package exists" is true and beside
+/// the point. Ports are opened through [`crate::services::firewall`], which
+/// speaks to whichever filter is actually running, so refusing costs nothing.
 async fn install_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing UFW").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing UFW").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
+    if let Some(why) = pkg::ufw_refusal_reason().await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing UFW...");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y ufw"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "UFW install timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("UFW install failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::install(&["ufw"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("UFW install failed: {e}"))
+    })?;
 
     // Configure default rules
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["default", "deny", "incoming"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["default", "allow", "outgoing"]).output()).await;
 
-    // Open essential ports
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["allow", "22/tcp"]).output()).await;   // SSH
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["allow", "80/tcp"]).output()).await;   // HTTP
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["allow", "443/tcp"]).output()).await;  // HTTPS
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["allow", "587/tcp"]).output()).await;  // SMTP submission
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["allow", "993/tcp"]).output()).await;  // IMAPS
+    // Open essential ports. Routed through the firewall service rather than
+    // `ufw` directly so the result is a fact we can report instead of assume —
+    // `open_mail_ports()` used to discard every result and log success anyway.
+    let failed = crate::services::firewall::allow_tcp_ports(
+        &["22", "80", "443", "587", "993"],
+    ).await;
 
     // Enable (--force to skip interactive prompt)
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").args(["--force", "enable"]).output()).await;
+
+    if !failed.is_empty() {
+        tracing::warn!("UFW installed but these ports could not be opened: {}", failed.join(" "));
+        return Ok(ok(&format!(
+            "UFW installed, but these ports could not be opened: {}",
+            failed.join(", ")
+        )));
+    }
 
     tracing::info!("UFW installed and enabled with default rules");
     Ok(ok("UFW installed — SSH, HTTP, HTTPS, SMTP, IMAPS ports opened"))
@@ -278,24 +331,16 @@ async fn install_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Fail2Ban installer ──────────────────────────────────────────────────
 
 async fn install_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Fail2Ban").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing Fail2Ban").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing Fail2Ban...");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y fail2ban"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Fail2Ban install timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Fail2Ban install failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::install(&["fail2ban"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Fail2Ban install failed: {e}"))
+    })?;
 
     // Write default jail config
     let jail_config = r#"[DEFAULT]
@@ -494,7 +539,9 @@ async fn stage_and_install_pdns_conf(staged: &str, contents: &str) -> Result<(),
 }
 
 async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing PowerDNS").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing PowerDNS").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     // Optional JSON body {"backend": "sqlite" | "pgsql"}. Absent/empty/invalid → pgsql
@@ -506,25 +553,19 @@ async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Va
     let backend_name = if use_sqlite { "sqlite" } else { "pgsql" };
     tracing::info!("Installing PowerDNS (backend={backend_name})...");
 
-    // 1. Install packages (backend-specific)
-    let pkgs = if use_sqlite {
-        "pdns-server pdns-backend-sqlite3 sqlite3"
+    // 1. Install packages (backend-specific). Both backend package names differ
+    // on the RHEL family — Debian names them after the library version
+    // (`pdns-backend-sqlite3`), the RHEL family after the database
+    // (`pdns-backend-sqlite`) — and neither was translated before s266, so this
+    // installer would have failed on its very first argument.
+    let pkgs: &[&str] = if use_sqlite {
+        &["pdns-server", "pdns-backend-sqlite3", "sqlite3"]
     } else {
-        "pdns-server pdns-backend-pgsql"
+        &["pdns-server", "pdns-backend-pgsql"]
     };
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", &format!("DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y {pkgs}")])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PowerDNS install timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS install failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::install(pkgs).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS install failed: {e}"))
+    })?;
 
     // 2. Generate the HTTP-API key (shared by both backends)
     let api_key: String = {
@@ -536,14 +577,38 @@ async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Va
     // 3. Backend-specific storage setup
     if use_sqlite {
         // /var/lib/powerdns is NOT in the agent's ReadWritePaths, so create the DB
-        // and load the schema via the unsandboxed escape hatch (same mechanism apt
-        // uses above) — otherwise ProtectSystem=strict EROFS's the write. The schema
-        // ships with pdns-backend-sqlite3 (plain or gzipped depending on distro).
-        let setup = "mkdir -p /var/lib/powerdns; \
-            SCHEMA=/usr/share/doc/pdns-backend-sqlite3/schema.sqlite3.sql; \
+        // and load the schema via the unsandboxed escape hatch (same mechanism the
+        // package transaction uses) — otherwise ProtectSystem=strict EROFS's the write.
+        //
+        // The schema's PATH is distro-specific and the old code hardcoded Debian's:
+        // `pdns-backend-sqlite3` ships it under its own doc directory, while the RHEL
+        // family puts it in `/usr/share/doc/pdns/` (verified s266). Both branches here
+        // were `[ -f ]`-guarded, so a miss did not fail — it **skipped**, leaving an
+        // empty database, a PowerDNS that starts fine and a DNS server that answers
+        // nothing, under an installer reporting success. Searching the candidates and
+        // then FAILING when none matched is the difference between a bug that reports
+        // itself and one that waits to be discovered by a user.
+        let setup = "set -e; mkdir -p /var/lib/powerdns; \
             if [ ! -s /var/lib/powerdns/pdns.sqlite3 ]; then \
-              if [ -f \"$SCHEMA\" ]; then sqlite3 /var/lib/powerdns/pdns.sqlite3 < \"$SCHEMA\"; \
-              elif [ -f \"$SCHEMA.gz\" ]; then zcat \"$SCHEMA.gz\" | sqlite3 /var/lib/powerdns/pdns.sqlite3; fi; \
+              SCHEMA=''; \
+              for c in /usr/share/doc/pdns-backend-sqlite3/schema.sqlite3.sql \
+                       /usr/share/doc/pdns/schema.sqlite3.sql \
+                       /usr/share/pdns-backend-sqlite3/schema.sqlite3.sql \
+                       /usr/share/doc/pdns-backend-sqlite/schema.sqlite3.sql; do \
+                if [ -f \"$c\" ]; then SCHEMA=\"$c\"; break; fi; \
+                if [ -f \"$c.gz\" ]; then SCHEMA=\"$c.gz\"; break; fi; \
+              done; \
+              if [ -z \"$SCHEMA\" ]; then \
+                echo 'PowerDNS SQLite schema not found in any known location' >&2; exit 1; \
+              fi; \
+              case \"$SCHEMA\" in \
+                *.gz) zcat \"$SCHEMA\" | sqlite3 /var/lib/powerdns/pdns.sqlite3 ;; \
+                *)    sqlite3 /var/lib/powerdns/pdns.sqlite3 < \"$SCHEMA\" ;; \
+              esac; \
+              if ! sqlite3 /var/lib/powerdns/pdns.sqlite3 \
+                   'SELECT 1 FROM domains LIMIT 1;' >/dev/null 2>&1; then \
+                echo 'PowerDNS SQLite schema loaded but the domains table is missing' >&2; exit 1; \
+              fi; \
             fi; \
             chown -R pdns:pdns /var/lib/powerdns";
         let sql_out = tokio::time::timeout(
@@ -685,28 +750,24 @@ default-soa-content=ns1.@ hostmaster.@ 0 10800 3600 604800 3600
 // ── Redis installer ────────────────────────────────────────────────
 
 async fn install_redis() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Redis").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing Redis").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing Redis...");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y redis-server"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Redis install timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install failed: {e}")))?;
+    pkg::refresh_index().await;
+    pkg::install(&["redis-server"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Redis install failed: {e}"))
+    })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Redis install failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
-
-    // Enable and start Redis
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["enable", "redis-server"]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["start", "redis-server"]).output()).await;
+    // `redis-server` is the package AND the unit on Debian; on the RHEL family
+    // both are `redis`, and they are translated by separate maps because a
+    // package name and a unit name are not the same kind of string.
+    let unit = pkg::service_name("redis-server").await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["enable", &unit]).output()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["start", &unit]).output()).await;
 
     // Verify Redis is responding
     let verify = tokio::time::timeout(
@@ -726,24 +787,23 @@ async fn install_redis() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Node.js installer ──────────────────────────────────────────────
 
 async fn install_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Node.js").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing Node.js").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing Node.js...");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y nodejs"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Node.js install timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Node.js install failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Node.js install failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    // NodeSource publishes a per-family setup script. `setup.sh` has branched to
+    // the rpm one since s264; the agent still fetched the **deb** script on every
+    // distro, which s265 recorded as a half-migration deliberately left alone
+    // until there was a dnf path to migrate onto. This is that path.
+    pkg::add_repo(pkg::Repo::NodeSource).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("NodeSource repository setup failed: {e}"))
+    })?;
+    pkg::install(&["nodejs"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Node.js install failed: {e}"))
+    })?;
 
     // Verify
     let ver = tokio::time::timeout(
@@ -795,23 +855,40 @@ async fn install_composer() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── PHP uninstaller ─────────────────────────────────────────────────────
 
 async fn uninstall_php() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing PHP").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing PHP").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling PHP...");
 
     let version = detect_php_version().await.unwrap_or_else(|| "8.3".to_string());
 
-    // Stop and disable PHP-FPM
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["stop", &format!("php{version}-fpm")]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["disable", &format!("php{version}-fpm")]).output()).await;
+    // Stop and disable PHP-FPM under whichever unit name this family uses.
+    let unit = pkg::service_name(&format!("php{version}-fpm")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["stop", &unit]).output()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["disable", &unit]).output()).await;
 
-    // Purge all PHP packages for this version
+    // Purge every PHP package. The glob is family-specific and deliberately
+    // NOT routed through `pkg::remove` — that translates package NAMES, and a
+    // glob is not a name; passing `php8.3-*` through the map would produce
+    // something that matches nothing. Debian's packages are versioned, the
+    // RHEL family's are not, so the two patterns differ in shape as well as
+    // spelling.
+    let glob = if pkg::manager().await == pkg::PkgMgr::Rpm {
+        "php-*".to_string()
+    } else {
+        format!("php{version}-*")
+    };
+    let cmd = if pkg::manager().await == pkg::PkgMgr::Rpm {
+        format!("dnf remove -y '{glob}'")
+    } else {
+        format!("DEBIAN_FRONTEND=noninteractive apt-get purge -y {glob} && apt-get autoremove -y")
+    };
+
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", &format!("DEBIAN_FRONTEND=noninteractive apt-get purge -y php{version}-* && apt-get autoremove -y")])
-            .output()
+        safe_command_unsandboxed("sh", &[]).args(["-c", &cmd]).output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PHP uninstall timed out after 300s"))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PHP uninstall failed: {e}")))?;
@@ -828,16 +905,20 @@ async fn uninstall_php() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Certbot uninstaller ─────────────────────────────────────────────────
 
 async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Certbot").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing Certbot").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling Certbot...");
 
-    // Stop all possible renewal timers
-    let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["stop", "certbot.timer"]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["disable", "certbot.timer"]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["stop", "snap.certbot.renew.timer"]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["disable", "snap.certbot.renew.timer"]).output()).await;
+    // Stop every renewal timer certbot might have arrived with — the apt/pip
+    // one, the snap one, and EPEL's `certbot-renew.timer`. Which one exists
+    // depends on how it was installed, so all are tried and none is required.
+    for t in ["certbot.timer", "snap.certbot.renew.timer", "certbot-renew.timer"] {
+        let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["stop", t]).output()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["disable", t]).output()).await;
+    }
 
     // Remove snap certbot (if installed)
     let _ = tokio::time::timeout(
@@ -855,13 +936,10 @@ async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
         let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["daemon-reload"]).output()).await;
     }
 
-    // Remove apt certbot (if installed)
-    let _ = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y certbot python3-certbot-nginx 2>/dev/null; apt-get autoremove -y 2>/dev/null; true"])
-            .output()
-    ).await;
+    // Remove the packaged certbot (if installed). Best-effort on purpose: the
+    // snap and pip paths above may already have removed it, and a box that
+    // never had the packaged one must not fail the uninstall.
+    let _ = pkg::remove(&["certbot", "python3-certbot-nginx"]).await;
 
     // Clean up symlink
     let _ = std::fs::remove_file("/usr/bin/certbot");
@@ -872,8 +950,17 @@ async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
 
 // ── UFW uninstaller ─────────────────────────────────────────────────────
 
+/// Remove UFW.
+///
+/// Unlike [`install_ufw`], this is allowed on every family — and on the RHEL
+/// family it is actively useful, because it is the cleanup for boxes that a
+/// pre-v2.38.0 `setup.sh` left with ufw installed beside firewalld. Refusing to
+/// remove a package we should never have installed would strand exactly the
+/// operators worst affected.
 async fn uninstall_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing UFW").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing UFW").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling UFW...");
@@ -881,20 +968,9 @@ async fn uninstall_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
     // Disable UFW first
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("ufw").arg("disable").output()).await;
 
-    // Purge UFW
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y ufw && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "UFW uninstall timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("UFW uninstall failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("UFW uninstall failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::remove(&["ufw"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("UFW uninstall failed: {e}"))
+    })?;
 
     tracing::info!("UFW uninstalled");
     Ok(ok("UFW disabled and removed"))
@@ -903,7 +979,9 @@ async fn uninstall_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Fail2Ban uninstaller ────────────────────────────────────────────────
 
 async fn uninstall_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Fail2Ban").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing Fail2Ban").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling Fail2Ban...");
@@ -912,20 +990,9 @@ async fn uninstall_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["stop", "fail2ban"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["disable", "fail2ban"]).output()).await;
 
-    // Purge fail2ban
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y fail2ban && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Fail2Ban uninstall timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Fail2Ban uninstall failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Fail2Ban uninstall failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::remove(&["fail2ban"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Fail2Ban uninstall failed: {e}"))
+    })?;
 
     // Remove custom jail config
     let _ = tokio::fs::remove_file("/etc/fail2ban/jail.local").await;
@@ -937,29 +1004,28 @@ async fn uninstall_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── PowerDNS uninstaller ────────────────────────────────────────────────
 
 async fn uninstall_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing PowerDNS").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing PowerDNS").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling PowerDNS...");
 
-    // Stop and disable pdns
+    // Stop and disable pdns. The unit is literally `pdns` on BOTH families —
+    // Debian's PACKAGE is `pdns-server` while its UNIT is already `pdns` — so
+    // this deliberately does NOT go through `service_name`, which would hand
+    // back `pdns-server` on Debian and stop a unit that has never existed
+    // there. It is the sharpest example of why the package map and the unit
+    // map have to be separate: for this service they disagree on Debian and
+    // agree on RHEL, which no single translation can express.
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["stop", "pdns"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["disable", "pdns"]).output()).await;
 
-    // Purge PowerDNS packages
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y pdns-server pdns-backend-pgsql pdns-backend-sqlite3 && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PowerDNS uninstall timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS uninstall failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS uninstall failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::remove(&["pdns-server", "pdns-backend-pgsql", "pdns-backend-sqlite3"])
+        .await
+        .map_err(|e| {
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS uninstall failed: {e}"))
+        })?;
 
     // Remove config file (but keep the pdns database — user may want DNS records)
     let _ = tokio::fs::remove_file("/etc/powerdns/pdns.conf").await;
@@ -971,29 +1037,20 @@ async fn uninstall_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Redis uninstaller ───────────────────────────────────────────────────
 
 async fn uninstall_redis() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Redis").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing Redis").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling Redis...");
 
-    // Stop and disable redis-server
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["stop", "redis-server"]).output()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["disable", "redis-server"]).output()).await;
+    let unit = pkg::service_name("redis-server").await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["stop", &unit]).output()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["disable", &unit]).output()).await;
 
-    // Purge redis
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y redis-server && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Redis uninstall timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Redis uninstall failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Redis uninstall failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    pkg::remove(&["redis-server"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Redis uninstall failed: {e}"))
+    })?;
 
     tracing::info!("Redis uninstalled");
     Ok(ok("Redis stopped and purged"))
@@ -1002,28 +1059,21 @@ async fn uninstall_redis() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Node.js uninstaller ─────────────────────────────────────────────────
 
 async fn uninstall_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Node.js").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing Node.js").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling Node.js...");
 
-    // Purge nodejs
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y nodejs && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Node.js uninstall timed out after 300s"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Node.js uninstall failed: {e}")))?;
+    pkg::remove(&["nodejs"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Node.js uninstall failed: {e}"))
+    })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Node.js uninstall failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
-
-    // Remove nodesource apt repo if present
-    let _ = tokio::fs::remove_file("/etc/apt/sources.list.d/nodesource.list").await;
+    // Remove the NodeSource repo on whichever family added it. This used to
+    // delete the apt sources file only, so an RPM box would have kept a repo
+    // definition for a package it no longer has.
+    pkg::remove_repo(pkg::Repo::NodeSource).await;
 
     tracing::info!("Node.js uninstalled");
     Ok(ok("Node.js purged and nodesource repo removed"))
@@ -1110,28 +1160,25 @@ async fn detect_php_version() -> Option<String> {
 // ── WAF (ModSecurity3 + OWASP CRS) installer ───────────────────────
 
 async fn install_waf() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing the WAF").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing the WAF").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing WAF (ModSecurity3 + OWASP CRS)...");
 
-    // 1. Install libmodsecurity3 and nginx connector
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get update && \
-                DEBIAN_FRONTEND=noninteractive apt-get install -y libmodsecurity3 libnginx-mod-http-modsecurity"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "WAF install timed out"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("apt install: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("WAF install failed (libmodsecurity3 or nginx module not available): {}",
-                stderr.chars().take(400).collect::<String>())));
-    }
+    // 1. Install the library and the nginx connector. Debian splits them and
+    // needs both names; the RHEL family ships one `nginx-mod-modsecurity` that
+    // pulls the library in, so both Debian spellings collapse onto it — which
+    // is why passing both here is correct on either family rather than a
+    // duplicate. (Only one of the two was translated before s266.)
+    pkg::refresh_index().await;
+    pkg::install(&["libmodsecurity3", "libnginx-mod-http-modsecurity"])
+        .await
+        .map_err(|e| {
+            err(StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("WAF install failed (libmodsecurity3 or the nginx module is not available): {e}"))
+        })?;
 
     // 2. Create directory structure
     let dirs = ["/etc/modsecurity", "/etc/modsecurity/sites", "/var/log/modsecurity"];
@@ -1222,7 +1269,9 @@ SecStatusEngine Off
 }
 
 async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing the WAF").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing the WAF").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling WAF...");
@@ -1249,21 +1298,17 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
         safe_command("nginx").args(["-s", "reload"]).output()
     ).await;
 
-    // Purge packages
-    let output = tokio::time::timeout(
-        Duration::from_secs(300),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y libnginx-mod-http-modsecurity libmodsecurity3 libmodsecurity3t64 && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "WAF uninstall timed out"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("WAF uninstall: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("WAF uninstall failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    // Purge packages. All three Debian spellings collapse onto the single RHEL
+    // package, so `remove` is handed the same list `install` was given.
+    pkg::remove(&[
+        "libnginx-mod-http-modsecurity",
+        "libmodsecurity3",
+        "libmodsecurity3t64",
+    ])
+    .await
+    .map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("WAF uninstall failed: {e}"))
+    })?;
 
     // Clean up config files (preserve logs)
     let _ = std::fs::remove_dir_all("/etc/modsecurity");
@@ -1275,46 +1320,27 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Cloudflare Tunnel (cloudflared) ─────────────────────────────────
 
 async fn install_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Cloudflare Tunnel").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Installing Cloudflare Tunnel").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Installing cloudflared...");
 
-    // Pre-resolve the codename in Rust. Inline `$(lsb_release -cs)` in
-    // single-quoted bash didn't expand and shipped the literal string into
-    // /etc/apt/sources.list.d/cloudflared.list, breaking apt-get update
-    // system-wide (issue #57 follow-up, v2.8.19).
-    let codename = std::fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| l.strip_prefix("VERSION_CODENAME=").map(|v| v.trim_matches('"').to_string()))
-        })
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR,
-            "Cannot detect OS codename from /etc/os-release (need VERSION_CODENAME)"))?;
-
-    let script = format!(
-        "curl -sL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg && \
-         printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared %s main\\n' {codename} > /etc/apt/sources.list.d/cloudflared.list && \
-         DEBIAN_FRONTEND=noninteractive apt-get update && \
-         DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared"
-    );
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(120),
-        safe_command_unsandboxed("sh", &[]).args(["-c", &script]).output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "cloudflared install timed out"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Install: {e}")))?;
-
-    if !output.status.success() {
-        // A partial install can leave a half-written sources file behind which
-        // would break every subsequent apt-get update on the box. Wipe it.
-        let _ = std::fs::remove_file("/etc/apt/sources.list.d/cloudflared.list");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("cloudflared install failed: {}", stderr.chars().take(400).collect::<String>())));
-    }
+    // The codename lookup that used to live here — and hard-errored with
+    // "Cannot detect OS codename" on every RHEL release, none of which carries
+    // VERSION_CODENAME — now sits inside `pkg::add_repo`, on the apt branch
+    // only. Cloudflare publishes a codename-keyed apt repo and a single flat
+    // rpm repo, so on the RPM side the codename is not defaulted or guessed:
+    // it is not part of the question. `add_repo` also removes a half-written
+    // repo file on failure, which is what stops a partial install from breaking
+    // every later transaction on the operator's box (Lesson #73C).
+    pkg::add_repo(pkg::Repo::Cloudflared).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("cloudflared repository setup failed: {e}"))
+    })?;
+    pkg::install(&["cloudflared"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("cloudflared install failed: {e}"))
+    })?;
 
     std::fs::create_dir_all("/etc/cloudflared").ok();
 
@@ -1332,7 +1358,9 @@ async fn install_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
 }
 
 async fn uninstall_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
-    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Cloudflare Tunnel").await {
+    use crate::services::pkg;
+
+    if let Some(why) = pkg::no_installer_reason("Removing Cloudflare Tunnel").await {
         return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
     }
     tracing::info!("Uninstalling cloudflared...");
@@ -1340,19 +1368,13 @@ async fn uninstall_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
     let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["stop", "cloudflared"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["disable", "cloudflared"]).output()).await;
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(120),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflared && apt-get autoremove -y"])
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Timeout"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Uninstall: {e}")))?;
+    pkg::remove(&["cloudflared"]).await.map_err(|e| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("cloudflared uninstall failed: {e}"))
+    })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed: {}", stderr.chars().take(300).collect::<String>())));
-    }
+    // Drop the repo definition on whichever family added it, so an operator who
+    // removes the tunnel is not left carrying Cloudflare's repo forever.
+    pkg::remove_repo(pkg::Repo::Cloudflared).await;
 
     let _ = std::fs::remove_dir_all("/etc/cloudflared");
     tracing::info!("cloudflared uninstalled");

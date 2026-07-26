@@ -675,6 +675,28 @@ else
     cp "$CLI_SRC/target/release/dockpanel" "$CLI_BIN"
 fi
 chmod +x "$AGENT_BIN" "$API_BIN" "$CLI_BIN"
+
+# SELinux: restore the binaries' security context after the swap.
+#
+# A rename within one filesystem PRESERVES the source label, and the release
+# path above moves these in from /tmp — so each binary arrives carrying
+# `user_tmp_t` instead of `bin_t`, and on an Enforcing box systemd then refuses
+# to execute it:
+#
+#     Failed at step EXEC spawning /usr/local/bin/dockpanel-agent: Permission denied
+#     dockpanel-agent.service: Main process exited, code=exited, status=203/EXEC
+#
+# Measured on Rocky 9.8 at s266. The failure is silent in the worst way: the
+# update reports success, and the service is dead until someone relabels it by
+# hand. Note the `cp` branch does NOT have this problem — copying ONTO an
+# existing file keeps the target's label — so this only ever bit the
+# release-binary path, which is the one every real install uses.
+#
+# No-op on Debian/Ubuntu, where restorecon is usually absent.
+if command -v restorecon > /dev/null 2>&1; then
+    restorecon -F "$AGENT_BIN" "$API_BIN" "$CLI_BIN" 2>/dev/null || true
+fi
+
 log "Binaries updated (agent: $(du -h "$AGENT_BIN" | cut -f1), api: $(du -h "$API_BIN" | cut -f1), cli: $(du -h "$CLI_BIN" | cut -f1))"
 
 systemctl daemon-reload

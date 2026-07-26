@@ -213,6 +213,24 @@ mv -f "$WORK/agent" "$STAGED" || fail swap "could not stage the new binary into 
 cp -a "$AGENT_BIN" "$BACKUP" 2>/dev/null || true
 mv -f "$STAGED" "$AGENT_BIN" || fail swap "could not move the new binary into place"
 swapped=1
+
+# SELinux: relabel after the swap, or this update is the last one this agent
+# ever performs.
+#
+# $WORK lives under the state dir, so the downloaded binary carries `var_lib_t`,
+# and BOTH moves above are renames within one filesystem — which PRESERVE the
+# label rather than taking the destination's. On an Enforcing box systemd then
+# cannot exec it (`status=203/EXEC`, "Permission denied"), and because this
+# runs on a 6-hourly timer, every RHEL-family install would lose its agent at
+# the first automatic update after installation. Measured on Rocky 9.8 at s266.
+#
+# Deliberately before the restart below, so the verify-running step that follows
+# is testing a binary systemd can actually execute. No-op where restorecon does
+# not exist.
+if command -v restorecon > /dev/null 2>&1; then
+    restorecon -F "$AGENT_BIN" 2>/dev/null || true
+fi
+
 log "binary swapped ($SIZE bytes)"
 
 # ── 4. Restart and prove the version actually changed ────────────────────

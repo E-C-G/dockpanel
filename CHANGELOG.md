@@ -4,6 +4,74 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.39.0] - 2026-07-26
+
+### Fixed
+
+- **Automatic updates left the agent unable to start on SELinux systems.** A
+  binary moved into `/usr/local/bin` keeps the label it had at its source — a
+  rename within one filesystem preserves it, it does not adopt the
+  destination's. `agent-self-update.sh` stages the download under
+  `/var/lib/dockpanel` and `update.sh` moves the release binaries in from
+  `/tmp`, so on Rocky, AlmaLinux, CentOS Stream and Fedora the new binary
+  arrived labelled `var_lib_t` or `user_tmp_t` instead of `bin_t`, and systemd
+  then refused to execute it (`status=203/EXEC`, "Permission denied") — while
+  the update reported success. Because the agent's own updater runs on a
+  six-hourly timer, every RHEL-family install would have lost its agent at the
+  first automatic update after installation. Both paths now restore the
+  security context after the swap.
+
+- **A fresh install on the RHEL family got end-of-life PHP 8.0.** `dnf install
+  php-fpm` resolves to the non-modular base package unless a module stream is
+  selected first, so the installer produced PHP 8.0.30 — older than every
+  stream those distros offer (8.1, 8.2, 8.3) and unsupported since November
+  2023 — and printed "PHP 8.0 (FPM)" as if that were the intended outcome. It
+  also made the panel's own PHP installer unreachable, since that checks
+  whether PHP is present, finds 8.0, and reports "already installed". The
+  installer now selects the newest stream the system offers before installing.
+
+- **The Services and PHP pages misreported PHP on the RHEL family.** The
+  per-version package query collapses onto the single unversioned `php-fpm`
+  package there, so every offered version read as installed, while the
+  running-check and socket path were both Debian-shaped, so none read as
+  running. The version is now read from the package database.
+
+### Changed
+
+- **Package operations dispatch on the package manager the system actually
+  has.** `services/pkg.rs` grew from a query layer into an install layer:
+  install/remove routed through the real manager, per-family repository setup
+  for NodeSource and Cloudflare, PHP module-stream selection, and a systemd
+  **unit**-name map alongside the package-name map — a package name and a unit
+  name are different strings that merely coincide on Debian, and translating
+  only the first installs the right package and then enables a unit that is not
+  there. The optional-service installers, the mail installer and the PHP
+  version manager all route through it.
+
+- **The panel now states plainly that it cannot install packages on RHEL-family
+  systems, instead of failing with an internal error.** The agent performs
+  privileged package work by asking systemd for a transient unit; on the RHEL
+  family that request is refused when it comes from inside the agent's service
+  (`Failed to start transient service unit: Connection reset by peer`). This is
+  a long-standing limitation rather than a new one — Composer installation,
+  unchanged in this release, fails the same way — and it is not caused by the
+  agent's sandbox, which was ruled out by reproducing the failure with every
+  restriction disabled. Until it is resolved, these endpoints report the
+  limitation and point at the system package manager rather than surfacing a
+  D-Bus error. **DockPanel does not claim panel-driven service installation on
+  RHEL-family systems in this release.**
+
+- **UFW installation is refused on systems running firewalld**, naming the
+  reason. UFW is installable there, which is precisely the hazard: it would
+  create a second rule set that nothing consults — the failure mode that made
+  v2.37.0 installs unreachable. Ports are opened through whichever firewall is
+  actually enforcing.
+
+- **Mail server installation is refused on RHEL-family systems** until the
+  configuration half has been verified there. The packages resolve, but a mail
+  stack whose daemons are running and whose configuration is wrong reports
+  itself healthy and delivers nothing.
+
 ## [2.38.0] - 2026-07-26
 
 ### Fixed

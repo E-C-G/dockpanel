@@ -1391,7 +1391,34 @@ install_php() {
             svc_fail "PHP-FPM"
         fi
     else
-        # RHEL/Rocky/Fedora
+        # RHEL/Rocky/Fedora.
+        #
+        # SELECT THE MODULE STREAM FIRST. `dnf install php-fpm` with no stream
+        # enabled resolves to the NON-MODULAR base package — PHP 8.0.30 on
+        # Rocky 9, older than every stream the box offers (8.1/8.2/8.3) and
+        # end-of-life since November 2023 — and the install summary then
+        # cheerfully prints "PHP 8.0 (FPM)". Measured on a real box at s266,
+        # where this installer did exactly that.
+        #
+        # It also made the panel's own PHP installer unreachable: it checks
+        # whether PHP is already present, finds 8.0, and reports "already
+        # installed", so nothing ever offers the operator a supported version.
+        local php_stream
+        php_stream=$(dnf -q module list php 2>/dev/null \
+                     | awk '$1=="php" && $2 ~ /^[0-9]/ {print $2}' | sort -Vr | head -1)
+        if [ -n "$php_stream" ]; then
+            if dnf -y module enable "php:${php_stream}" > /dev/null 2>&1; then
+                info "Selected PHP ${php_stream} (module stream)"
+            else
+                warn "Could not enable the php:${php_stream} module stream — falling back to the distro default, which may be end-of-life"
+            fi
+        fi
+
+        # The extension names are passed as-is: several of them (php-curl,
+        # php-zip, php-sqlite3) are VIRTUAL provides satisfied by php-common
+        # rather than packages of their own, and dnf resolves those, so this
+        # list is not the all-or-nothing hazard the apt side has to guard
+        # against. Verified against a real dnf at s266.
         if run "Installing PHP (distro packages)" pkg_install php-fpm php-cli php-common php-mysqlnd php-pgsql php-xml php-mbstring php-curl php-zip php-gd; then
             systemctl enable --now php-fpm > /dev/null 2>&1
             log "PHP installed with FPM"
