@@ -145,14 +145,30 @@ DockPanel configures Postfix to route all outbound email through the relay. Inco
 
 ## Webmail (Roundcube)
 
-Roundcube provides browser-based email access.
+Roundcube provides browser-based email access. There are two ways to install it, and they do
+not behave the same.
+
+### On its own domain (recommended)
 
 1. Go to **Docker Apps**
 2. Search for **Roundcube**
 3. Click **Deploy**
 4. Set a domain (e.g., `webmail.example.com`)
 
-After deployment, users can access their email at `https://webmail.example.com`.
+Your users then read their mail at `https://webmail.example.com`. Prefer this. Roundcube expects
+to own the root of the site it is served from, and giving it its own hostname avoids the problem
+below entirely.
+
+### Under `/webmail/` on the panel domain
+
+The **Mail** page can also install Roundcube as a path on the panel's own domain. It is quicker to
+set up and needs no second DNS record.
+
+> **Known issue (v2.36.0).** Installed this way, the message list can render empty even though the
+> mailbox has mail in it — a frame is navigated to the panel root, whose security policy refuses
+> it, and the error stops the list from loading. Logging in, IMAP, POP3 and delivery are all
+> unaffected, and any desktop or phone mail client works normally against the same account. If you
+> hit this, deploy Roundcube on its own domain as described above.
 
 ## Spam Filter (Rspamd)
 
