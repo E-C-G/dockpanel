@@ -49,8 +49,63 @@ pub struct SecurityOverview {
     pub ssl_certs_count: usize,
 }
 
-/// Run `ufw status verbose` and parse the output into a `FirewallStatus`.
+/// firewalld's equivalent of the ufw view: the default zone's target as the
+/// policy, and its open services and ports as the rule list. Reported in the
+/// same shape so the Security page needs no per-firewall branch.
+async fn firewalld_status() -> Result<FirewallStatus, String> {
+    let zone = fw_out(&["--get-default-zone"]).await.trim().to_string();
+    let target = fw_out(&["--zone", &zone, "--get-target"]).await.trim().to_string();
+
+    let mut rules = Vec::new();
+    let mut number = 0;
+    for (kind, args) in [
+        ("service", vec!["--zone", zone.as_str(), "--list-services"]),
+        ("port", vec!["--zone", zone.as_str(), "--list-ports"]),
+    ] {
+        for item in fw_out(&args).await.split_whitespace() {
+            number += 1;
+            rules.push(FirewallRule {
+                number,
+                to: if kind == "service" { format!("{item} (service)") } else { item.to_string() },
+                action: "ALLOW IN".into(),
+                from: "Anywhere".into(),
+            });
+        }
+    }
+
+    Ok(FirewallStatus {
+        active: true,
+        default_policy: format!(
+            "{} (incoming), allow (outgoing) — firewalld zone '{zone}'",
+            if target.eq_ignore_ascii_case("ACCEPT") { "allow" } else { "deny" }
+        ),
+        rules,
+    })
+}
+
+async fn fw_out(args: &[&str]) -> String {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        safe_command("firewall-cmd").args(args).output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    .unwrap_or_default()
+}
+
+/// Firewall state for the Security page.
+///
+/// This only ever ran `ufw status verbose`, so on the RHEL family — where
+/// firewalld is the running firewall — it reported `active: false` and zero
+/// rules for a box that was firewalled correctly, and the overview card said
+/// the server had no firewall at all (s265).
 pub async fn get_firewall_status() -> Result<FirewallStatus, String> {
+    if crate::services::firewall::detect().await == crate::services::firewall::Firewall::Firewalld {
+        return firewalld_status().await;
+    }
+
     let output = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         safe_command("ufw").args(["status", "verbose"]).output(),
@@ -433,8 +488,17 @@ pub async fn change_ssh_port(port: u16) -> Result<(), String> {
         return Err("Invalid port".into());
     }
     modify_sshd_config("Port", &port.to_string()).await?;
-    // Add firewall rule for new port before restarting
-    let _ = safe_command("ufw").args(["allow", &format!("{port}/tcp")]).output().await;
+    // Add a firewall rule for the new port before restarting sshd — in
+    // whichever firewall is running. This used to be a discarded `ufw allow`,
+    // so on a firewalld box it changed nothing and the next SSH connection
+    // had nowhere to land.
+    if !crate::services::firewall::allow_tcp(&port.to_string()).await {
+        return Err(format!(
+            "Could not open port {port} in the firewall — refusing to move SSH there, \
+             it would lock you out. Open it manually, then retry."
+        ));
+    }
+    crate::services::firewall::reload().await;
     restart_sshd().await
 }
 

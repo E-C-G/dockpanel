@@ -115,5 +115,138 @@ else
 fi
 
 echo
+echo "── 4. The box is configured for the firewall it is actually running ──"
+
+# s265: install succeeded on all four RPM families and the panel was still
+# unreachable, because setup.sh installed UFW next to the firewalld the distro
+# already had running and then opened 80/443 in UFW only. Let's Encrypt could
+# not fetch the ACME challenge, so there was no certificate either — while the
+# installer printed "installed successfully" and an https:// URL.
+
+# The detector must exist AND be called from main() — a definition nothing
+# invokes leaves FW_MGR at its "none" default, which silently disables every
+# fw_allow below. (The first version of this pin only checked the definition
+# and passed happily when the call site was removed.)
+if grep -qE '^detect_firewall\(\) \{' "$SETUP" && \
+   grep -qE '^[[:space:]]+detect_firewall$' "$SETUP"; then
+  ok "setup.sh detects the enforcing firewall (FW_MGR) and calls the detector from main()"
+else
+  bad "detect_firewall is missing or never called in $SETUP — FW_MGR stays 'none', fw_allow becomes a no-op, and the installer is back to assuming UFW"
+fi
+
+# THE DURABLE PIN for this class, same shape as §1: rather than pinning one
+# call site, require every `pkg_install ufw` to sit on the branch taken only
+# when no firewall is running. Checked positionally, because a textual search
+# for "is it inside the case" passes for a `none)` branch that no longer exists.
+ufw_installs=$(grep -cE '^[[:space:]]*(if run .*)?pkg_install ufw|pkg_install ufw' "$SETUP" || true)
+guarded_installs=$(awk '
+  /^[[:space:]]*case "\$FW_MGR" in/ { in_case=1 }
+  in_case && /^[[:space:]]*none\)/  { in_none=1 }
+  in_none && /pkg_install ufw/      { n++ }
+  in_none && /^[[:space:]]*;;/      { in_none=0 }
+  in_case && /^[[:space:]]*esac/    { in_case=0 }
+  END { print n+0 }
+' "$SETUP")
+if [ "$ufw_installs" -gt 0 ] && [ "$guarded_installs" -eq "$ufw_installs" ]; then
+  ok "every 'pkg_install ufw' sits on the FW_MGR=none branch ($guarded_installs/$ufw_installs)"
+elif [ "$ufw_installs" -eq 0 ]; then
+  ok "setup.sh never installs UFW"
+else
+  bad "$ufw_installs 'pkg_install ufw' in $SETUP but only $guarded_installs on the FW_MGR=none branch — installing UFW next to a running firewalld is what left the panel unreachable on every RHEL-family box"
+fi
+
+if grep -q 'firewall-cmd' "$SETUP"; then
+  ok "setup.sh knows how to open a port in firewalld"
+else
+  bad "$SETUP never mentions firewall-cmd — ports opened only in UFW are dropped by firewalld on Rocky/Alma/CentOS/Fedora"
+fi
+
+# The agent had the same defect one layer in: open_mail_ports() shelled out to
+# ufw, discarded every result, and logged success unconditionally.
+#
+# Two kinds of ufw call are legitimate and must stay allowed: the ufw installer
+# itself (`install_ufw`/`uninstall_ufw`, which now refuse on non-apt boxes) and
+# ufw-specific rule CRUD. What must NOT come back is code that *opens a port*
+# or *reports firewall state* through ufw alone — those are the ones that were
+# wrong on every RHEL-family box. Anything matching below is that class.
+# Opening a port through ufw alone is the defect. (Reading ufw's own status is
+# fine where it sits behind the dispatch — see the next assertion.)
+offenders=$(grep -rn 'safe_command("ufw")' panel/agent/src --include=*.rs \
+  | grep -vE 'services/firewall\.rs' \
+  | grep -vE 'routes/service_installer\.rs' \
+  | grep -E '"allow"' || true)
+if [ -n "$offenders" ]; then
+  bad "code opens a port through ufw directly:
+$offenders
+    → use services::firewall::allow_tcp, which dispatches on the running firewall AND returns whether it worked"
+else
+  ok "port-opening goes through services/firewall.rs on every path"
+fi
+
+# Firewall STATUS must branch on the detected firewall rather than assuming ufw.
+if grep -q 'firewalld_status' panel/agent/src/services/security.rs && \
+   grep -q 'firewall::detect' panel/agent/src/services/security.rs; then
+  ok "the Security page dispatches on the running firewall instead of calling a firewalld box unfirewalled"
+else
+  bad "security.rs no longer dispatches on the detected firewall — on the RHEL family the Security overview reports 'no firewall' for a box that is firewalled"
+fi
+
+if grep -q 'firewall::detect' panel/agent/src/services/diagnostics.rs; then
+  ok "diagnostics raises 'no firewall' from the real firewall state, not from ufw's absence"
+else
+  bad "diagnostics.rs is back to asking ufw — it will warn 'Firewall (ufw) is not active' on every firewalld box and name a tool the operator does not have"
+fi
+
+echo
+echo "── 5. Package queries work on both package databases ──"
+
+# is_installed() ran `dpkg -l`. There is no dpkg on an RPM box, so it answered
+# false for EVERY package: the Services page reported PHP and Fail2Ban as not
+# installed while both were installed and running. There were four separate
+# hand-rolled copies of it, which is how it stayed wrong in all of them.
+if grep -rq 'safe_command("dpkg")' panel/agent/src --include=*.rs; then
+  bad "an agent file calls dpkg directly — there is no dpkg on the RHEL family, so that query answers false for every package. Use services::pkg::is_installed"
+else
+  ok "no direct dpkg calls in the agent — package presence goes through services::pkg"
+fi
+
+if grep -q 'PkgMgr::Rpm' panel/agent/src/services/pkg.rs 2>/dev/null; then
+  ok "services::pkg dispatches on the box's real package database"
+else
+  bad "services::pkg no longer handles rpm — every package query is Debian-only again"
+fi
+
+echo
+echo "── 6. SELinux is accounted for, not discovered by the operator ──"
+
+# With SELinux Enforcing (the RHEL-family default) nginx may not open a socket
+# to the API, so every request answered 502 — including from the box itself.
+# The denial is dontaudit'ed: nothing in the journal, nothing in ausearch.
+if grep -q 'httpd_can_network_connect' "$SETUP"; then
+  ok "setup.sh sets httpd_can_network_connect, without which the panel answers 502 on Enforcing systems"
+else
+  bad "$SETUP no longer sets httpd_can_network_connect — nginx cannot reach the API under Enforcing SELinux and every request 502s with no log line to explain it"
+fi
+
+# Existing broken boxes cannot be fixed from the panel, because the panel is
+# what is unreachable. update.sh is the only path in.
+if grep -q 'httpd_can_network_connect' scripts/update.sh && \
+   grep -q 'firewall-cmd' scripts/update.sh; then
+  ok "update.sh heals both defects on installs that already exist"
+else
+  bad "update.sh no longer repairs the firewall/SELinux state — boxes installed before v2.38.0 stay unreachable, and they cannot be fixed from a panel they cannot reach"
+fi
+
+echo
+echo "── 7. An apt-only installer says so ──"
+
+if grep -q 'apt_only_reason' panel/agent/src/services/pkg.rs 2>/dev/null && \
+   grep -q 'apt_only_reason' panel/agent/src/routes/service_installer.rs; then
+  ok "optional-service installers refuse with a stated limitation on non-apt boxes"
+else
+  bad "the apt-only guard is gone — on the RHEL family these endpoints fail with 'Failed to find executable apt-get', which tells the operator nothing"
+fi
+
+echo
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

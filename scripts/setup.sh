@@ -36,6 +36,13 @@ GITHUB_REPO="ovexro/dockpanel"
 # certificate (no domain → no Let's Encrypt). print_summary reads it to print
 # the right scheme and explain the browser warning before it happens.
 PANEL_SELF_SIGNED=0
+# Set to 1 by provision_panel_ssl only when certbot actually issued a
+# certificate. print_summary reads it so a failed issuance can never be
+# reported as an https:// panel URL.
+PANEL_SSL_OK=0
+# Which firewall this box is enforcing with: firewalld | ufw | none.
+# Resolved by detect_firewall in main().
+FW_MGR="none"
 
 # ── Resolve repo root ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -294,6 +301,67 @@ pkg_update() {
         dnf) dnf check-update || true ;;
         yum) yum check-update || true ;;
     esac
+}
+
+# ── Firewall ─────────────────────────────────────────────────────────────
+# Sibling of detect_pkg_manager: find the firewall the box is ALREADY
+# enforcing with, so we configure that one instead of installing a second.
+# Debian/Ubuntu images normally ship neither -> we install UFW. RHEL-family
+# images ship firewalld running -> we use it. Never both (see the s265 note
+# in install_recommended_services).
+detect_firewall() {
+    if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then
+        FW_MGR="firewalld"
+    elif command -v ufw &> /dev/null; then
+        FW_MGR="ufw"
+    else
+        FW_MGR="none"
+    fi
+}
+
+# Allow a port, e.g. `fw_allow 443/tcp`. Returns non-zero when there is no
+# firewall to configure or the rule could not be added — callers must not
+# assume success, which is exactly what the old code did.
+fw_allow() {
+    local port="$1"
+    case "$FW_MGR" in
+        firewalld) firewall-cmd --permanent --add-port="$port" > /dev/null 2>&1 ;;
+        ufw)       ufw allow "$port" > /dev/null 2>&1 ;;
+        *)         return 1 ;;
+    esac
+}
+
+# firewalld stages --permanent rules; they do nothing until reloaded. UFW
+# applies immediately, so this is a no-op there.
+fw_reload() {
+    case "$FW_MGR" in
+        firewalld) firewall-cmd --reload > /dev/null 2>&1 || true ;;
+    esac
+}
+
+# ── SELinux ──────────────────────────────────────────────────────────────
+# On Enforcing systems (the RHEL family default) nginx may not open outbound
+# TCP connections unless httpd_can_network_connect is set. The panel vhost
+# proxies to the API on 127.0.0.1:3080 and every site vhost proxies to PHP-FPM
+# or an app container, so without this EVERY request returns 502 — including
+# from the box itself. s265 measured it: the boolean alone flipped 502 -> 200.
+# The denial is dontaudit'ed, so nothing appears in ausearch or the journal;
+# there is no breadcrumb to follow, which is why this must be set up front.
+configure_selinux() {
+    command -v getenforce &> /dev/null || return 0
+    [ "$(getenforce 2>/dev/null)" = "Enforcing" ] || return 0
+
+    header "SELinux"
+    if command -v setsebool &> /dev/null && \
+       run "Allowing nginx to reach the panel API (httpd_can_network_connect)" \
+           setsebool -P httpd_can_network_connect on; then
+        log "SELinux: nginx may now proxy to the API and to site backends"
+        svc_ok "SELinux policy"
+    else
+        warn "SELinux is Enforcing and httpd_can_network_connect could not be set —"
+        warn "the panel will answer 502 until you run: setsebool -P httpd_can_network_connect on"
+        svc_fail "SELinux policy"
+    fi
 }
 
 # True when apt has a real installation candidate for a package. `apt-cache
@@ -1356,32 +1424,53 @@ install_recommended_services() {
         svc_ok "Certbot"
     fi
 
-    # UFW (firewall)
-    if ! command -v ufw &> /dev/null; then
-        if run "Installing UFW firewall" pkg_install ufw; then
-            ufw default deny incoming > /dev/null 2>&1
-            ufw default allow outgoing > /dev/null 2>&1
-            ufw allow 22/tcp > /dev/null 2>&1
-            ufw --force enable > /dev/null 2>&1
-            log "UFW installed and enabled"
+    # Firewall. Install one only if the box has none — never a second one.
+    #
+    # s265: this used to install UFW unconditionally. On the RHEL family that
+    # put UFW's iptables rules alongside the firewalld nftables rules the
+    # distro already had running, and then opened 80/443 in UFW *only*. The
+    # packets kept dying at firewalld, so Let's Encrypt could not reach
+    # /.well-known/acme-challenge, the panel got no certificate, and it was
+    # unreachable from any browser — while the installer printed
+    # "installed successfully" and an https:// URL. Two firewalls is not a
+    # hardening measure, it is an outage nobody can see.
+    case "$FW_MGR" in
+        firewalld)
+            log "Firewall: firewalld is already active — using it (not installing UFW)"
+            svc_ok "firewalld"
+            ;;
+        ufw)
+            log "UFW already installed"
             svc_ok "UFW"
-        else
-            warn "UFW failed to install — no firewall is active"
-            svc_fail "UFW"
-        fi
-    else
-        log "UFW already installed"
-        svc_ok "UFW"
-    fi
+            ;;
+        none)
+            if run "Installing UFW firewall" pkg_install ufw; then
+                ufw default deny incoming > /dev/null 2>&1
+                ufw default allow outgoing > /dev/null 2>&1
+                ufw allow 22/tcp > /dev/null 2>&1
+                ufw --force enable > /dev/null 2>&1
+                FW_MGR="ufw"
+                log "UFW installed and enabled"
+                svc_ok "UFW"
+            else
+                warn "UFW failed to install — no firewall is active"
+                svc_fail "UFW"
+            fi
+            ;;
+    esac
 
-    # Ensure panel ports are always open (even if UFW was pre-existing)
-    if command -v ufw &> /dev/null; then
-        ufw allow 80/tcp > /dev/null 2>&1
-        ufw allow 443/tcp > /dev/null 2>&1
+    # Ensure panel ports are open in whichever firewall is actually enforcing.
+    if fw_allow 80/tcp && fw_allow 443/tcp; then
+        local opened="80, 443"
         if [ -n "$PANEL_PORT" ] && [ "$PANEL_PORT" != "80" ] && [ "$PANEL_PORT" != "443" ]; then
-            ufw allow "${PANEL_PORT}/tcp" > /dev/null 2>&1
+            fw_allow "${PANEL_PORT}/tcp" && opened="$opened, $PANEL_PORT"
         fi
-        log "Firewall: ports 80, 443${PANEL_PORT:+, $PANEL_PORT} allowed"
+        fw_reload
+        log "Firewall ($FW_MGR): ports $opened allowed"
+    elif [ "$FW_MGR" = "none" ]; then
+        log "Firewall: none active — nothing to open"
+    else
+        warn "Firewall ($FW_MGR): could not open 80/443 — the panel may be unreachable"
     fi
 
     # Fail2Ban (intrusion prevention)
@@ -1485,11 +1574,19 @@ provision_panel_ssl() {
     if run "Provisioning Let's Encrypt certificate for ${PANEL_DOMAIN}" \
         certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then
         log "SSL certificate provisioned for $PANEL_DOMAIN"
+        PANEL_SSL_OK=1
         normalize_panel_listen
     else
-        warn "SSL provisioning failed — the panel still works over HTTP"
-        info "Retry manually: certbot --nginx -d $PANEL_DOMAIN"
-        info "If using Cloudflare proxy, set SSL mode to 'Full' and try again"
+        # Order these by what actually causes it. s265: a firewall the
+        # installer did not configure blocked :80, so the ACME challenge could
+        # never be fetched — and the old hint blamed Cloudflare, which was not
+        # even in the path. Reachability first, proxies last.
+        warn "SSL provisioning failed — the panel is served over plain HTTP for now"
+        info "Let's Encrypt must reach http://${PANEL_DOMAIN}/.well-known/acme-challenge/ from the internet. Check, in order:"
+        info "  1. ${PANEL_DOMAIN} resolves to this server's public IP"
+        info "  2. ports 80 and 443 are open — in the OS firewall (${FW_MGR}) AND in any provider firewall"
+        info "  3. if the domain is proxied by Cloudflare, set SSL mode to 'Full'"
+        info "Then retry: certbot --nginx -d $PANEL_DOMAIN"
     fi
 }
 
@@ -1514,8 +1611,12 @@ print_summary() {
     if [ -n "$INSTALLED_VERSION" ]; then
         echo -e "  ${BOLD}Version:${NC}        ${INSTALLED_VERSION}"
     fi
-    if [ -n "$PANEL_DOMAIN" ]; then
+    if [ -n "$PANEL_DOMAIN" ] && [ "$PANEL_SSL_OK" = "1" ]; then
         echo -e "  ${BOLD}Panel URL:${NC}      https://${PANEL_DOMAIN}"
+    elif [ -n "$PANEL_DOMAIN" ]; then
+        # No certificate was issued. Printing https:// here sends the operator
+        # to a URL that cannot answer, and it reads as if the install worked.
+        echo -e "  ${BOLD}Panel URL:${NC}      http://${PANEL_DOMAIN}  ${YELLOW}(no certificate — see below)${NC}"
     elif [ "$PANEL_SELF_SIGNED" = "1" ]; then
         echo -e "  ${BOLD}Panel URL:${NC}      https://${SERVER_IP}:${PANEL_PORT}"
     else
@@ -1646,6 +1747,7 @@ main() {
     export DEBIAN_FRONTEND=noninteractive
 
     detect_pkg_manager
+    detect_firewall
 
     # Auto-detect: if no source available, use release binaries
     if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
@@ -1743,6 +1845,9 @@ main() {
 
     # These steps should continue even if one fails
     set +e
+    # Before nginx is asked to proxy anything: on Enforcing SELinux it may not
+    # open the socket to the API at all, and the denial is silent.
+    configure_selinux
     configure_nginx
     create_services
 

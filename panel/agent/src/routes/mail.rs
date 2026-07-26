@@ -176,6 +176,11 @@ async fn mail_status() -> Result<Json<serde_json::Value>, ApiErr> {
 }
 
 async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
+    // The mail stack is installed with apt below. Say so plainly rather than
+    // letting the operator read "Failed to find executable apt-get".
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing the mail server").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Starting mail server installation...");
 
     // 1. Install packages.
@@ -502,13 +507,10 @@ async fn is_service_active(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Package presence, on dpkg and rpm boxes alike — see `services::pkg`, which
+/// also maps Debian's three Dovecot packages onto the single RPM `dovecot`.
 async fn is_installed(package: &str) -> bool {
-    safe_command("dpkg")
-        .args(["-l", package])
-        .output()
-        .await
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("ii"))
-        .unwrap_or(false)
+    crate::services::pkg::is_installed(package).await
 }
 
 // ── OpenDKIM wiring ─────────────────────────────────────────────────────
@@ -624,10 +626,23 @@ async fn rebuild_dkim_tables() -> Result<(), String> {
 /// panel port and nothing else, so without this the installer finishes with
 /// Postfix and Dovecot listening behind a firewall that drops every packet.
 async fn open_mail_ports() {
-    for port in MAIL_PORTS {
-        let _ = safe_command("ufw").args(["allow", &format!("{port}/tcp")]).output().await;
+    // This used to shell out to `ufw` and discard every result, then log
+    // "Mail ports opened in firewall" unconditionally — a sentence that was
+    // false on every RHEL-family box, where firewalld is the firewall and ufw
+    // is usually not even installed (s265). Say what actually happened.
+    let failed = crate::services::firewall::allow_tcp_ports(MAIL_PORTS).await;
+    if failed.is_empty() {
+        tracing::info!(
+            "Mail ports opened in {:?}: {}",
+            crate::services::firewall::detect().await,
+            MAIL_PORTS.join(", ")
+        );
+    } else {
+        tracing::warn!(
+            "Mail ports NOT opened: {} — mail will not be deliverable until they are",
+            failed.join(", ")
+        );
     }
-    tracing::info!("Mail ports opened in firewall: {}", MAIL_PORTS.join(", "));
 }
 
 /// The panel's own Let's Encrypt certificate, when this box has one for the

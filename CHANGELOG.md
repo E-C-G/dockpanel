@@ -4,6 +4,61 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.38.0] - 2026-07-26
+
+### Fixed
+
+- **On the RHEL family the panel installed successfully and could not be
+  reached.** v2.37.0 made the installer complete on Rocky, AlmaLinux, CentOS
+  Stream and Fedora, and verified it with `/api/health` — measured on
+  `127.0.0.1:3080`, which bypasses nginx. Driving the same install from a
+  browser found it unusable, for two independent reasons:
+  - **Two firewalls, and the installer configured the one that was not
+    enforcing.** These distros boot with **firewalld** running and only SSH
+    allowed. `setup.sh` installed UFW alongside it and opened 80/443 in UFW,
+    while firewalld went on dropping them. The panel was unreachable, and
+    Let's Encrypt could not fetch the ACME challenge, so no certificate was
+    issued either — while the installer printed "installed successfully" and an
+    `https://` URL, and blamed Cloudflare for the SSL failure. The installer now
+    detects the firewall the box is already enforcing with and configures that
+    one, never installing a second; the SSL hint names reachability first; and a
+    failed issuance can no longer be reported as an `https://` panel URL.
+  - **SELinux blocked nginx from reaching the panel API.** With SELinux
+    Enforcing (the default on all four) `httpd_can_network_connect` is off, so
+    every request returned 502 — including from the box itself — with no journal
+    or `ausearch` entry, because the denial is `dontaudit`-ed. The installer now
+    sets the boolean up front.
+  - **`update.sh` repairs both on installs that already exist**, which is the
+    only path in: a box in either state cannot be fixed from a panel it cannot
+    reach.
+- **The panel misreported the box it was running on.** `is_installed()` shelled
+  out to `dpkg`, and there is no dpkg on an RPM system, so every package read as
+  absent — the Services page offered to install PHP and Fail2Ban while both were
+  installed and running. Four hand-rolled copies of that function existed, which
+  is how it stayed wrong in all of them; package presence now goes through one
+  implementation that dispatches on the real package database and maps the names
+  that differ (`pdns-server`→`pdns`, `redis-server`→`redis`, Debian's three
+  Dovecot packages→`dovecot`). PHP-FPM's *running* check had the same shape in
+  the service manager and now also recognises the single `php-fpm` unit.
+- **Firewall state was read through `ufw` alone**, so a firewalled RHEL box
+  reported no firewall at all on the Security page, and diagnostics warned
+  "Firewall (ufw) is not active" while naming a tool the operator does not have.
+  Both now dispatch on the running firewall, and the Security page reports
+  firewalld's zone, policy and open services.
+- **Mail ports were "opened" without checking.** `open_mail_ports()` discarded
+  every result and then logged success unconditionally — false on any box
+  without ufw. It now reports which ports it could not open. Moving the SSH port
+  refuses rather than proceeding if the new port cannot be opened, instead of
+  locking the operator out.
+
+### Changed
+
+- Optional-service installers that are still Debian/Ubuntu-only (Redis, Node.js,
+  PowerDNS, mail, WAF, Cloudflare Tunnel) now refuse on other distributions with
+  a stated reason and a remedy, instead of failing with
+  `Failed to find executable apt-get`. The limitation is documented in the
+  README and the getting-started requirements.
+
 ## [2.37.0] - 2026-07-26
 
 ### Fixed

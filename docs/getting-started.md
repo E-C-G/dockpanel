@@ -16,6 +16,13 @@ DockPanel is a free, self-hosted, Docker-native server management panel built in
 
 Docker and Nginx are installed automatically if not already present.
 
+> **On the RHEL family (CentOS, Rocky, AlmaLinux, Fedora)** the panel, sites, PHP, SSL and
+> Docker apps all work, and the installer configures firewalld and SELinux for you. What is
+> *not* supported yet is installing the **optional services** — Redis, Node.js, PowerDNS, the
+> mail server, the WAF, Cloudflare Tunnel — from inside the panel: those installers are still
+> Debian/Ubuntu-only. Install them with `dnf` and the panel will detect them. The panel tells
+> you this explicitly rather than failing obscurely.
+
 ## Installation
 
 Run a single command on a fresh VPS:

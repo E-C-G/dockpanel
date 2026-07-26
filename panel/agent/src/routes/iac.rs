@@ -317,12 +317,7 @@ async fn check_php_versions() -> Vec<PhpExport> {
     let mut results = Vec::new();
 
     for v in &versions {
-        let installed = safe_command("dpkg")
-            .args(["-s", &format!("php{v}-fpm")])
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let installed = crate::services::pkg::is_installed(&format!("php{v}-fpm")).await;
 
         let fpm_running = if installed {
             safe_command("systemctl")

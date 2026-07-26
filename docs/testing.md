@@ -1,6 +1,6 @@
 # How DockPanel Is Tested
 
-> **Reflects v2.37.0.** The version stamp, the template count and every
+> **Reflects v2.38.0.** The version stamp, the template count and every
 > assertion total on this page are checked against the source by
 > `tests/docs-claims-pin-e2e.sh`, so this page cannot quietly fall behind the
 > code it describes.
@@ -116,6 +116,62 @@ without narrowing `mydestination` made Postfix treat a hosted domain as local
 and bounce real mailboxes as "unknown user", with the daemon perfectly healthy
 throughout. A fix verified only to the depth of "the process is running" has
 been verified to exactly the depth that produced the original bug.
+
+### The four distros installed, and still could not be reached — v2.38.0
+
+v2.37.0 fixed the RPM install and proved it with `/api/health` answering on all
+four families. The next session drove the same install from a **browser** rather
+than from inside the box, and found it unusable — for two reasons, neither of
+which the previous check could see:
+
+| | |
+|---|---|
+| The installer printed | `DockPanel installed successfully!` and `Panel URL: https://…` |
+| What was true | no certificate, unreachable from any browser, **502 even from the box itself** |
+
+**Two firewalls, and the installer configured the one that was not enforcing.**
+Rocky, AlmaLinux, CentOS Stream and Fedora all boot with **firewalld** running
+and only SSH allowed. `setup.sh` installed UFW from EPEL next to it, enabled it,
+and opened 80/443 **in UFW**. firewalld went on dropping both. Let's Encrypt
+therefore could not fetch `/.well-known/acme-challenge/`, so there was no
+certificate either — and the failure hint blamed a Cloudflare proxy that was not
+in the path. Opening those two ports in firewalld, changing nothing else, made
+the box answer from the internet and let the installer's own certbot command
+succeed on the next try.
+
+**SELinux blocked nginx from reaching the panel API.** With SELinux Enforcing —
+the default on all four — `httpd_can_network_connect` is off, so nginx may not
+open a socket to `127.0.0.1:3080`. Every request returned 502, including from
+the box itself. The denial is `dontaudit`-ed: nothing in the journal, nothing in
+`ausearch`. `setsebool -P httpd_can_network_connect on`, alone, turned 502 into
+200.
+
+That second one explains why the previous session read green. It measured
+`127.0.0.1:3080`, which is the API directly — **the path a browser takes, through
+nginx, was never on the evidence.** A check can be honest, repeatable and still
+be measuring a different thing than the one the reader cares about.
+
+The same session found the panel misreporting the box it was running on:
+`is_installed()` shelled out to `dpkg`, and there is no dpkg on an RPM system, so
+**every package read as absent** — the Services page offered to install PHP and
+Fail2Ban while both were installed and running. There were four hand-rolled
+copies of that function, which is how it stayed wrong in all of them. Firewall
+state had the same shape: the Security page ran `ufw status`, so a firewalled box
+reported no firewall at all.
+
+Fixed in v2.38.0: the installer detects the firewall the box is already
+enforcing with and configures **that** one (never installing a second),
+sets the SELinux boolean up front, and `update.sh` repairs both on installs that
+already exist — necessary because a broken box cannot be fixed from a panel it
+cannot reach. Package and firewall queries moved behind one implementation each
+that dispatches on the real system. Optional-service installers that are still
+Debian-only now say so, with the remedy, instead of failing with
+`Failed to find executable apt-get`.
+
+Verified on a fresh Rocky 9.8 box from the published release: `200` over a real
+Let's Encrypt certificate from outside, `ssl_verify_result=0`, firewalld holding
+80/443, no UFW installed, and the Services page reporting PHP and Fail2Ban as
+installed and running.
 
 ### Four supported distros that could not install — v2.37.0
 
@@ -233,6 +289,16 @@ full restore drill on the upgraded box brought the deleted post back.
 
 This section is the reason the rest of the page is worth reading.
 
+- **On the RHEL family, the optional-service installers do not work.** Redis,
+  Node.js, PowerDNS, the mail server, the WAF and Cloudflare Tunnel are all
+  installed with `apt-get` in code that has no `dnf` path — 55 call sites across
+  12 files. The panel now refuses these with a stated reason and a remedy instead
+  of an obscure failure, but the capability is genuinely missing, not merely
+  unpolished.
+- **Every vertical above install is still apt-only evidence on the RPM family.**
+  Mail, backups, git deploy, DNS and PHP pools have been driven end to end on
+  Debian/Ubuntu only.
+
 - **The webmail message list can render empty.** Login, delivery and IMAP all
   work, and the mailbox demonstrably holds mail, but a frame is navigated to the
   panel root where the stricter policy refuses it, and the resulting error aborts
@@ -282,6 +348,9 @@ have is marked not-driven rather than skipped quietly.
 | Docker app from the template catalogue, over a panel-issued certificate | pass — limits genuinely applied, not merely accepted |
 | Mail: DKIM/SPF/DMARC published for real and verified | pass |
 | **A real SMTP send/receive between two domains, DKIM verified on delivery** | **found the installer had never completed** |
+| **Install on each RPM family we claim to support** | **found all four unable to install** — fixed in v2.37.0 |
+| **Reaching an RPM-family install from a browser, not from inside the box** | **found it unreachable and 502** — fixed in v2.38.0 |
+| Optional-service installers (Redis, Node.js, PowerDNS, mail, WAF) on the RPM family | not supported yet — the panel now says so explicitly |
 | Rspamd scoring live mail at delivery | pass |
 | Webmail login | fixed and driven; **message list still open** |
 | Backup, and a restore that returns the site's content | pass — after two sessions of fixes |
@@ -328,7 +397,7 @@ survivable. Seven suites, **179 assertions**, all green at the current commit:
 | `git-deploy-sandbox-pin-e2e.sh` | 20 |
 | `ssl-correctness-pin-e2e.sh` | 30 |
 | `nginx-listen-pin-e2e.sh` | 17 |
-| `rpm-install-pin-e2e.sh` | 7 |
+| `rpm-install-pin-e2e.sh` | 18 |
 
 **On every release** (`release.yml`, `smoke-test.yml`):
 

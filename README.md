@@ -36,6 +36,9 @@ admin password you create is encrypted on the way to the server. Point a domain 
 and pass `PANEL_DOMAIN=your.domain` to get a trusted Let's Encrypt certificate instead.
 
 Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, AlmaLinux 9+, Fedora 39+. x86_64 and ARM64.
+On the RHEL family the optional-service installers (Redis, Node.js, PowerDNS, mail, WAF,
+Cloudflare Tunnel) are not yet available from the panel — install those with `dnf`.
+See [getting started](docs/getting-started.md#requirements).
 
 ## Why DockPanel?
 

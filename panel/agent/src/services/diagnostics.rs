@@ -662,25 +662,20 @@ async fn check_security() -> Vec<DiagnosticFinding> {
         }
     }
 
-    // Firewall active?
-    if let Ok(Ok(output)) = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        safe_command("ufw").args(["status"]).output(),
-    )
-    .await
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.contains("Status: active") {
-            findings.push(DiagnosticFinding {
-                id: "firewall-inactive".into(),
-                category: "security".into(),
-                severity: "warning".into(),
-                title: "Firewall (ufw) is not active".into(),
-                description: "All ports are exposed to the internet without a firewall.".into(),
-                fix_available: false,
-                fix_id: None,
-            });
-        }
+    // Firewall active? This asked ufw specifically, so on the whole RHEL
+    // family — where firewalld is running and ufw is usually not installed —
+    // it raised "Firewall (ufw) is not active" on boxes that were firewalled
+    // perfectly well, and named a tool the operator does not have (s265).
+    if crate::services::firewall::detect().await == crate::services::firewall::Firewall::None {
+        findings.push(DiagnosticFinding {
+            id: "firewall-inactive".into(),
+            category: "security".into(),
+            severity: "warning".into(),
+            title: "No firewall is active".into(),
+            description: "Neither firewalld nor ufw is running — all ports are exposed to the internet.".into(),
+            fix_available: false,
+            fix_id: None,
+        });
     }
 
     // Unattended upgrades?

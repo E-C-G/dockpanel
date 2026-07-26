@@ -229,12 +229,8 @@ async fn remove_ssh_key(
 // ── Auto-Updates ────────────────────────────────────────────────────────
 
 async fn auto_updates_status() -> Result<Json<serde_json::Value>, ApiErr> {
-    let installed = safe_command("dpkg")
-        .args(["-l", "unattended-upgrades"])
-        .output()
-        .await
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("ii"))
-        .unwrap_or(false);
+    // `services::pkg` maps this onto `dnf-automatic` on the RHEL family.
+    let installed = crate::services::pkg::is_installed("unattended-upgrades").await;
 
     let enabled = if installed {
         tokio::fs::read_to_string("/etc/apt/apt.conf.d/20auto-upgrades")

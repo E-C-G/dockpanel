@@ -179,7 +179,8 @@ async fn restic_backup(
 
     if !has_restic {
         return Err(err(StatusCode::PRECONDITION_FAILED,
-            "Restic not installed. Run: apt-get install restic"));
+            "Restic not installed. Install it with your system package manager \
+             (apt install restic / dnf install restic)."));
     }
 
     // Ensure password file exists

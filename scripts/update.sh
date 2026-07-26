@@ -359,6 +359,43 @@ APT_EOF
     fi
 fi
 
+# ── v2.38.0: heal RHEL-family installs the old installer left unreachable ──
+# Every install on Rocky/Alma/CentOS/Fedora before v2.38.0 finished in one of
+# two broken states, and an operator cannot click their way out of either
+# because both make the panel unreachable — so the repair has to happen here.
+#
+#   1. setup.sh installed UFW next to the firewalld the distro was already
+#      running, then opened 80/443 in UFW only. firewalld kept dropping them.
+#   2. SELinux (Enforcing by default) blocks nginx from opening a socket to
+#      the API, so every request answered 502 — even from the box itself. The
+#      denial is dontaudit'ed, so nothing shows up in the journal or ausearch.
+#
+# Both repairs are idempotent and no-ops on Debian/Ubuntu.
+if command -v firewall-cmd &> /dev/null && firewall-cmd --state &> /dev/null; then
+    fw_changed=0
+    for svc in http https; do
+        if ! firewall-cmd --query-service="$svc" &> /dev/null; then
+            firewall-cmd --permanent --add-service="$svc" &> /dev/null && fw_changed=1
+        fi
+    done
+    if [ "$fw_changed" = "1" ]; then
+        firewall-cmd --reload &> /dev/null || true
+        log "firewalld: opened 80/443 (this box was serving behind a closed firewall)"
+    fi
+fi
+
+if command -v getenforce &> /dev/null && [ "$(getenforce 2>/dev/null)" = "Enforcing" ] \
+   && command -v getsebool &> /dev/null; then
+    if getsebool httpd_can_network_connect 2>/dev/null | grep -q -- "--> off"; then
+        if setsebool -P httpd_can_network_connect on 2>/dev/null; then
+            log "SELinux: allowed nginx to reach the API (the panel was answering 502)"
+        else
+            warn "SELinux is Enforcing and httpd_can_network_connect is off — the panel will"
+            warn "answer 502. Run: setsebool -P httpd_can_network_connect on"
+        fi
+    fi
+fi
+
 # ── Refresh systemd service files (may have changed between versions) ─────
 log "Updating systemd service files..."
 # Agent unit — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)

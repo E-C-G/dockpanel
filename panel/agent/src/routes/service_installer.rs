@@ -56,7 +56,13 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
     // directly (never the `php-fpm` metapackage), so a missing version here
     // reports an installed+running PHP as absent on the Services page.
     let php_installed = is_installed("php-fpm").await || is_installed("php8.5-fpm").await || is_installed("php8.4-fpm").await || is_installed("php8.3-fpm").await || is_installed("php8.2-fpm").await || is_installed("php8.1-fpm").await;
-    let php_running = is_active("php8.5-fpm").await || is_active("php8.4-fpm").await || is_active("php8.3-fpm").await || is_active("php8.2-fpm").await || is_active("php8.1-fpm").await;
+    // Debian names the unit per version (`php8.3-fpm`); the RHEL family has a
+    // single `php-fpm`. Checking only the versioned names reported an active
+    // PHP as stopped on every RPM box (s265) — the same shape as the dpkg
+    // problem one line above, in the service manager instead of the package
+    // manager.
+    let php_running = is_active("php8.5-fpm").await || is_active("php8.4-fpm").await || is_active("php8.3-fpm").await || is_active("php8.2-fpm").await || is_active("php8.1-fpm").await
+        || is_active("php-fpm").await;
     let certbot_installed = which("certbot").await;
     let ufw_installed = which("ufw").await;
     let ufw_active = is_ufw_active().await;
@@ -99,6 +105,9 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── PHP installer ───────────────────────────────────────────────────────
 
 async fn install_php() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing PHP").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing PHP...");
 
     // Detect best PHP version available
@@ -146,6 +155,9 @@ async fn install_php() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Certbot installer ───────────────────────────────────────────────────
 
 async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Certbot").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing Certbot...");
 
     // Remove old apt-based certbot first (if present) to avoid conflicts
@@ -226,6 +238,9 @@ async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── UFW installer ───────────────────────────────────────────────────────
 
 async fn install_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing UFW").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing UFW...");
 
     let output = tokio::time::timeout(
@@ -263,6 +278,9 @@ async fn install_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Fail2Ban installer ──────────────────────────────────────────────────
 
 async fn install_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Fail2Ban").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing Fail2Ban...");
 
     let output = tokio::time::timeout(
@@ -476,6 +494,9 @@ async fn stage_and_install_pdns_conf(staged: &str, contents: &str) -> Result<(),
 }
 
 async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing PowerDNS").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     // Optional JSON body {"backend": "sqlite" | "pgsql"}. Absent/empty/invalid → pgsql
     // (back-compat: older panels POST no body). SQLite removes the dependency on the
     // panel's containerized PostgreSQL that broke installs in issue #63.
@@ -664,6 +685,9 @@ default-soa-content=ns1.@ hostmaster.@ 0 10800 3600 604800 3600
 // ── Redis installer ────────────────────────────────────────────────
 
 async fn install_redis() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Redis").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing Redis...");
 
     let output = tokio::time::timeout(
@@ -702,6 +726,9 @@ async fn install_redis() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Node.js installer ──────────────────────────────────────────────
 
 async fn install_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Node.js").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing Node.js...");
 
     let output = tokio::time::timeout(
@@ -768,6 +795,9 @@ async fn install_composer() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── PHP uninstaller ─────────────────────────────────────────────────────
 
 async fn uninstall_php() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing PHP").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling PHP...");
 
     let version = detect_php_version().await.unwrap_or_else(|| "8.3".to_string());
@@ -798,6 +828,9 @@ async fn uninstall_php() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Certbot uninstaller ─────────────────────────────────────────────────
 
 async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Certbot").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling Certbot...");
 
     // Stop all possible renewal timers
@@ -840,6 +873,9 @@ async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── UFW uninstaller ─────────────────────────────────────────────────────
 
 async fn uninstall_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing UFW").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling UFW...");
 
     // Disable UFW first
@@ -867,6 +903,9 @@ async fn uninstall_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Fail2Ban uninstaller ────────────────────────────────────────────────
 
 async fn uninstall_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Fail2Ban").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling Fail2Ban...");
 
     // Stop and disable fail2ban
@@ -898,6 +937,9 @@ async fn uninstall_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── PowerDNS uninstaller ────────────────────────────────────────────────
 
 async fn uninstall_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing PowerDNS").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling PowerDNS...");
 
     // Stop and disable pdns
@@ -929,6 +971,9 @@ async fn uninstall_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Redis uninstaller ───────────────────────────────────────────────────
 
 async fn uninstall_redis() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Redis").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling Redis...");
 
     // Stop and disable redis-server
@@ -957,6 +1002,9 @@ async fn uninstall_redis() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Node.js uninstaller ─────────────────────────────────────────────────
 
 async fn uninstall_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Node.js").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling Node.js...");
 
     // Purge nodejs
@@ -1007,15 +1055,11 @@ async fn uninstall_composer() -> Result<Json<serde_json::Value>, ApiErr> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Package presence, on dpkg and rpm boxes alike — see `services::pkg`.
+/// This used to shell out to `dpkg` directly, which answered `false` for
+/// every package on the entire RHEL family (s265).
 async fn is_installed(package: &str) -> bool {
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        safe_command("dpkg").args(["-l", package]).output()
-    ).await
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("ii"))
-        .unwrap_or(false)
+    crate::services::pkg::is_installed(package).await
 }
 
 async fn is_active(service: &str) -> bool {
@@ -1066,6 +1110,9 @@ async fn detect_php_version() -> Option<String> {
 // ── WAF (ModSecurity3 + OWASP CRS) installer ───────────────────────
 
 async fn install_waf() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing the WAF").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing WAF (ModSecurity3 + OWASP CRS)...");
 
     // 1. Install libmodsecurity3 and nginx connector
@@ -1175,6 +1222,9 @@ SecStatusEngine Off
 }
 
 async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing the WAF").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling WAF...");
 
     // Remove WAF directives from all nginx configs
@@ -1225,6 +1275,9 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
 // ── Cloudflare Tunnel (cloudflared) ─────────────────────────────────
 
 async fn install_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Installing Cloudflare Tunnel").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Installing cloudflared...");
 
     // Pre-resolve the codename in Rust. Inline `$(lsb_release -cs)` in
@@ -1279,6 +1332,9 @@ async fn install_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
 }
 
 async fn uninstall_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
+    if let Some(why) = crate::services::pkg::apt_only_reason("Removing Cloudflare Tunnel").await {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, &why));
+    }
     tracing::info!("Uninstalling cloudflared...");
 
     let _ = tokio::time::timeout(Duration::from_secs(30), safe_command("systemctl").args(["stop", "cloudflared"]).output()).await;

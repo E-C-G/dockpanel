@@ -46,14 +46,14 @@ struct InstallResponse {
     version: String,
 }
 
-/// Check if a PHP-FPM version is installed via dpkg.
+/// Check if a PHP-FPM version is installed.
+///
+/// On RPM boxes there is one `php-fpm` package rather than one per version,
+/// so `services::pkg` collapses every `php{v}-fpm` onto it — a `true` there
+/// means "some PHP-FPM is installed". `socket_exists` below is what actually
+/// distinguishes the versions on either family.
 async fn is_installed(version: &str) -> bool {
-    safe_command("dpkg")
-        .args(["-s", &format!("php{version}-fpm")])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::services::pkg::is_installed(&format!("php{version}-fpm")).await
 }
 
 /// Check if a PHP-FPM socket file exists.
