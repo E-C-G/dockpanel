@@ -170,5 +170,118 @@ else
 fi
 
 echo
+echo "── 5. The published support matrix cannot exceed the tested matrix ──"
+
+# README's masthead names six distro families. Until 2026-07-26 the smoke matrix
+# tested two of them, so four families were advertised on the strength of
+# nothing — the same "green check measuring the honest half" shape the drills
+# keep finding in the product, this time in our own marketing copy. The claim
+# and the evidence are now bound together: name a family in the README and CI
+# must exec the release binaries on it.
+SMOKE=.github/workflows/smoke-test.yml
+
+# The support claim is NOT in one place. It is in README.md, docs/getting-started.md
+# and TWICE in the marketing SPA (the FAQ answer and the strip under the install
+# box) — four independently-edited sites, which is precisely the shape that let
+# the template count drift to 152-in-ten-places. So locate claims by what they
+# SAY: any line naming three or more distro families IS a support claim,
+# wherever it lives. A new claim site joins the pin by existing.
+#
+# Prose that merely mentions one or two distros (docs/testing.md describing the
+# apt matrix, cli-reference.md's sample output) stays below the threshold.
+#
+# Threshold: four families, OR three families plus a word that makes the line a
+# promise rather than a mention. Three-alone is not enough — CONTRIBUTING.md's
+# build-tools line names Ubuntu/Debian and Fedora purely to give two package
+# lists, and reading that as a support claim would put a distro under the pin
+# that nobody promised. The marketing strip (`Ubuntu · Debian · CentOS · Rocky ·
+# Amazon Linux`) has no promise-word at all, which is why the count arm exists.
+DISTRO_RE='Ubuntu|Debian|CentOS|Rocky|Alma[Ll]inux|Fedora|Amazon Linux'
+PROMISE_RE='[Ss]upports?|[Rr]uns on|\*\*OS\*\*|Requirements'
+
+# Normalise a distro name to a family slug, from either side of the comparison.
+family_of() {
+  case "$(tr '[:upper:]' '[:lower:]' <<<"$1")" in
+    ubuntu*)              echo ubuntu ;;
+    debian*)              echo debian ;;
+    *centos*)             echo centos ;;
+    rocky*)               echo rocky ;;
+    alma*)                echo alma ;;
+    fedora*)              echo fedora ;;
+    amazon*|amzn*)        echo amazon ;;
+    *)                    echo UNKNOWN ;;
+  esac
+}
+
+if [ ! -f "$SMOKE" ]; then
+  bad "$SMOKE is missing — nothing verifies the support claim"
+else
+  # Every claim site, and the families each one names.
+  CLAIMED=""
+  sites=0
+  for f in "${MD_SURFACES[@]}" "${WEB_SURFACES[@]}"; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      fams=$(grep -oE "$DISTRO_RE" <<<"$line" | while read -r n; do family_of "$n"; done | sort -u)
+      n_fams=$(wc -w <<<"$fams")
+      if [ "$n_fams" -lt 4 ]; then
+        [ "$n_fams" -ge 3 ] && grep -qE "$PROMISE_RE" <<<"$line" || continue
+      fi
+      sites=$((sites+1))
+      CLAIMED="$CLAIMED $fams"
+    done < <(grep -hE "$DISTRO_RE" "$f" 2>/dev/null)
+  done
+  CLAIMED=$(tr ' ' '\n' <<<"$CLAIMED" | grep -v '^$' | sort -u)
+
+  if [ "$sites" -eq 0 ]; then
+    bad "no support-claim line found on any surface — the claim moved and this check went blind"
+  else
+    ok "support claim located on $sites site(s) across the three surfaces"
+  fi
+
+  # Tested images, from the matrix. Stops at the first non-item line so a later
+  # `container:` key cannot be swept in.
+  IMAGES=$(awk '
+    /^ *distro:/      { inside=1; next }
+    inside && /^ *#/  { next }
+    inside && /^ *- / { sub(/^ *- /,""); print; next }
+    inside            { exit }
+  ' "$SMOKE")
+
+  if [ -z "$CLAIMED" ] || [ -z "$IMAGES" ]; then
+    bad "parsed $(wc -w <<<"$CLAIMED") claimed families and $(wc -w <<<"$IMAGES") matrix images — one side of the comparison went blind"
+  else
+    TESTED=$(while read -r i; do [ -n "$i" ] && family_of "$i"; done <<<"$IMAGES" | sort -u)
+
+    # An image nobody can classify would silently count for nothing.
+    if grep -qx UNKNOWN <<<"$TESTED"; then
+      bad "$SMOKE lists an image this check cannot map to a distro family — extend family_of()"
+    fi
+
+    missing=""
+    for fam in $CLAIMED; do
+      grep -qx "$fam" <<<"$TESTED" || missing="$missing $fam"
+    done
+
+    if [ -n "$missing" ]; then
+      bad "a published surface claims support for:${missing} — no image in $SMOKE tests $([ "$(wc -w <<<"$missing")" -eq 1 ] && echo it || echo them)"
+    else
+      ok "all $(wc -w <<<"$CLAIMED") claimed distro families are exec-tested by $SMOKE"
+    fi
+  fi
+
+  # The same surfaces claim ARM64. That half IS covered — by a separate job,
+  # since arm64 needs QEMU binfmt on the host rather than a container image — so
+  # the matrix check above structurally cannot see it.
+  if grep -qi 'ARM64' README.md; then
+    if grep -qE '^ *smoke-arm64:' "$SMOKE"; then
+      ok "ARM64 is claimed and $SMOKE has the smoke-arm64 job that proves it"
+    else
+      bad "ARM64 support is claimed but $SMOKE has no smoke-arm64 job"
+    fi
+  fi
+fi
+
+echo
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

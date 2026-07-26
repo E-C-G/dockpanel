@@ -8,7 +8,7 @@ DockPanel is a free, self-hosted, Docker-native server management panel built in
 
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
-| **OS** | Ubuntu 20.04+, Debian 11+, CentOS 9+, Rocky Linux 9+, Fedora 39+, Amazon Linux 2023 | Ubuntu 22.04 LTS |
+| **OS** | Ubuntu 20.04+, Debian 11+, CentOS 9+, Rocky Linux 9+, AlmaLinux 9+, Fedora 39+ | Ubuntu 22.04 LTS |
 | **Architecture** | x86_64 or ARM64 (aarch64) | x86_64 |
 | **RAM** | 512 MB | 1 GB+ |
 | **Disk** | 10 GB | 20 GB+ |

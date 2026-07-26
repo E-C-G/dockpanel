@@ -35,7 +35,7 @@ panel serves a self-signed certificate, so your browser warns once — it is the
 admin password you create is encrypted on the way to the server. Point a domain at the box
 and pass `PANEL_DOMAIN=your.domain` to get a trusted Let's Encrypt certificate instead.
 
-Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, Fedora 39+, Amazon Linux 2023. x86_64 and ARM64.
+Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, AlmaLinux 9+, Fedora 39+. x86_64 and ARM64.
 
 ## Why DockPanel?
 

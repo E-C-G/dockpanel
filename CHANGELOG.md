@@ -4,6 +4,54 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.37.0] - 2026-07-26
+
+### Fixed
+
+- **DockPanel could not install on any RPM-family distro.** The README, the docs
+  and the website all claimed CentOS 9+, Rocky 9+, Fedora 39+ and Amazon Linux
+  2023, and the release smoke-test matrix contained only Debian and Ubuntu
+  images. Driving all four on real servers found every one of them failing, in
+  three different places:
+  - **Rocky and AlmaLinux died installing Docker.** `get.docker.com` sends each
+    distro to its own repository path, and `download.docker.com/linux/rocky/9/`
+    publishes `containerd.io` and the plugins but no `docker-ce` — so the
+    install aborted at step 3 of 15 with `Unable to find a match: docker-ce`.
+    AlmaLinux is not in that script's distro list at all. Both now get an
+    explicit repository pointing at the `centos` path, whose packages are plain
+    `el$releasever` builds.
+  - **CentOS Stream died configuring Nginx.** The step that comments out RHEL's
+    default server block used a `sed` range terminating at the first `}`, which
+    inside a server block belongs to a nested `location` — half the block stayed
+    live at `http` level and `nginx -t` failed with `"location" directive is not
+    allowed here`. It now counts braces to find the block's real end.
+  - **Fedora died starting the agent.** The unit listed `/etc/apt` in
+    `ReadWritePaths`; systemd fails the entire mount namespace when any entry is
+    missing, so on an RPM box the agent could not start at all. Distro-specific
+    paths now carry systemd's `-` prefix, so a missing directory can no longer
+    make the agent unstartable — the class fix, not just this path.
+
+### Changed
+
+- **Amazon Linux 2023 removed from the support claim, AlmaLinux 9+ added.**
+  Docker's install script has no Amazon Linux branch and no image is available
+  to verify a fix against, so the claim was withdrawn rather than left standing
+  on nothing. AlmaLinux — which the installer already greeted by name while
+  being unable to install on it — is now claimed, tested and verified.
+- The release smoke-test matrix now covers Rocky 9, AlmaLinux 9, CentOS Stream
+  9, Fedora 39 and 43 and Amazon Linux 2023 alongside the apt distros, with a
+  per-family package-manager step.
+
+### Added
+
+- `tests/rpm-install-pin-e2e.sh` (7 assertions) pins all three fixes, including
+  a check that every sandbox path is either optional or created before the unit
+  starts — so the next `/etc/apt` cannot happen.
+- `tests/docs-claims-pin-e2e.sh` now fails the build when a distro family is
+  named on any published surface and no image in the smoke matrix tests it. It
+  locates support claims by pattern across all three surfaces, which turned up a
+  fifth claim site nobody had been maintaining.
+
 ## [2.36.0] - 2026-07-26
 
 ### Fixed

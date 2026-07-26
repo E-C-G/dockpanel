@@ -1,6 +1,6 @@
 # How DockPanel Is Tested
 
-> **Reflects v2.36.0.** The version stamp, the template count and every
+> **Reflects v2.37.0.** The version stamp, the template count and every
 > assertion total on this page are checked against the source by
 > `tests/docs-claims-pin-e2e.sh`, so this page cannot quietly fall behind the
 > code it describes.
@@ -117,6 +117,43 @@ and bounce real mailboxes as "unknown user", with the daemon perfectly healthy
 throughout. A fix verified only to the depth of "the process is running" has
 been verified to exactly the depth that produced the original bug.
 
+### Four supported distros that could not install — v2.37.0
+
+The README, the docs and the website all said DockPanel ran on CentOS 9+,
+Rocky 9+, Fedora 39+ and Amazon Linux 2023. The release smoke-test matrix
+contained Debian and Ubuntu images and nothing else. So the RPM half of the
+support claim rested on no evidence whatsoever — and when four throwaway boxes
+were finally used to check, **all four failed to install**, at three unrelated
+places:
+
+| Distro | Failed at | Cause |
+|---|---|---|
+| Rocky 9.8 | Docker, step 3 of 15 | `download.docker.com/linux/rocky/9/` exists and serves valid metadata, but upstream fills it with `containerd.io` and the plugins only. No `docker-ce`. The install died on `Unable to find a match: docker-ce docker-ce-cli`. |
+| AlmaLinux 9.8 | Docker | `get.docker.com` has no `almalinux` branch at all — `ERROR: Unsupported distribution 'almalinux'` — even though the installer greets it by name with "Detected: AlmaLinux 9.8". |
+| CentOS Stream 9 | Nginx | The step that comments out RHEL's default server block used a `sed` range ending at the first `}`. Inside a server block that brace belongs to a nested `location`, so the block was half-commented and the remainder landed at `http` level: `"location" directive is not allowed here in /etc/nginx/nginx.conf:52`. |
+| Fedora 43 | Systemd services | The agent unit listed `/etc/apt` in `ReadWritePaths`. That path does not exist on an RPM box, systemd refuses to build the mount namespace when any entry is missing, and the agent could not start **at all**. |
+
+The last one is the most instructive. `/etc/apt` was not a typo: `setup.sh` and
+`update.sh` each keep a hand-written list of directories to pre-create, both
+commented "pre-create everything the canonical unit lists", and neither had
+`/etc/apt` — because on Debian and Ubuntu it already exists, so the omission was
+invisible on every box anyone had ever tested. Three lists kept in sync from
+memory, and the one entry that mattered was in none of the copies.
+
+Fixed in v2.37.0 by pointing the RHEL rebuilds at Docker's `centos` repository
+(the packages there are plain `el$releasever` builds), counting braces instead
+of guessing at the block end, and marking distro-specific sandbox paths optional
+with systemd's `-` prefix so a missing directory can never again make the agent
+unstartable. Verified the same way it was found: the same five boxes, before and
+after, `/api/health` answering `2.36.0` on Rocky, AlmaLinux, CentOS Stream and
+Fedora where the installer had previously aborted.
+
+Amazon Linux 2023 was **removed from the support claim** rather than fixed:
+`get.docker.com` has no `amzn` branch, and there is no image available to verify
+a fix against. AlmaLinux, which the installer had recognised all along without
+being able to install, took its place — and this time the claim has a box behind
+it.
+
 ### Git deploy had never built — v2.35.0
 
 Deploying a site from a real git repository failed 1.4 seconds in:
@@ -217,6 +254,15 @@ This section is the reason the rest of the page is worth reading.
 - **Multi-service app templates do not exist to test.** A single-container
   template definition cannot express Supabase, Mastodon or PeerTube. That is a
   build item, not a coverage gap.
+- **Amazon Linux 2023 is no longer claimed.** `get.docker.com` has no `amzn`
+  branch, so the installer cannot provision Docker there, and no image is
+  available to us to verify a fix against. Withdrawing the claim was the honest
+  option; building and verifying real support is the open item.
+- **The RPM families are verified for install, not yet for the verticals.** The
+  four boxes were driven to a healthy panel — services up, `/api/health`
+  answering — and destroyed. Mail, backups, git deploy and the rest have been
+  driven on Debian and Ubuntu only, so anything package-manager-shaped in those
+  paths is still unproven on RPM. That is now the largest known blind spot.
 
 ## The coverage ledger
 
@@ -244,7 +290,10 @@ have is marked not-driven rather than skipped quietly.
 | Update from a published older tag to current, on a box with a live site | pass |
 | A restore drill on an upgraded, not fresh, install | pass |
 | Auto-sleep on a Docker app | **found it stopped a container that was serving users** |
+| **Install on each RPM-family distro we claim to support** | **found all four could not install at all** — now pass on Rocky 9, AlmaLinux 9, CentOS Stream 9, Fedora 43 |
+| **Install on the published minimum spec (512 MB RAM, 10 GB disk)** | pass — Debian 12, unmodified installer, both services healthy |
 | A push-a-change → redeploy loop | not driven |
+| Install on Amazon Linux 2023 | not driven — no image available to us, and the claim was withdrawn rather than left unverified |
 
 ## What runs on every commit and every release
 
@@ -269,7 +318,7 @@ that reads the source and fails if the fix is undone — including the shapes th
 are easy to undo by accident. The mail pins assert, among other things, that the
 sandbox was **not** widened to include `/etc/opendkim.conf`, since widening it
 would have "fixed" the bug while destroying the reason the bug was
-survivable. Six suites, **172 assertions**, all green at the current commit:
+survivable. Seven suites, **179 assertions**, all green at the current commit:
 
 | Suite | Assertions |
 |---|---|
@@ -279,6 +328,7 @@ survivable. Six suites, **172 assertions**, all green at the current commit:
 | `git-deploy-sandbox-pin-e2e.sh` | 20 |
 | `ssl-correctness-pin-e2e.sh` | 30 |
 | `nginx-listen-pin-e2e.sh` | 17 |
+| `rpm-install-pin-e2e.sh` | 7 |
 
 **On every release** (`release.yml`, `smoke-test.yml`):
 
@@ -287,10 +337,14 @@ survivable. Six suites, **172 assertions**, all green at the current commit:
 - SPDX SBOMs for all three crates, `checksums.txt`, and **keyless Sigstore
   signatures** (`.sig` + `.pem` per asset).
 - **Post-publish smoke tests that download the published binaries and run
-  them** on Debian 11, 12 and 13, Ubuntu 20.04, 22.04 and 24.04, plus arm64 —
-  asserting static linkage and no loader errors on each. These run *after* the
-  release is created, so a green release page is not the all-clear; the smoke
-  matrix is.
+  them** on Debian 11, 12 and 13, Ubuntu 20.04, 22.04 and 24.04, Rocky 9,
+  AlmaLinux 9, CentOS Stream 9, Fedora 39 and 43, and Amazon Linux 2023, plus
+  arm64 — asserting static linkage and no loader errors on each. These run
+  *after* the release is created, so a green release page is not the all-clear;
+  the smoke matrix is. Until v2.37.0 this matrix covered only the apt distros
+  while the documentation promised six families, so `docs-claims-pin-e2e.sh`
+  now fails the build if a family is named on any published surface and no
+  image in the matrix tests it.
 - The release body is generated from `CHANGELOG.md`, and the release fails if the
   tag has no changelog entry.
 

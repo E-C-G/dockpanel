@@ -48,7 +48,7 @@ The install script:
 5. Creates a systemd service and starts the agent
 6. Opens port 9443 in the firewall
 
-The agent supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky Linux 9+, Fedora 39+, and Amazon Linux 2023.
+The agent supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky Linux 9+, AlmaLinux 9+, and Fedora 39+.
 
 ## Add a Server in the Panel
 

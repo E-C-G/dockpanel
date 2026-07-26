@@ -227,7 +227,7 @@ const steps = [
 
 const faqs = [
   { q: 'Is it really free?', a: 'Every feature, every server, no limits. Licensed under BSL 1.1, which converts to MIT in 2030. There is no premium tier.' },
-  { q: 'System requirements?', a: '512 MB RAM, 1 CPU, 10 GB disk. Runs on Ubuntu, Debian, CentOS, Rocky, and Amazon Linux. ARM64 works too.' },
+  { q: 'System requirements?', a: '512 MB RAM, 1 CPU, 10 GB disk. Runs on Ubuntu, Debian, CentOS, Rocky, AlmaLinux, and Fedora. ARM64 works too.' },
   { q: 'How is this different from cPanel?', a: "cPanel uses ~800 MB of RAM, costs $15/month, and doesn't support Docker. DockPanel's panel services idle around ~19 MB (about ~85 MB with the bundled PostgreSQL), cost nothing, and ship with 153 Docker templates, a WAF, passkey authentication, Git deploys, a CLI, and multi-server management." },
   { q: 'What happens if DockPanel goes down?', a: 'Your sites keep running. Nginx and Docker are independent processes \u2014 the panel is just the management layer. It auto-restarts via systemd if it ever stops.' },
   { q: 'Can I manage multiple servers?', a: 'As many as you want. Install a lightweight agent on each server and manage them all from one dashboard.' },
@@ -414,7 +414,7 @@ export default function Landing() {
                   {copied ? 'Copied' : 'Copy'}
                 </button>
               </div>
-              <p className="text-[11px] text-zinc-600 mt-2.5 tracking-wide font-medium">Ubuntu &middot; Debian &middot; CentOS &middot; Rocky &middot; Amazon Linux &middot; ARM64</p>
+              <p className="text-[11px] text-zinc-600 mt-2.5 tracking-wide font-medium">Ubuntu &middot; Debian &middot; CentOS &middot; Rocky &middot; AlmaLinux &middot; Fedora &middot; ARM64</p>
             </div>
 
             <div className="flex items-center justify-center gap-3">

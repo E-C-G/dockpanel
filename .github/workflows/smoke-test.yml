@@ -12,8 +12,16 @@ name: Install smoke-test
 #
 # Scope: this is an ABI/loader smoke-test, NOT a full functional install. The
 # heavier end-to-end `install.sh` test (Docker + Postgres + nginx provisioning)
-# is the separate fresh-VPS gate. Covers amd64 + the apt-based distros that span
-# the glibc floor (Debian 11 / Ubuntu 20.04 = glibc 2.31) up to the newest.
+# is the separate fresh-VPS gate. Covers amd64 + arm64.
+#
+# The matrix must span EVERY distro family named in the README support line —
+# `tests/docs-claims-pin-e2e.sh` §5 fails the build if a family is claimed there
+# and absent here. Until 2026-07-26 it listed only the apt families, so the RPM
+# half of a six-family support claim had never been verified by anything: a
+# green check measuring the honest half. Both floors are pinned deliberately
+# (debian:11 / ubuntu:20.04 = glibc 2.31; fedora:39 is the README's stated
+# floor) even though static musl has no libc floor — the point is that the
+# claim and the evidence move together.
 
 # NOTE ON TRIGGERS: `release: [published]` alone never fires this workflow.
 # release.yml publishes with the default GITHUB_TOKEN, and GitHub deliberately
@@ -76,20 +84,49 @@ jobs:
       fail-fast: false
       matrix:
         distro:
+          # apt families — README: "Ubuntu 20+, Debian 11+"
           - debian:11
           - debian:12
           - debian:13
           - ubuntu:20.04
           - ubuntu:22.04
           - ubuntu:24.04
+          # rpm families — README: "CentOS 9+, Rocky 9+, AlmaLinux 9+, Fedora 39+"
+          # amazonlinux is deliberately NOT claimed on any surface: get.docker.com
+          # has no `amzn` branch, so the installer cannot provision Docker there,
+          # and no image is available to us to verify a fix against. It stays in
+          # the matrix as free ABI coverage — if support is ever built, the
+          # evidence for the binaries half is already here.
+          - rockylinux:9
+          - almalinux:9
+          - quay.io/centos/centos:stream9
+          - fedora:39
+          - fedora:43
+          - amazonlinux:2023
     container:
       image: ${{ matrix.distro }}
     steps:
       - name: Install fetch deps
         run: |
           set -eux
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates file >/dev/null
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates file >/dev/null
+          elif command -v dnf >/dev/null 2>&1; then
+            # --allowerasing is load-bearing on amazonlinux:2023: the image ships
+            # curl-minimal, which CONFLICTS with the full curl package, and dnf
+            # aborts the whole transaction rather than substituting. Verified by
+            # running the step without the flag (transaction fails, exit non-zero).
+            dnf install -y --allowerasing --setopt=install_weak_deps=False \
+                curl ca-certificates file >/dev/null
+          elif command -v microdnf >/dev/null 2>&1; then
+            microdnf install -y curl ca-certificates file >/dev/null
+          elif command -v yum >/dev/null 2>&1; then
+            yum install -y curl ca-certificates file >/dev/null
+          else
+            echo "FAIL: no supported package manager in ${{ matrix.distro }} — this matrix entry cannot fetch the release assets."
+            exit 1
+          fi
 
       - name: Download published binaries (amd64)
         run: |

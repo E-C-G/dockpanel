@@ -439,14 +439,52 @@ install_dependencies() {
     log "Base packages installed"
 }
 
+# Docker's convenience script points each distro at its own repo path under
+# download.docker.com/linux/<distro>. For the RHEL rebuilds that path is a trap:
+# `linux/rocky/9/` EXISTS and serves valid metadata, but upstream fills it with
+# containerd.io and the plugins only — no docker-ce, no docker-ce-cli. So on
+# Rocky the script cheerfully adds the repo and the very next command dies with
+# `Error: Unable to find a match: docker-ce docker-ce-cli`, aborting the install
+# at step 3 of 15. AlmaLinux fares worse still: it is not in the script's distro
+# list at all, so it never reaches a repo.
+#
+# The packages under `linux/centos/$releasever` are plain el$releasever builds
+# that install cleanly on every RHEL rebuild (that path carried 198 docker-ce
+# RPMs when this was written, against rocky's 0), so point the clones there
+# ourselves rather than at a directory upstream does not fill.
+docker_repo_rhel_clone() {
+    cat > /etc/yum.repos.d/docker-ce.repo << 'REPOEOF'
+[docker-ce-stable]
+name=Docker CE Stable - $basearch
+baseurl=https://download.docker.com/linux/centos/$releasever/$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://download.docker.com/linux/centos/gpg
+REPOEOF
+}
+
 install_docker() {
     header "Docker"
 
     if command -v docker &> /dev/null; then
         log "Docker already installed: $(docker --version | head -1)"
     else
-        run "Installing Docker (get.docker.com — takes a minute)" \
-            bash -c 'curl -fsSL https://get.docker.com | sh'
+        local DOCKER_OS_ID=""
+        [ -f /etc/os-release ] && DOCKER_OS_ID=$(. /etc/os-release && echo "${ID:-}")
+
+        case "$DOCKER_OS_ID" in
+            rocky|almalinux|centos|rhel|ol)
+                docker_repo_rhel_clone
+                # --allowerasing: the stock images ship podman's `runc`, which
+                # containerd.io replaces; without it dnf aborts the transaction.
+                run "Installing Docker (docker-ce, el-clone repo)" \
+                    bash -c 'dnf install -y --allowerasing docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
+                ;;
+            *)
+                run "Installing Docker (get.docker.com — takes a minute)" \
+                    bash -c 'curl -fsSL https://get.docker.com | sh'
+                ;;
+        esac
         systemctl enable --now docker > /dev/null 2>&1
         if ! command -v docker &> /dev/null; then
             error "Docker installation failed — see $INSTALL_LOG"
@@ -1672,9 +1710,31 @@ main() {
     if [ -f /etc/nginx/sites-enabled/default ]; then
         rm -f /etc/nginx/sites-enabled/default
     fi
-    # RHEL: comment out default server block in nginx.conf
-    if [ "$PKG_MGR" != "apt" ] && grep -q "server {" /etc/nginx/nginx.conf 2>/dev/null; then
-        sed -i '/^[[:space:]]*server {/,/^[[:space:]]*}/s/^/#/' /etc/nginx/nginx.conf 2>/dev/null || true
+    # RHEL: comment out the default server block in nginx.conf, which binds :80
+    # and would fight the panel vhost.
+    #
+    # This used to be a sed range — `/server {/,/^[[:space:]]*}/` — and that range
+    # ends at the FIRST line that is just a closing brace, which inside a server
+    # block is the end of its first nested `location`, not the end of the server.
+    # So it commented the opening third of the block and left the remainder at
+    # http level, and nginx -t died with `"location" directive is not allowed
+    # here in /etc/nginx/nginx.conf:52`. Every RHEL-family install failed there.
+    # Counting braces is the only way to find the block's real end.
+    if [ "$PKG_MGR" != "apt" ] && [ -f /etc/nginx/nginx.conf ]; then
+        awk '
+          # Only an UNcommented top-level server block; an already-commented one
+          # starts with # and must not match, so re-running stays a no-op.
+          !c && /^[[:space:]]*server[[:space:]]*\{/ { c = 1; d = 0 }
+          c {
+            d += gsub(/\{/, "{") - gsub(/\}/, "}")
+            print "#" $0
+            if (d <= 0) c = 0
+            next
+          }
+          { print }
+        ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.dockpanel-new 2>/dev/null &&
+          mv /etc/nginx/nginx.conf.dockpanel-new /etc/nginx/nginx.conf
+        rm -f /etc/nginx/nginx.conf.dockpanel-new
     fi
 
     # These steps should continue even if one fails
